@@ -135,6 +135,8 @@ pub fn secure_existing_file(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::*;
 
     #[cfg(unix)]
     #[test]
