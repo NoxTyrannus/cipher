@@ -366,9 +366,7 @@ fn resolve_sandbox_path(
         .ok_or_else(|| wasmtime::Error::msg("resolve path: no file name"))?;
     let resolved = parent_canonical.join(file_name);
     let is_allowed = roots.iter().any(|r| {
-        let canonical_root = r
-            .canonicalize()
-            .unwrap_or_else(|_| r.clone());
+        let canonical_root = r.canonicalize().unwrap_or_else(|_| r.clone());
         resolved.starts_with(&canonical_root)
     });
     if !is_allowed {
