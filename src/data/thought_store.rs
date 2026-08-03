@@ -640,6 +640,7 @@ fn ensure_secure_file(path: &Path) -> Result<()> {
     ensure_secure_file_from_metadata(path, metadata)
 }
 
+#[allow(unused_variables)]
 fn ensure_secure_file_from_metadata(path: &Path, metadata: fs::Metadata) -> Result<()> {
     #[cfg(unix)]
     {
@@ -655,6 +656,7 @@ fn ensure_secure_file_from_metadata(path: &Path, metadata: fs::Metadata) -> Resu
     Ok(())
 }
 
+#[allow(unused_variables)]
 fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
