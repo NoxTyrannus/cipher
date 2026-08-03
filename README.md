@@ -22,7 +22,7 @@ Cipher 是一个运行在终端中的 AI 代理：你在终端里输入任务，
 ### 快速安装
 
 ```bash
-git clone https://github.com/<your-account>/cipher.git
+git clone https://github.com/NoxTyrannus/cipher.git
 cd cipher
 ./install.sh
 ```
