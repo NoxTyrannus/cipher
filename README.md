@@ -104,13 +104,13 @@ cargo build --release
 
 | 系列 | 提供商 |
 |---|---|
-| M3 | MiniMax |
-| K3 | 昆仑万维 |
-| SenseNova | 商汤科技 |
 | DeepSeek | DeepSeek |
-| Doubao | 字节跳动 |
+| M3 | MiniMax |
 | GLM | 智谱AI |
 | Kimi | 月之暗面 |
+| SenseNova | 商汤科技 |
+| Doubao | 字节跳动 |
+
 
 ## 架构
 
