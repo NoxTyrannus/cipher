@@ -5,7 +5,7 @@ edition = "2021"
 description = "终端原生 AI 代理 — 三种工作模式 (UNNI/KEEP/LOOP), 内置执行/洞察/记忆三中台"
 license = "MIT"
 rust-version = "1.96"
-repository = "https://github.com/<your-account>/cipher"
+repository = "https://github.com/NoxTyrannus/cipher"
 
 [[bin]]
 name = "cipher"
