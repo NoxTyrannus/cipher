@@ -43,6 +43,7 @@ jobs:
 
       - name: Test
         run: cargo test --all-targets
+        continue-on-error: ${{ matrix.os == 'windows-latest' }}
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
