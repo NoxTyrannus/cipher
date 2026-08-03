@@ -1,0 +1,7 @@
+/target
+/.atomcode
+/.tmp
+/.superpowers
+/.gitnexus
+/data/*.db
+/data/*.db.wal

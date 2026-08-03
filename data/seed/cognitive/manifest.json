@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "description": "五态认知记忆出厂 seed — 用户设计 + DP酱 整理",
+  "nodes_file": "nodes.json",
+  "edges_file": "edges.json"
+}

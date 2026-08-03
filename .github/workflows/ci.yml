@@ -1,0 +1,100 @@
+name: Cipher CI (Linux/macOS/Windows)
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: cargo quality gates (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.96.0)
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Test
+        run: cargo test --all-targets
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: cipher-${{ matrix.os }}
+          path: |
+            target/release/cipher
+            target/release/cipher.exe
+          if-no-files-found: ignore
+
+  release:
+    name: Publish GitHub Release
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package release assets
+        shell: bash
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name cipher -o -name cipher.exe \) | while read f; do
+            os=$(echo "$f" | sed -E 's|artifacts/cipher-([^/]+)/.*|\1|')
+            case "$os" in
+              ubuntu-latest) target="cipher-linux-x86_64" ;;
+              macos-14) target="cipher-macos-x86_64" ;;
+              windows-latest) target="cipher-windows-x86_64.exe" ;;
+            esac
+            cp "$f" "release/$target"
+          done
+          chmod +x release/cipher-* 2>/dev/null || true
+          ls -la release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true

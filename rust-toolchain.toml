@@ -1,0 +1,8 @@
+[toolchain]
+# nova-agent 2.0 — Rust toolchain pin
+# 锁 rustc 1.96.0 (与 CLAUDE.md §2.2 父 agent-harness 一致)
+# 原因: iter11 子代理 ratatui 预研用 rustc 1.96, iter13+ 全部验证通过; 升 1.97+ 可能 break
+# 详细: ADR-079 + https://rust-lang.github.io/rustup/concepts/toolchains.html
+channel = "1.96.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

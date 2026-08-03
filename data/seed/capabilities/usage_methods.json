@@ -1,0 +1,4 @@
+[
+  {"id":"capability.list","capability_id":"capability.register","name":"List Capabilities","prompt":"列出当前注册表中所有能力，按类型（原子/分子/方法）分组","examples":{},"metadata":{"partition":"system"}},
+  {"id":"capability.inspect","capability_id":"capability.register","name":"Inspect Capability","prompt":"查看指定能力的详细定义（schema、executor、版本等）","examples":{},"metadata":{"partition":"system"}}
+]

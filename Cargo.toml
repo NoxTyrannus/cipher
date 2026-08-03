@@ -1,0 +1,61 @@
+[package]
+name = "cipher"
+version = "0.1.0"
+edition = "2021"
+description = "终端原生 AI 代理 — 三种工作模式 (UNNI/KEEP/LOOP), 内置执行/洞察/记忆三中台"
+license = "MIT"
+rust-version = "1.96"
+repository = "https://github.com/<your-account>/cipher"
+
+[[bin]]
+name = "cipher"
+path = "src/main.rs"
+
+[dependencies]
+# async runtime
+tokio = { version = "1", features = ["full"] }
+
+# error handling
+thiserror = "1"
+
+# utilities
+async-trait = "0.1"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+secrecy = "0.8"
+sha2 = "0.10"
+fs2 = "0.4"
+jsonschema = { version = "0.47", default-features = false }
+
+# Data layer (D-6, iter59 2026-06-12) — 1 库嵌入 (per ADR-106, 替代 ADR-095)
+duckdb = { version = "1.10503.1", features = ["bundled"] }    # 5 注册表 (per ADR-128 双库)
+hnsw_rs = "0.3"                                                # 应用层 HNSW ANN (preference_rag 向量检索, per iter59)
+# TriviumDB 5 记忆 (per ADR-128 双库, 替代 DuckDB 5 记忆表)
+triviumdb = "0.7"
+# UUID generation (thought IDs)
+uuid = { version = "1", features = ["v4", "v5"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Startup modules (iter53 2026-06-12, per spec 2026-06-12-startup-modules-design)
+toml = "0.8"                                                   # config.toml 解析
+dialoguer = "0.11"                                            # 首次启动 CLI 交互 prompt
+dirs = "5"                                                    # ~/.cipher/ 路径
+clap = { version = "4", features = ["derive"] }              # CLI 子命令解析 (setup/config, per cli spec)
+tracing = "0.1"                                               # self-check 结构化日志
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# TUI + mode_runtime (iter53 2026-06-12, per spec 3 + ADR-068 方案 A)
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }   # TUI 渲染
+crossterm = { version = "0.29", features = ["event-stream"] }                        # 终端事件
+futures = "0.3"                                                                      # EventStream 抽象
+
+# Logic + agent (iter53 2026-06-12, per spec 4 + ADR-059/060/061)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }   # LLM HTTP (stream feature for SSE bytes_stream)
+
+# Script sandbox (iter58 mini-plan 3, per spec 2026-06-12-wasmtime-sandbox)
+wasmtime = "28"                                               # Wasmtime 28 运行时 + JIT + 沙箱 (Plan 3 T1)
+
+[dev-dependencies]
+httptest = "0.15"                                             # mock LLM HTTP 端点 (Plan 1 T2+ reqwest 测试)
+tempfile = "3"                                                # 测试用临时目录 (Config/Init/SelfCheck 集成测试)
+wat = "1"                                                     # WAT 文本 → .wasm 字节, Wasm 沙箱测试 fixture (Plan 3 T1)

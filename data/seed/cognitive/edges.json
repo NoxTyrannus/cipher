@@ -1,0 +1,22 @@
+[
+  {"from": "seed-divergence", "to": "seed-precipitation", "relation": "推进:素材归位消化"},
+  {"from": "seed-precipitation", "to": "seed-decision", "relation": "推进:筛选裁断"},
+  {"from": "seed-decision", "to": "seed-induction", "relation": "推进:抽取规律"},
+  {"from": "seed-induction", "to": "seed-design", "relation": "推进:转化为方案"},
+  {"from": "seed-design", "to": "seed-divergence", "relation": "推进:新一轮探索"},
+  {"from": "seed-divergence", "to": "seed-induction", "relation": "调节:收敛聚焦"},
+  {"from": "seed-precipitation", "to": "seed-design", "relation": "调节:推动输出"},
+  {"from": "seed-decision", "to": "seed-divergence", "relation": "调节:重新打开"},
+  {"from": "seed-induction", "to": "seed-precipitation", "relation": "调节:回归具体"},
+  {"from": "seed-design", "to": "seed-decision", "relation": "调节:剪裁聚焦"},
+  {"from": "seed-divergence", "to": "seed-mode-unni", "relation": "模式用法"},
+  {"from": "seed-precipitation", "to": "seed-mode-unni", "relation": "模式用法"},
+  {"from": "seed-decision", "to": "seed-mode-unni", "relation": "模式用法"},
+  {"from": "seed-induction", "to": "seed-mode-unni", "relation": "模式用法"},
+  {"from": "seed-design", "to": "seed-mode-unni", "relation": "模式用法"},
+  {"from": "seed-mode-unni", "to": "seed-mode-keep", "relation": "转入:意图模糊时"},
+  {"from": "seed-mode-unni", "to": "seed-mode-loop", "relation": "转入:持续迭代时"},
+  {"from": "seed-mode-keep", "to": "seed-mode-unni", "relation": "转入:对齐后执行"},
+  {"from": "seed-mode-keep", "to": "seed-mode-loop", "relation": "转入:对齐后持续"},
+  {"from": "seed-overview", "to": "seed-divergence", "relation": "总览→分述"}
+]
