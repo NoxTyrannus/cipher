@@ -365,7 +365,12 @@ fn resolve_sandbox_path(
         .file_name()
         .ok_or_else(|| wasmtime::Error::msg("resolve path: no file name"))?;
     let resolved = parent_canonical.join(file_name);
-    let is_allowed = roots.iter().any(|r| resolved.starts_with(r));
+    let is_allowed = roots.iter().any(|r| {
+        let canonical_root = r
+            .canonicalize()
+            .unwrap_or_else(|_| r.clone());
+        resolved.starts_with(&canonical_root)
+    });
     if !is_allowed {
         return Err(wasmtime::Error::msg("path not in sandbox roots"));
     }
