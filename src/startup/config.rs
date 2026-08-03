@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-#[cfg(unix)]
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
