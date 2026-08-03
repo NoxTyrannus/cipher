@@ -15,7 +15,7 @@ use crate::data::workspace_store::WorkspaceStore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -541,9 +541,12 @@ fn sha256_bytes(bytes: &[u8]) -> String {
 
 fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| migration_error(format!("cannot sync directory: {error}")))?;
+    {
+        use std::fs::File;
+        File::open(path)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| migration_error(format!("cannot sync directory: {error}")))?;
+    }
     #[cfg(not(unix))]
     let _ = path;
     Ok(())

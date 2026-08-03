@@ -7,7 +7,7 @@ use crate::common::{AgentError, Result, UtcTimestamp};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -660,6 +660,7 @@ fn ensure_secure_file_from_metadata(path: &Path, metadata: fs::Metadata) -> Resu
 fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
+        use std::fs::File;
         File::open(path)
             .and_then(|directory| directory.sync_all())
             .map_err(|error| {
