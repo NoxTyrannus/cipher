@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
-use std::fs::File;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -249,11 +248,14 @@ impl Config {
 #[allow(unused_variables)]
 fn sync_directory(path: &Path) -> Result<(), crate::common::AgentError> {
     #[cfg(unix)]
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| {
-            crate::common::AgentError::Io(format!("flush config directory {:?}: {error}", path))
-        })?;
+    {
+        use std::fs::File;
+        File::open(path)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                crate::common::AgentError::Io(format!("flush config directory {:?}: {error}", path))
+            })?;
+    }
 
     Ok(())
 }

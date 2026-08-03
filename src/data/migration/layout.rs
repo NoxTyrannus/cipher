@@ -3,9 +3,7 @@ use crate::data::permissions::{ensure_private_directory, secure_existing_file};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-#[cfg(not(windows))]
-use std::fs::File;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
