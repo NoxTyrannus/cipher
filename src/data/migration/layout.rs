@@ -626,14 +626,32 @@ fn sync_tree(directory: &Path) -> Result<()> {
             sync_tree(&path)?;
         } else if metadata.is_file() {
             secure_existing_file(&path)?;
-            File::open(&path)
-                .and_then(|file| file.sync_all())
-                .map_err(|error| layout_error(format!("cannot sync generation file: {error}")))?;
+            sync_generation_file(&path)?;
         } else {
             return Err(layout_error("generation tree contains a special file"));
         }
     }
     sync_directory(directory)
+}
+
+fn sync_generation_file(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        // Windows: FlushFileBuffers 需要写句柄 — 只读 File::open 的 sync_all 会
+        // Access denied (os error 5)。读写打开后 sync, 失败仅告警 (Windows 写缓冲由系统管理)。
+        if let Ok(file) = File::options().write(true).open(path) {
+            if let Err(e) = file.sync_all() {
+                tracing::warn!("sync generation file (windows, non-fatal): {e}");
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| layout_error(format!("cannot sync generation file: {error}")))
+    }
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
