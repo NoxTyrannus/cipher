@@ -246,6 +246,7 @@ impl Config {
     }
 }
 
+#[allow(unused_variables)]
 fn sync_directory(path: &Path) -> Result<(), crate::common::AgentError> {
     #[cfg(unix)]
     File::open(path)
