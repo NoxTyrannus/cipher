@@ -28,7 +28,7 @@ fs2 = "0.4"
 jsonschema = { version = "0.47", default-features = false }
 
 # Data layer (D-6, iter59 2026-06-12) — 1 库嵌入 (per ADR-106, 替代 ADR-095)
-duckdb = { version = "1.10503.1", features = ["bundled"] }    # 5 注册表 (per ADR-128 双库)
+duckdb = { version = "1.10505.0", features = ["bundled"] }    # 5 注册表 (per ADR-128 双库)
 hnsw_rs = "0.3"                                                # 应用层 HNSW ANN (preference_rag 向量检索, per iter59)
 # TriviumDB 5 记忆 (per ADR-128 双库, 替代 DuckDB 5 记忆表)
 triviumdb = "0.7"
