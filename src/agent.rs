@@ -1,7 +1,6 @@
 pub mod agent_pool;
 pub mod communication;
 pub mod context_assembler;
-pub mod decision;
 pub mod dispatcher;
 pub mod execution_platform;
 pub mod insight_platform;

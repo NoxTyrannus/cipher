@@ -35,25 +35,58 @@ impl fmt::Display for OutputValidationError {
 pub fn parse_agent_output(
     content: &str,
 ) -> std::result::Result<AgentOutput, Vec<OutputValidationError>> {
-    let mut output = serde_json::from_str::<AgentOutput>(content.trim()).map_err(|error| {
-        let message = match error.classify() {
-            serde_json::error::Category::Syntax | serde_json::error::Category::Eof => format!(
-                "output is not valid JSON at line {} column {}",
-                error.line(),
-                error.column()
-            ),
-            serde_json::error::Category::Data => format!(
-                "output must be an object containing only string-or-null think/say fields at line {} column {}",
-                error.line(),
-                error.column()
-            ),
-            serde_json::error::Category::Io => "output JSON could not be read".to_string(),
-        };
-        vec![OutputValidationError::new("invalid_json_output", message)]
-    })?;
+    let mut output = match serde_json::from_str::<AgentOutput>(content.trim()) {
+        Ok(output) => output,
+        Err(first_error) => match recover_agent_output(content) {
+            Some(output) => output,
+            None => {
+                let message = match first_error.classify() {
+                    serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
+                        format!(
+                            "output is not valid JSON at line {} column {}",
+                            first_error.line(),
+                            first_error.column()
+                        )
+                    }
+                    serde_json::error::Category::Data => format!(
+                        "output must be an object containing only string-or-null think/say fields at line {} column {}",
+                        first_error.line(),
+                        first_error.column()
+                    ),
+                    serde_json::error::Category::Io => "output JSON could not be read".to_string(),
+                };
+                return Err(vec![OutputValidationError::new(
+                    "invalid_json_output",
+                    message,
+                )]);
+            }
+        },
+    };
     output.think = normalize_optional_text(output.think);
     output.say = normalize_optional_text(output.say);
     Ok(output)
+}
+
+/// 容错链: 直接解析失败后, 依次尝试围栏块 → 剥离推理前言 → 取首个 JSON 对象。
+fn recover_agent_output(content: &str) -> Option<AgentOutput> {
+    for candidate in agent_output_candidates(content) {
+        if let Ok(output) = serde_json::from_str::<AgentOutput>(&candidate) {
+            return Some(output);
+        }
+    }
+    None
+}
+
+fn agent_output_candidates(content: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(block) = crate::common::json_util::extract_json_block(content) {
+        candidates.push(block);
+    }
+    let stripped = crate::common::json_util::strip_reasoning_preamble(content);
+    if let Some(obj) = crate::common::json_util::extract_first_json_object(&stripped) {
+        candidates.push(obj);
+    }
+    candidates
 }
 
 pub fn validate_agent_output(
@@ -141,12 +174,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_plain_text_fenced_json_and_unknown_fields() {
+    fn rejects_plain_text_unknown_fields_and_wrong_types() {
         assert!(parse_agent_output("").is_err());
         assert!(parse_agent_output("plain text").is_err());
-        assert!(parse_agent_output("```json\n{\"think\":\"x\"}\n```").is_err());
         assert!(parse_agent_output(r#"{"think":"x","message":"legacy"}"#).is_err());
         assert!(parse_agent_output(r#"{"think":42}"#).is_err());
+    }
+
+    #[test]
+    fn accepts_fenced_json_block() {
+        let output = parse("```json\n{\"think\":\"x\"}\n```");
+        assert_eq!(output.think.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn accepts_think_reasoning_prefix() {
+        let output = parse("<think>I should inspect the logs first.</think>\n{\"think\":\"inspect logs\",\"say\":\"checking.\"}");
+        assert_eq!(output.think.as_deref(), Some("inspect logs"));
+        assert_eq!(output.say.as_deref(), Some("checking."));
+    }
+
+    #[test]
+    fn rejects_pure_prose_without_json() {
+        let err = parse_agent_output("<think>planning step</think>\n这是纯散文, 没有 JSON 对象。")
+            .unwrap_err();
+        assert!(err.iter().any(|e| e.code == "invalid_json_output"));
     }
 
     #[test]
