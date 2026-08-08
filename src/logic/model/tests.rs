@@ -32,9 +32,8 @@ async fn openai_call_sends_authorization_bearer() {
     let p = OpenAiProvider::new();
     let req = LlmRequest {
         model: "gpt-4o".to_string(),
-        messages: vec![Message {
-            role: MessageRole::User,
-            content: "hi".to_string(),
+        messages: vec![ChatMessage::User {
+            text: "hi".to_string(),
         }],
         api_url: format!("{url_trimmed}/v1"),
         api_key: Some(secrecy::SecretString::new("sk-test".to_string())),
@@ -60,9 +59,8 @@ async fn anthropic_call_sends_x_api_key_header() {
     let p = AnthropicProvider::new();
     let req = LlmRequest {
         model: "claude-3-5-sonnet".to_string(),
-        messages: vec![Message {
-            role: MessageRole::User,
-            content: "hi".to_string(),
+        messages: vec![ChatMessage::User {
+            text: "hi".to_string(),
         }],
         max_tokens: Some(1024),
         api_url: url_trimmed,
@@ -97,9 +95,8 @@ async fn anthropic_call_parses_tool_use() {
     let p = AnthropicProvider::new();
     let req = LlmRequest {
         model: "claude-3-5-sonnet".to_string(),
-        messages: vec![Message {
-            role: MessageRole::User,
-            content: "hi".to_string(),
+        messages: vec![ChatMessage::User {
+            text: "hi".to_string(),
         }],
         max_tokens: Some(1024),
         api_url: url_trimmed,
@@ -130,9 +127,8 @@ async fn provider_returns_llm_error_on_4xx() {
     let p = OpenAiProvider::new();
     let req = LlmRequest {
         model: "gpt-4o".to_string(),
-        messages: vec![Message {
-            role: MessageRole::User,
-            content: "hi".to_string(),
+        messages: vec![ChatMessage::User {
+            text: "hi".to_string(),
         }],
         api_url: format!("{url_trimmed}/v1"),
         api_key: Some(secrecy::SecretString::new("sk-bad".to_string())),
@@ -148,9 +144,8 @@ async fn provider_returns_io_error_on_connection_refused() {
     let p = OpenAiProvider::new();
     let req = LlmRequest {
         model: "gpt-4o".to_string(),
-        messages: vec![Message {
-            role: MessageRole::User,
-            content: "hi".to_string(),
+        messages: vec![ChatMessage::User {
+            text: "hi".to_string(),
         }],
         api_url: "http://127.0.0.1:1/v1".to_string(),
         api_key: Some(secrecy::SecretString::new("sk-test".to_string())),
@@ -208,9 +203,8 @@ async fn openai_call_parses_tool_calls() {
     let p = OpenAiProvider::new();
     let req = LlmRequest {
         model: "gpt-4o".to_string(),
-        messages: vec![Message {
-            role: MessageRole::User,
-            content: "hi".to_string(),
+        messages: vec![ChatMessage::User {
+            text: "hi".to_string(),
         }],
         api_url: format!("{url_trimmed}/v1"),
         api_key: Some(secrecy::SecretString::new("sk-test".to_string())),

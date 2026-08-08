@@ -10,8 +10,9 @@ use serde_json::Value;
 use crate::agent::communication::CognitiveFragment;
 use crate::data::triviumdb::TriviumDb;
 use crate::data::ModelRow;
+use crate::logic::model::message::{ChatMessage, SystemKind};
 use crate::logic::model::prompts::read_platform_prompt;
-use crate::logic::model::provider::{LlmProvider, LlmRequest, Message, MessageRole};
+use crate::logic::model::provider::{LlmProvider, LlmRequest};
 
 #[allow(dead_code)]
 pub struct CognitiveAgent {
@@ -99,14 +100,11 @@ impl CognitiveAgent {
         };
 
         let messages = vec![
-            Message {
-                role: MessageRole::System,
-                content: prompt,
+            ChatMessage::System {
+                text: prompt,
+                kind: SystemKind::Primary,
             },
-            Message {
-                role: MessageRole::User,
-                content: user_content,
-            },
+            ChatMessage::User { text: user_content },
         ];
 
         let req = LlmRequest::from_model_row(&self.model_row, messages, api_key)?;

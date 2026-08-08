@@ -3,7 +3,7 @@ use crate::agent::agent_pool::AgentPool;
 use crate::agent::thought::{InternalPlatform, ThinkingInput, ThinkingTerminalState};
 use crate::common::{AgentError, Result};
 use crate::data::thought_store::ThoughtStore;
-use crate::logic::model::provider::{Message, MessageRole};
+use crate::logic::model::message::{ChatMessage, MemoryKind, SystemKind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -173,7 +173,7 @@ impl ContextAssembler {
         &self,
         user_input: &str,
         mode_hint: &str,
-    ) -> (String, Vec<Message>) {
+    ) -> (String, Vec<ChatMessage>) {
         let window = self.config.context_window;
 
         let system_prompt =
@@ -237,24 +237,20 @@ impl ContextAssembler {
         messages.extend(attention_msgs);
 
         for msg in &recent_messages {
-            messages.push(Message {
-                role: msg.role.parse().unwrap_or(MessageRole::User),
-                content: msg.content.clone(),
-            });
+            messages.push(chat_message_of(msg));
         }
 
         messages.extend(experience_msgs);
         messages.extend(preference_msgs);
 
-        messages.push(Message {
-            role: MessageRole::User,
-            content: user_input.to_string(),
+        messages.push(ChatMessage::User {
+            text: user_input.to_string(),
         });
 
         (system_prompt, messages)
     }
 
-    async fn read_trivium_memories(&self, memory_type: &str, quota: usize) -> Vec<Message> {
+    async fn read_trivium_memories(&self, memory_type: &str, quota: usize) -> Vec<ChatMessage> {
         if let Some(shared) = &self.shared_trivium {
             let db = shared.lock().await;
             return self.read_memories_with_db(&db, memory_type, quota);
@@ -271,7 +267,7 @@ impl ContextAssembler {
         db: &crate::data::triviumdb::TriviumDb,
         memory_type: &str,
         quota: usize,
-    ) -> Vec<Message> {
+    ) -> Vec<ChatMessage> {
         let mut budget = ContextBudget::new(quota);
         let mut messages = Vec::new();
 
@@ -298,9 +294,9 @@ impl ContextAssembler {
                 break;
             }
 
-            messages.push(Message {
-                role: MessageRole::System,
-                content,
+            messages.push(ChatMessage::System {
+                text: content,
+                kind: SystemKind::Memory(memory_kind_of(memory_type)),
             });
         }
 
@@ -582,12 +578,49 @@ fn build_pool_snapshot_text(snapshot: &[AgentEntry]) -> String {
     lines.join("\n")
 }
 
+fn memory_kind_of(memory_type: &str) -> MemoryKind {
+    match memory_type {
+        "attention" => MemoryKind::Attention,
+        "experience" => MemoryKind::Experience,
+        "preference" => MemoryKind::Preference,
+        _ => MemoryKind::Cognitive,
+    }
+}
+
+fn chat_message_of(parsed: &ParsedMessage) -> ChatMessage {
+    match parsed.role.as_str() {
+        "user" => ChatMessage::User {
+            text: parsed.content.clone(),
+        },
+        "assistant" => ChatMessage::Assistant {
+            text: parsed.content.clone(),
+            tool_calls: Vec::new(),
+        },
+        "system" => ChatMessage::System {
+            text: parsed.content.clone(),
+            kind: SystemKind::Meta,
+        },
+        _ => ChatMessage::User {
+            text: parsed.content.clone(),
+        },
+    }
+}
+
+fn message_text(m: &ChatMessage) -> &str {
+    match m {
+        ChatMessage::System { text, .. } => text,
+        ChatMessage::User { text } => text,
+        ChatMessage::Assistant { text, .. } => text,
+        ChatMessage::ToolResult { text, .. } => text,
+    }
+}
+
 fn pct_of(window: usize, pct: f64) -> usize {
     ((window as f64) * pct / 100.0) as usize
 }
 
-fn total_tokens(msgs: &[Message]) -> usize {
-    msgs.iter().map(|m| estimate_tokens(&m.content)).sum()
+fn total_tokens(msgs: &[ChatMessage]) -> usize {
+    msgs.iter().map(|m| estimate_tokens(message_text(m))).sum()
 }
 
 #[allow(dead_code)]
@@ -900,8 +933,7 @@ mod tests {
         assert!(!system_prompt.is_empty());
 
         let last = messages.last().unwrap();
-        assert_eq!(last.role, MessageRole::User);
-        assert_eq!(last.content, "hello");
+        assert!(matches!(last, ChatMessage::User { text } if text == "hello"));
     }
 
     #[tokio::test]
@@ -915,8 +947,10 @@ mod tests {
         let (_system_prompt, messages) = assembler.build_messages("test input", "unni").await;
 
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].role, MessageRole::User);
-        assert_eq!(messages[0].content, "test input");
+        assert!(matches!(
+            &messages[0],
+            ChatMessage::User { text } if text == "test input"
+        ));
     }
 
     #[tokio::test]
@@ -943,14 +977,17 @@ mod tests {
 
         let has_user_turn = messages
             .iter()
-            .any(|m| m.content.contains("User question one"));
+            .any(|m| message_text(m).contains("User question one"));
         let has_assistant_turn = messages
             .iter()
-            .any(|m| m.content.contains("Assistant reply two"));
+            .any(|m| message_text(m).contains("Assistant reply two"));
         assert!(has_user_turn, "should contain user turn 1");
         assert!(has_assistant_turn, "should contain assistant turn 2");
 
-        assert_eq!(messages.last().unwrap().content, "new question");
+        assert!(matches!(
+            messages.last().unwrap(),
+            ChatMessage::User { text } if text == "new question"
+        ));
     }
 
     #[tokio::test]
@@ -1013,13 +1050,13 @@ mod tests {
 
         assert!(messages
             .iter()
-            .any(|message| message.content == "durable earlier question"));
+            .any(|message| message_text(message) == "durable earlier question"));
         let assistant_history = messages
             .iter()
-            .find(|message| message.role == MessageRole::Assistant)
+            .find(|message| matches!(message, ChatMessage::Assistant { .. }))
             .expect("completed Thought should produce assistant history");
         let parsed_history =
-            crate::agent::output::parse_agent_output(&assistant_history.content).unwrap();
+            crate::agent::output::parse_agent_output(message_text(assistant_history)).unwrap();
         assert_eq!(
             parsed_history.think.as_deref(),
             Some("durable earlier work")
@@ -1030,12 +1067,15 @@ mod tests {
         );
         assert!(!messages
             .iter()
-            .any(|message| { message.content == "incomplete input must not be duplicated" }));
+            .any(|message| { message_text(message) == "incomplete input must not be duplicated" }));
         assert!(!messages.iter().any(|message| {
-            message.content == "failed input must not become orphan history"
-                || message.content == "cancelled input must not become orphan history"
+            message_text(message) == "failed input must not become orphan history"
+                || message_text(message) == "cancelled input must not become orphan history"
         }));
-        assert_eq!(messages.last().unwrap().content, "current question");
+        assert!(matches!(
+            messages.last().unwrap(),
+            ChatMessage::User { text } if text == "current question"
+        ));
         assert_eq!(
             completed.output.unwrap().terminal_state,
             ThinkingTerminalState::Completed
@@ -1066,7 +1106,7 @@ mod tests {
 
         let assistant_count = messages
             .iter()
-            .filter(|m| m.content.contains("Turn") && m.content.contains("content"))
+            .filter(|m| message_text(m).contains("Turn") && message_text(m).contains("content"))
             .count();
         assert!(assistant_count > 0, "should have at least some history");
     }
@@ -1105,7 +1145,9 @@ mod tests {
 
         let (_s, msgs) = assembler.build_messages("q", "unni").await;
         assert!(
-            !msgs.iter().any(|m| m.content.contains("用户偏好 Rust")),
+            !msgs
+                .iter()
+                .any(|m| message_text(m).contains("用户偏好 Rust")),
             "无 active 版本时 attention 不可见"
         );
 
@@ -1122,7 +1164,8 @@ mod tests {
         }
         let (_s, msgs) = assembler.build_messages("q", "unni").await;
         assert!(
-            msgs.iter().any(|m| m.content.contains("用户偏好 Rust")),
+            msgs.iter()
+                .any(|m| message_text(m).contains("用户偏好 Rust")),
             "publish 后 attention 应注入上下文"
         );
     }

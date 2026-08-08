@@ -8,8 +8,9 @@ use crate::data::triviumdb::TriviumDb;
 use crate::data::ModelRow;
 use crate::logic::capability::executor::CapabilityExecutor;
 use crate::logic::capability::service::{CapabilityCall, CapabilityService};
+use crate::logic::model::message::{ChatMessage, SystemKind};
 use crate::logic::model::prompts::read_platform_prompt;
-use crate::logic::model::provider::{LlmProvider, LlmRequest, Message, MessageRole};
+use crate::logic::model::provider::{LlmProvider, LlmRequest};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -35,6 +36,30 @@ fn select_prompt(kind: &str, prompts_dir: &Path) -> String {
     } else {
         read_platform_prompt(prompts_dir, "execution_platform.md")
     }
+}
+
+/// prefilled_arguments 总大小超过该阈值时禁止预填, 自动降级为 subagent 执行。
+const PREFILLED_MAX_BYTES: usize = 8192;
+
+/// subagent 循环最大轮数 (模型不可配置)。
+const SUBAGENT_MAX_TURNS: u32 = 6;
+
+/// 设计解析失败后的重试提示: 原错误信息原样保留, 并附加具体修复指引。
+fn design_retry_prompt(base_prompt: &str, first_error: &str) -> String {
+    format!(
+        "{base_prompt}\n\n## 上次输出解析失败\n{first_error}\n\
+         请修正输出使其是**单个完整 JSON 对象** (不要多余闭合括号/不要截断), 重新输出。\n\
+         若失败原因是嵌入了过长的内容（如文件全文/大段文本），不要把它放进 \
+         prefilled_arguments——省略 prefilled_arguments，subagent 会在执行时生成内容；\
+         或对 file.write 类节点改为先用 shell.exec 分块写入。\n\
+         prefilled_arguments 必须严格匹配能力 schema 的 required 字段与类型。"
+    )
+}
+
+/// 判定 prefilled_arguments 是否超限。返回实际字节数; 未超限返回 None。
+fn prefilled_arguments_oversized(args: &serde_json::Value) -> Option<usize> {
+    let size = serde_json::to_string(args).map(|s| s.len()).unwrap_or(0);
+    (size > PREFILLED_MAX_BYTES).then_some(size)
 }
 
 #[cfg(test)]
@@ -70,8 +95,6 @@ pub struct DagNodeDesign {
     pub arguments: Option<serde_json::Value>,
     #[serde(default)]
     pub depends_on: Vec<String>,
-    #[serde(default = "default_max_turns")]
-    pub max_turns: u32,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u32,
 }
@@ -145,17 +168,46 @@ fn default_timeout_seconds() -> u32 {
 }
 
 fn parse_execution_design(content: &str) -> Result<ExecutionDesign> {
+    probe_parse_execution_design(content).0
+}
+
+/// 供探针 (examples/exec_probe) 使用的解析入口: 返回 (解析结果, 尝试次数)。
+/// 直接解析计 1 次; 直接失败且 repair 后重试计 2 次。
+#[doc(hidden)]
+pub fn probe_parse_execution_design(content: &str) -> (Result<ExecutionDesign>, u32) {
     let cleaned = preprocess_llm_json(content);
 
-    if let Ok(dag) = serde_json::from_str::<DagDesign>(&cleaned) {
+    match parse_design_attempt(&cleaned) {
+        Ok(design) => (Ok(design), 1),
+        Err(first_error) => {
+            let repaired = crate::common::json_util::repair_json(&cleaned);
+            if repaired != cleaned {
+                tracing::warn!(
+                    "execution_platform: 设计 JSON 直接解析失败, repair 后重试: {first_error}"
+                );
+                let retried = parse_design_attempt(&repaired).map_err(|second_error| {
+                    AgentError::Parse(format!(
+                        "execution_platform: repair 后仍解析失败: {second_error} (原错误: {first_error})"
+                    ))
+                });
+                (retried, 2)
+            } else {
+                (Err(first_error), 1)
+            }
+        }
+    }
+}
+
+fn parse_design_attempt(cleaned: &str) -> Result<ExecutionDesign> {
+    if let Ok(dag) = serde_json::from_str::<DagDesign>(cleaned) {
         if dag.template_kind == "dag" && !dag.nodes.is_empty() {
             return Ok(ExecutionDesign::Dag(dag));
         }
     }
-    if has_nodes_signature(&cleaned) {
-        match parse_task_flow_tolerant(&cleaned) {
+    if has_nodes_signature(cleaned) {
+        match parse_task_flow_tolerant(cleaned) {
             Ok(design) => return Ok(design),
-            Err(parse_error) => match extract_flow_nodes_tolerant(content) {
+            Err(parse_error) => match extract_flow_nodes_tolerant(cleaned) {
                 Some(flow) => {
                     tracing::warn!(
                             "execution_platform: TaskFlow 整体解析失败, 逐节点提取兜底恢复 {} 节点: {parse_error}",
@@ -168,7 +220,7 @@ fn parse_execution_design(content: &str) -> Result<ExecutionDesign> {
         }
     }
 
-    if let Some(flow) = extract_flow_nodes_tolerant(content) {
+    if let Some(flow) = extract_flow_nodes_tolerant(cleaned) {
         tracing::warn!(
             "execution_platform: TaskFlow 无有效整体签名, 逐节点提取兜底恢复 {} 节点",
             flow.nodes.len()
@@ -176,13 +228,13 @@ fn parse_execution_design(content: &str) -> Result<ExecutionDesign> {
         return Ok(ExecutionDesign::Flow(flow));
     }
 
-    if let Ok(single) = serde_json::from_str::<SubAgentDesign>(&cleaned) {
+    if let Ok(single) = serde_json::from_str::<SubAgentDesign>(cleaned) {
         return Ok(ExecutionDesign::Single(single));
     }
 
     Err(AgentError::Parse(format!(
         "execution_platform: failed to parse ExecutionDesign from LLM content: {}",
-        crate::common::json_util::truncate_utf8_boundary(content, 2000)
+        crate::common::json_util::truncate_utf8_boundary(cleaned, 2000)
     )))
 }
 
@@ -454,22 +506,86 @@ enum SubagentAction {
 }
 
 fn parse_subagent_output(content: &str) -> SubagentAction {
-    let json_text = extract_json_block(content).unwrap_or_else(|| content.trim().to_string());
-    let value: serde_json::Value = match serde_json::from_str(&json_text) {
-        Ok(v) => v,
-        Err(e) => return SubagentAction::Invalid(format!("invalid JSON: {e}")),
-    };
-    if let Some(args) = value.get("arguments") {
-        return SubagentAction::Arguments {
-            arguments: args.clone(),
-        };
+    let mut specific_reason: Option<String> = None;
+    for candidate in subagent_parse_candidates(content) {
+        match parse_subagent_action_json(&candidate) {
+            Ok(action) => return action,
+            Err(SubagentParseError::ArgumentsNotObject(reason)) => {
+                if specific_reason.is_none() {
+                    specific_reason = Some(reason);
+                }
+            }
+            Err(SubagentParseError::NotAction) => {}
+        }
+        let repaired = crate::common::json_util::repair_json(&candidate);
+        if repaired != candidate {
+            tracing::warn!("parse_subagent_output: 直接解析失败, repair 后重试");
+            if let Ok(action) = parse_subagent_action_json(&repaired) {
+                return action;
+            }
+        }
     }
-    if let Some(tc) = value.get("tool_call") {
-        let arguments = tc
-            .get("arguments")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        return SubagentAction::Arguments { arguments };
+    SubagentAction::Invalid(specific_reason.unwrap_or_else(|| {
+        format!(
+            "输出缺少 arguments 或 done 字段或 JSON 非法: {}",
+            &content[..content.len().min(120)]
+        )
+    }))
+}
+
+/// 逐级 fallback 候选链: 围栏块 → 剥离推理前言后取首个 JSON 对象 → 整串。
+fn subagent_parse_candidates(content: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(block) = extract_json_block(content) {
+        candidates.push(block);
+    }
+    let stripped = crate::common::json_util::strip_reasoning_preamble(content);
+    if let Some(obj) = crate::common::json_util::extract_first_json_object(&stripped) {
+        candidates.push(obj);
+    }
+    let trimmed = content.trim().to_string();
+    if !candidates.contains(&trimmed) {
+        candidates.push(trimmed);
+    }
+    candidates
+}
+
+/// subagent 动作解析错误分类。
+enum SubagentParseError {
+    /// JSON 非法或未识别为动作, 无明确原因, 走通用 Invalid 文案。
+    NotAction,
+    /// arguments 存在但非 JSON 对象, reason 直接反馈给模型。
+    ArgumentsNotObject(String),
+}
+
+fn parse_subagent_action_json(
+    json_text: &str,
+) -> std::result::Result<SubagentAction, SubagentParseError> {
+    let value: serde_json::Value =
+        serde_json::from_str(json_text).map_err(|_| SubagentParseError::NotAction)?;
+    if value.get("arguments").is_some() {
+        let args = value.get("arguments").unwrap();
+        if args.is_object() {
+            return Ok(SubagentAction::Arguments {
+                arguments: args.clone(),
+            });
+        }
+        return Err(SubagentParseError::ArgumentsNotObject(
+            "arguments 必须是 JSON 对象".to_string(),
+        ));
+    }
+    if value.get("tool_call").is_some() {
+        let tc = value.get("tool_call").unwrap();
+        if let Some(args) = tc.get("arguments") {
+            if args.is_object() {
+                return Ok(SubagentAction::Arguments {
+                    arguments: args.clone(),
+                });
+            }
+        }
+        return Err(SubagentParseError::ArgumentsNotObject(
+            "tool_call.arguments 必须是 JSON 对象".to_string(),
+        ));
     }
     if value.get("done").and_then(|v| v.as_bool()) == Some(true) {
         let summary = value
@@ -477,12 +593,9 @@ fn parse_subagent_output(content: &str) -> SubagentAction {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        return SubagentAction::Done { summary };
+        return Ok(SubagentAction::Done { summary });
     }
-    SubagentAction::Invalid(format!(
-        "输出缺少 arguments 或 done 字段: {}",
-        &json_text[..json_text.len().min(120)]
-    ))
+    Err(SubagentParseError::NotAction)
 }
 
 trait TopoNode {
@@ -729,12 +842,25 @@ impl NodeRunner {
                 let node_owned = node.clone();
                 let runner = self.clone();
                 if let Some(args) = node.prefilled_arguments.clone() {
-                    join_set.spawn(async move {
-                        runner.execute_prefilled_node(&node_owned, &args).await
-                    });
+                    match prefilled_arguments_oversized(&args) {
+                        Some(bytes) => {
+                            tracing::warn!(
+                                "execution_platform: prefilled degraded: oversized ({bytes} bytes > {PREFILLED_MAX_BYTES}), node '{}' 改走 subagent",
+                                node.id
+                            );
+                            join_set.spawn(async move {
+                                runner.run_subagent_loop(&node_owned, &dep_summary).await.0
+                            });
+                        }
+                        None => {
+                            join_set.spawn(async move {
+                                runner.execute_prefilled_node(&node_owned, &args).await
+                            });
+                        }
+                    }
                 } else {
                     join_set.spawn(async move {
-                        runner.run_subagent_loop(&node_owned, &dep_summary).await
+                        runner.run_subagent_loop(&node_owned, &dep_summary).await.0
                     });
                 }
             }
@@ -861,7 +987,8 @@ impl NodeRunner {
         }
     }
 
-    async fn run_subagent_loop(&self, node: &TaskNode, dep_summary: &str) -> NodeResult {
+    /// 返回 (NodeResult, 实际轮数)。
+    async fn run_subagent_loop(&self, node: &TaskNode, dep_summary: &str) -> (NodeResult, u32) {
         tracing::info!(
             "execution_platform: flow node '{}' subagent loop (two-stage), task='{}'",
             node.id,
@@ -892,16 +1019,15 @@ impl NodeRunner {
             schema,
         );
         let mut messages = vec![
-            Message {
-                role: MessageRole::System,
-                content: system_prompt,
+            ChatMessage::System {
+                text: system_prompt,
+                kind: SystemKind::Primary,
             },
-            Message {
-                role: MessageRole::User,
-                content: "开始执行任务。只输出 JSON。".to_string(),
+            ChatMessage::User {
+                text: "开始执行任务。只输出 JSON。".to_string(),
             },
         ];
-        let max_turns = 6u32;
+        let max_turns = SUBAGENT_MAX_TURNS;
         let mut tool_call_count = 0u32;
         for turn in 0..max_turns {
             let req = match LlmRequest::from_model_row(
@@ -912,41 +1038,50 @@ impl NodeRunner {
                 Ok(r) => r,
                 Err(e) => {
                     logs.push(format!("LLM request build failed: {e}"));
-                    return NodeResult {
-                        node_id: node.id.clone(),
-                        status: NodeStatus::Failed,
-                        summary: String::new(),
-                        error: Some(format!("LLM request build failed: {e}")),
-                        tool_call_count,
-                        tool_call_logs: logs,
-                    };
+                    return (
+                        NodeResult {
+                            node_id: node.id.clone(),
+                            status: NodeStatus::Failed,
+                            summary: String::new(),
+                            error: Some(format!("LLM request build failed: {e}")),
+                            tool_call_count,
+                            tool_call_logs: logs,
+                        },
+                        turn + 1,
+                    );
                 }
             };
             let resp = match self.provider.call(&req).await {
                 Ok(r) => r,
                 Err(e) => {
                     logs.push(format!("LLM call failed (turn {turn}): {e}"));
-                    return NodeResult {
-                        node_id: node.id.clone(),
-                        status: NodeStatus::Failed,
-                        summary: String::new(),
-                        error: Some(format!("subagent LLM call failed: {e}")),
-                        tool_call_count,
-                        tool_call_logs: logs,
-                    };
+                    return (
+                        NodeResult {
+                            node_id: node.id.clone(),
+                            status: NodeStatus::Failed,
+                            summary: String::new(),
+                            error: Some(format!("subagent LLM call failed: {e}")),
+                            tool_call_count,
+                            tool_call_logs: logs,
+                        },
+                        turn + 1,
+                    );
                 }
             };
             match parse_subagent_output(&resp.content) {
                 SubagentAction::Done { summary } => {
                     logs.push(format!("DONE: {summary}"));
-                    return NodeResult {
-                        node_id: node.id.clone(),
-                        status: NodeStatus::Completed,
-                        summary,
-                        error: None,
-                        tool_call_count,
-                        tool_call_logs: logs,
-                    };
+                    return (
+                        NodeResult {
+                            node_id: node.id.clone(),
+                            status: NodeStatus::Completed,
+                            summary,
+                            error: None,
+                            tool_call_count,
+                            tool_call_logs: logs,
+                        },
+                        turn + 1,
+                    );
                 }
                 SubagentAction::Arguments { arguments } => {
                     let capability_name = self
@@ -963,6 +1098,7 @@ impl NodeRunner {
                                 })
                         })
                         .unwrap_or_else(|| capability.clone());
+                    let history_arguments = arguments.clone();
                     let cap_call = CapabilityCall {
                         capability_id: capability.clone(),
                         capability_name,
@@ -974,8 +1110,10 @@ impl NodeRunner {
                                 if let Some(fail) = Self::output_indicates_failure(&result.output) {
                                     Err(format!("{capability}: {fail}"))
                                 } else {
-                                    let summary: String =
-                                        result.output.to_string().chars().take(300).collect();
+                                    let summary = crate::common::json_util::truncate_head_tail(
+                                        &result.output.to_string(),
+                                        4000,
+                                    );
                                     Ok(summary)
                                 }
                             }
@@ -988,20 +1126,18 @@ impl NodeRunner {
                     match outcome {
                         Ok(summary) => {
                             logs.push(format!("OK {capability}: {summary}"));
-                            messages.push(Message {
-                                role: MessageRole::Assistant,
-                                content: serde_json::json!({"tool_call": {"name": capability, "arguments": "see result"}}).to_string(),
+                            messages.push(ChatMessage::Assistant {
+                                text: serde_json::json!({"tool_call": {"name": capability, "arguments": history_arguments}}).to_string(),
+                                tool_calls: vec![],
                             });
-                            messages.push(Message {
-                                role: MessageRole::User,
-                                content: format!("能力 {capability} 执行结果: {summary}"),
+                            messages.push(ChatMessage::User {
+                                text: format!("能力 {capability} 执行结果: {summary}"),
                             });
                         }
                         Err(e) => {
                             logs.push(format!("FAIL {capability}: {e}"));
-                            messages.push(Message {
-                                role: MessageRole::User,
-                                content: format!(
+                            messages.push(ChatMessage::User {
+                                text: format!(
                                     "能力 {capability} 执行失败: {e}\n分析错误并调整参数重试, 或输出 done 结束 (说明失败原因)"
                                 ),
                             });
@@ -1010,9 +1146,8 @@ impl NodeRunner {
                 }
                 SubagentAction::Invalid(reason) => {
                     logs.push(format!("INVALID output (turn {turn}): {reason}"));
-                    messages.push(Message {
-                        role: MessageRole::User,
-                        content: format!(
+                    messages.push(ChatMessage::User {
+                        text: format!(
                             "你的输出无法解析: {reason}\n只输出 JSON: {{\"arguments\": {{...}}}} 或 {{\"done\": true, \"summary\": \"...\"}}"
                         ),
                     });
@@ -1020,14 +1155,17 @@ impl NodeRunner {
             }
         }
         logs.push(format!("EXCEEDED max_turns={max_turns}"));
-        NodeResult {
-            node_id: node.id.clone(),
-            status: NodeStatus::Failed,
-            summary: String::new(),
-            error: Some(format!("subagent exceeded max_turns={max_turns}")),
-            tool_call_count,
-            tool_call_logs: logs,
-        }
+        (
+            NodeResult {
+                node_id: node.id.clone(),
+                status: NodeStatus::Failed,
+                summary: String::new(),
+                error: Some(format!("subagent exceeded max_turns={max_turns}")),
+                tool_call_count,
+                tool_call_logs: logs,
+            },
+            max_turns,
+        )
     }
 
     fn capability_service(&self) -> std::result::Result<Option<CapabilityService<'_>>, String> {
@@ -1070,6 +1208,52 @@ pub struct ExecutionPlatform {
     registry: Option<Registry>,
 
     executor: Option<Arc<CapabilityExecutor>>,
+}
+
+/// 探针 (examples/exec_probe) 输出的设计阶段指标。
+#[doc(hidden)]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProbeDesignStats {
+    pub parse_attempts: u32,
+    pub parse_ok: bool,
+    pub node_count: usize,
+    pub error: Option<String>,
+    pub kind: String,
+}
+
+/// 探针 (examples/exec_probe) 输出的单节点指标。
+#[doc(hidden)]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProbeNodeStats {
+    pub node_id: String,
+    pub capability: String,
+    pub path: String,
+    pub status: String,
+    pub tool_calls: u32,
+    pub turns: u32,
+    pub duration_ms: u64,
+    pub error: Option<String>,
+    pub logs: Vec<String>,
+}
+
+/// 探针 (examples/exec_probe) 输出的 usage 汇总。
+#[doc(hidden)]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProbeUsage {
+    pub prompt: u32,
+    pub completion: u32,
+}
+
+/// 探针 (examples/exec_probe) 的整体运行报告。
+#[doc(hidden)]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProbeRunReport {
+    pub goal: String,
+    pub design: ProbeDesignStats,
+    pub nodes: Vec<ProbeNodeStats>,
+    pub ok: bool,
+    pub total_duration_ms: u64,
+    pub usage: Option<ProbeUsage>,
 }
 
 impl ExecutionPlatform {
@@ -1181,10 +1365,7 @@ impl ExecutionPlatform {
                 tracing::warn!(
                     "execution_platform: 设计解析失败 (turn_id={turn_id}), 重试 1 次: {first_error}"
                 );
-                let retry_prompt = format!(
-                    "{prompt}\n\n## 上次输出解析失败\n{first_error}\n\
-                     请修正输出使其是**单个完整 JSON 对象** (不要多余闭合括号/不要截断), 重新输出。"
-                );
+                let retry_prompt = design_retry_prompt(&prompt, &first_error.to_string());
                 match self.call_llm_for_design(&retry_prompt).await {
                     Ok(d) => d,
                     Err(e) => {
@@ -1502,12 +1683,25 @@ impl ExecutionPlatform {
                 let node_owned = node.clone();
                 let runner = self.node_runner();
                 if let Some(args) = node.prefilled_arguments.clone() {
-                    join_set.spawn(async move {
-                        runner.execute_prefilled_node(&node_owned, &args).await
-                    });
+                    match prefilled_arguments_oversized(&args) {
+                        Some(bytes) => {
+                            tracing::warn!(
+                                "execution_platform: prefilled degraded: oversized ({bytes} bytes > {PREFILLED_MAX_BYTES}), node '{}' 改走 subagent",
+                                node.id
+                            );
+                            join_set.spawn(async move {
+                                runner.run_subagent_loop(&node_owned, &dep_summary).await.0
+                            });
+                        }
+                        None => {
+                            join_set.spawn(async move {
+                                runner.execute_prefilled_node(&node_owned, &args).await
+                            });
+                        }
+                    }
                 } else {
                     join_set.spawn(async move {
-                        runner.run_subagent_loop(&node_owned, &dep_summary).await
+                        runner.run_subagent_loop(&node_owned, &dep_summary).await.0
                     });
                 }
             }
@@ -1728,7 +1922,6 @@ impl ExecutionPlatform {
                 format!("node_id: {}", node.id),
                 format!("task_context: {}", node.task_context),
                 format!("capabilities: {:?}", node.capability_ids),
-                format!("max_turns: {}", node.max_turns),
                 format!("timeout: {}s", node.timeout_seconds),
             ];
             lines.push("NO_RUNTIME: registry/executor 未配置, 降级模拟".to_string());
@@ -1891,13 +2084,12 @@ impl ExecutionPlatform {
 
     async fn call_llm_for_design(&self, prompt: &str) -> Result<ExecutionDesign> {
         let messages = vec![
-            Message {
-                role: MessageRole::System,
-                content: prompt.to_string(),
+            ChatMessage::System {
+                text: prompt.to_string(),
+                kind: SystemKind::Primary,
             },
-            Message {
-                role: MessageRole::User,
-                content: "Design the execution plan now. Output ONLY the JSON.".to_string(),
+            ChatMessage::User {
+                text: "Design the execution plan now. Output ONLY the JSON.".to_string(),
             },
         ];
 
@@ -1906,6 +2098,272 @@ impl ExecutionPlatform {
         let resp = self.provider.call(&req).await?;
 
         parse_execution_design(&resp.content)
+    }
+
+    /// 探针 (examples/exec_probe) 最小入口: 设计→执行全链路, 返回机器可读指标。
+    /// 不触发 DM/洞察/记忆; 直接走 TaskFlow 设计→节点执行路径。
+    #[doc(hidden)]
+    pub async fn probe_goal(&self, goal: &str) -> ProbeRunReport {
+        let started = std::time::Instant::now();
+        let template_kind = infer_template_kind(goal, &[]);
+        let base_prompt = build_execution_prompt(
+            template_kind,
+            goal,
+            &[],
+            self.prompts_dir.as_deref(),
+            &self.capability_ids,
+            self.registry.as_ref(),
+        );
+        let prompt = self.enrich_prompt_with_environment(&base_prompt).await;
+
+        let mut parse_attempts = 0u32;
+        let mut design_outcome: Result<ExecutionDesign> = Err(AgentError::Parse(
+            "probe: design LLM call did not run".to_string(),
+        ));
+        let mut usage: Option<ProbeUsage> = None;
+
+        for round in 0..2u32 {
+            let round_prompt = if round == 0 {
+                prompt.clone()
+            } else {
+                let err = match &design_outcome {
+                    Err(e) => e.to_string(),
+                    Ok(_) => break,
+                };
+                design_retry_prompt(&prompt, &err)
+            };
+            match self.probe_call_for_design(&round_prompt).await {
+                Ok((design, attempts, round_usage)) => {
+                    parse_attempts += attempts;
+                    if let Some(u) = round_usage {
+                        usage = Some(ProbeUsage {
+                            prompt: u.prompt_tokens,
+                            completion: u.completion_tokens,
+                        });
+                    }
+                    design_outcome = Ok(design);
+                    break;
+                }
+                Err((parse_err, attempts, round_usage)) => {
+                    parse_attempts += attempts;
+                    if let Some(u) = round_usage {
+                        usage = Some(ProbeUsage {
+                            prompt: u.prompt_tokens,
+                            completion: u.completion_tokens,
+                        });
+                    }
+                    design_outcome = Err(parse_err);
+                }
+            }
+        }
+
+        let design_report = match &design_outcome {
+            Ok(ExecutionDesign::Flow(flow)) => ProbeDesignStats {
+                parse_attempts,
+                parse_ok: true,
+                node_count: flow.nodes.len(),
+                error: None,
+                kind: "flow".to_string(),
+            },
+            Ok(ExecutionDesign::Single(_single)) => ProbeDesignStats {
+                parse_attempts,
+                parse_ok: true,
+                node_count: 1,
+                error: None,
+                kind: "single".to_string(),
+            },
+            Ok(ExecutionDesign::Dag(dag)) => ProbeDesignStats {
+                parse_attempts,
+                parse_ok: true,
+                node_count: dag.nodes.len(),
+                error: None,
+                kind: "dag".to_string(),
+            },
+            Err(e) => ProbeDesignStats {
+                parse_attempts,
+                parse_ok: false,
+                node_count: 0,
+                error: Some(e.to_string()),
+                kind: "none".to_string(),
+            },
+        };
+
+        let mut nodes: Vec<ProbeNodeStats> = Vec::new();
+        if let Ok(ExecutionDesign::Flow(flow)) = &design_outcome {
+            nodes = self.probe_execute_flow(flow).await;
+        } else if let Ok(ExecutionDesign::Single(single)) = &design_outcome {
+            let start = std::time::Instant::now();
+            let capability = single.capability_ids.first().cloned().unwrap_or_default();
+            let result = self.dispatch_single_subagent(single).await;
+            nodes.push(ProbeNodeStats {
+                node_id: "subagent-1".to_string(),
+                capability,
+                path: "subagent".to_string(),
+                status: format!("{:?}", result.status),
+                tool_calls: result.tool_call_count,
+                turns: 1,
+                duration_ms: start.elapsed().as_millis() as u64,
+                error: result.error.clone(),
+                logs: result.tool_call_logs.clone(),
+            });
+        }
+
+        let ok = design_report.parse_ok
+            && nodes
+                .iter()
+                .all(|n| n.status == format!("{:?}", NodeStatus::Completed));
+
+        ProbeRunReport {
+            goal: goal.to_string(),
+            design: design_report,
+            nodes,
+            ok,
+            total_duration_ms: started.elapsed().as_millis() as u64,
+            usage,
+        }
+    }
+
+    /// 探针用的设计 LLM 调用: 返回 (设计, 解析尝试次数, usage)。
+    /// 失败时返回 Err((解析错误, 尝试次数, usage))。
+    async fn probe_call_for_design(
+        &self,
+        prompt: &str,
+    ) -> std::result::Result<
+        (
+            ExecutionDesign,
+            u32,
+            Option<crate::logic::model::provider::Usage>,
+        ),
+        (
+            AgentError,
+            u32,
+            Option<crate::logic::model::provider::Usage>,
+        ),
+    > {
+        let messages = vec![
+            ChatMessage::System {
+                text: prompt.to_string(),
+                kind: SystemKind::Primary,
+            },
+            ChatMessage::User {
+                text: "Design the execution plan now. Output ONLY the JSON.".to_string(),
+            },
+        ];
+        let req = match LlmRequest::from_model_row(&self.model_row, messages, self.api_key.clone())
+        {
+            Ok(r) => r,
+            Err(e) => return Err((e, 0, None)),
+        };
+        let resp = match self.provider.call(&req).await {
+            Ok(r) => r,
+            Err(e) => return Err((e, 0, None)),
+        };
+        let (parsed, attempts) = probe_parse_execution_design(&resp.content);
+        match parsed {
+            Ok(design) => Ok((design, attempts, resp.usage)),
+            Err(e) => Err((e, attempts, resp.usage)),
+        }
+    }
+
+    /// 探针用的串行流式执行: 逐层逐节点执行并记录指标 (path/turns/duration)。
+    async fn probe_execute_flow(&self, flow: &TaskFlow) -> Vec<ProbeNodeStats> {
+        let layers = match topological_layers(&flow.nodes) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("probe: flow cycle detected: {e}");
+                return flow
+                    .nodes
+                    .iter()
+                    .map(|n| ProbeNodeStats {
+                        node_id: n.id.clone(),
+                        capability: n.capability.clone(),
+                        path: "skipped".to_string(),
+                        status: format!("{:?}", NodeStatus::Failed),
+                        tool_calls: 0,
+                        turns: 0,
+                        duration_ms: 0,
+                        error: Some(format!("flow cycle: {e}")),
+                        logs: vec![],
+                    })
+                    .collect();
+            }
+        };
+        let by_id: HashMap<String, &TaskNode> =
+            flow.nodes.iter().map(|n| (n.id.clone(), n)).collect();
+        let mut results: HashMap<String, NodeResult> = HashMap::new();
+        let mut node_stats: Vec<ProbeNodeStats> = Vec::new();
+
+        for layer in &layers {
+            for node_id in layer {
+                let node = by_id[node_id.as_str()];
+                let failed_dep = node.depends_on.iter().find(|dep| {
+                    results
+                        .get(*dep)
+                        .is_some_and(|r| r.status != NodeStatus::Completed)
+                });
+                if let Some(dep) = failed_dep {
+                    node_stats.push(ProbeNodeStats {
+                        node_id: node.id.clone(),
+                        capability: node.capability.clone(),
+                        path: "skipped".to_string(),
+                        status: format!("{:?}", NodeStatus::Skipped),
+                        tool_calls: 0,
+                        turns: 0,
+                        duration_ms: 0,
+                        error: Some(format!("dependency '{dep}' failed/skipped")),
+                        logs: vec![],
+                    });
+                    results.insert(
+                        node.id.clone(),
+                        NodeResult {
+                            node_id: node.id.clone(),
+                            status: NodeStatus::Skipped,
+                            summary: String::new(),
+                            error: Some(format!("dependency '{dep}' failed/skipped")),
+                            tool_call_count: 0,
+                            tool_call_logs: vec![],
+                        },
+                    );
+                    continue;
+                }
+
+                let dep_summary = build_dep_summary(node, &results, &by_id);
+                let runner = self.node_runner();
+                let start = std::time::Instant::now();
+                let (result, turns, path) = if let Some(args) = node.prefilled_arguments.clone() {
+                    match prefilled_arguments_oversized(&args) {
+                        Some(bytes) => {
+                            tracing::warn!(
+                                    "probe: prefilled degraded: oversized ({bytes} bytes > {PREFILLED_MAX_BYTES}), node '{}' 改走 subagent",
+                                    node.id
+                                );
+                            let (r, t) = runner.run_subagent_loop(node, &dep_summary).await;
+                            (r, t, "degraded_subagent")
+                        }
+                        None => {
+                            let r = runner.execute_prefilled_node(node, &args).await;
+                            (r, 1, "prefilled")
+                        }
+                    }
+                } else {
+                    let (r, t) = runner.run_subagent_loop(node, &dep_summary).await;
+                    (r, t, "subagent")
+                };
+                node_stats.push(ProbeNodeStats {
+                    node_id: node.id.clone(),
+                    capability: node.capability.clone(),
+                    path: path.to_string(),
+                    status: format!("{:?}", result.status),
+                    tool_calls: result.tool_call_count,
+                    turns,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    error: result.error.clone(),
+                    logs: result.tool_call_logs.clone(),
+                });
+                results.insert(result.node_id.clone(), result);
+            }
+        }
+        node_stats
     }
 
     async fn dispatch_single_subagent(&self, design: &SubAgentDesign) -> NodeResult {
@@ -2299,6 +2757,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prefilled_small_arguments_stay_prefilled() {
+        let args = serde_json::json!({"path": "Cargo.toml"});
+        assert_eq!(prefilled_arguments_oversized(&args), None);
+    }
+
+    #[test]
+    fn prefilled_oversized_content_degrades_to_subagent() {
+        let big = "x".repeat(10_000);
+        let args = serde_json::json!({"content": big});
+        let bytes = prefilled_arguments_oversized(&args).expect("应为超限");
+        assert!(bytes > PREFILLED_MAX_BYTES, "got {bytes} bytes");
+    }
+
+    #[test]
+    fn prefilled_at_threshold_boundary() {
+        let args = serde_json::json!({"path": "a".repeat(PREFILLED_MAX_BYTES)});
+        let bytes = prefilled_arguments_oversized(&args).expect("带 JSON 包装后应超限");
+        assert!(bytes > PREFILLED_MAX_BYTES, "got {bytes} bytes");
+    }
+
+    #[test]
+    fn design_retry_prompt_keeps_error_and_adds_guidance() {
+        let prompt = design_retry_prompt("BASE", "line 1: expected value at line 3 column 7");
+        assert!(prompt.starts_with("BASE"), "原 prompt 前置保留");
+        assert!(
+            prompt.contains("line 1: expected value at line 3 column 7"),
+            "解析错误信息(含行列位置)原样保留"
+        );
+        assert!(
+            prompt.contains("不要把它放进 prefilled_arguments"),
+            "缺少过长内容降级指引"
+        );
+        assert!(
+            prompt.contains("prefilled_arguments 必须严格匹配能力 schema 的 required 字段与类型"),
+            "缺少 schema 匹配指引"
+        );
+    }
+
+    #[test]
     fn parse_execution_design_prefers_task_flow() {
         let content = r#"{
             "template_kind": "normal",
@@ -2644,6 +3141,65 @@ mod tests {
     }
 
     #[test]
+    fn parse_subagent_output_with_think_prefix() {
+        let content = "<think>The task is to read the file first.</think>\n\
+                       {\"done\": true, \"summary\": \"read done\"}";
+        match parse_subagent_output(content) {
+            SubagentAction::Done { summary } => assert_eq!(summary, "read done"),
+            other => panic!("expected Done, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_subagent_output_with_think_prefix_arguments() {
+        let content = "<think>need file path</think>{\"arguments\": {\"path\": \"top5.md\"}}";
+        match parse_subagent_output(content) {
+            SubagentAction::Arguments { arguments } => {
+                assert_eq!(arguments["path"], "top5.md");
+            }
+            other => panic!("expected Arguments, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_subagent_output_unclosed_think_strips_to_end() {
+        let content = "<think>still reasoning...\n{\"done\": true, \"summary\": \"ok\"}";
+        assert!(matches!(
+            parse_subagent_output(content),
+            SubagentAction::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn parse_subagent_output_rejects_non_object_arguments() {
+        for bad in [r#"{"arguments": "see result"}"#, r#"{"arguments": "text"}"#] {
+            match parse_subagent_output(bad) {
+                SubagentAction::Invalid(reason) => assert!(
+                    reason.contains("arguments 必须是 JSON 对象"),
+                    "reason must explain object requirement: {reason}"
+                ),
+                other => panic!("expected Invalid for {bad}, got: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_subagent_output_rejects_non_object_tool_call_arguments() {
+        for bad in [
+            r#"{"tool_call": {"name": "file.read", "arguments": "text"}}"#,
+            r#"{"tool_call": {"name": "file.read", "arguments": null}}"#,
+        ] {
+            match parse_subagent_output(bad) {
+                SubagentAction::Invalid(reason) => assert!(
+                    reason.contains("arguments 必须是 JSON 对象"),
+                    "reason must explain object requirement: {reason}"
+                ),
+                other => panic!("expected Invalid for {bad}, got: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn resolve_capability_alias_normalizes_model_names() {
         assert_eq!(resolve_capability_alias("shell_exec"), "shell.exec");
         assert_eq!(resolve_capability_alias("functions.file_read"), "file.read");
@@ -2873,6 +3429,44 @@ mod tests {
             "sequence"
         }
         async fn call(&self, _req: &LlmRequest) -> Result<LlmResponse> {
+            let content = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default();
+            Ok(LlmResponse {
+                content,
+                tool_calls: vec![],
+                usage: None,
+            })
+        }
+    }
+
+    struct RecordingSequenceProvider {
+        captured: std::sync::Mutex<Vec<Vec<ChatMessage>>>,
+        responses: std::sync::Mutex<std::collections::VecDeque<String>>,
+    }
+    impl RecordingSequenceProvider {
+        fn new(responses: Vec<&str>) -> Self {
+            Self {
+                captured: std::sync::Mutex::new(vec![]),
+                responses: std::sync::Mutex::new(
+                    responses.into_iter().map(str::to_string).collect(),
+                ),
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for RecordingSequenceProvider {
+        fn id(&self) -> &'static str {
+            "recording-sequence"
+        }
+        fn name(&self) -> &'static str {
+            "recording-sequence"
+        }
+        async fn call(&self, req: &LlmRequest) -> Result<LlmResponse> {
+            self.captured.lock().unwrap().push(req.messages.clone());
             let content = self
                 .responses
                 .lock()
@@ -3158,7 +3752,7 @@ mod tests {
             provider,
         );
         let node = flow_node("n1", vec![], "read loop.txt", "file.read", None);
-        let result = platform.node_runner().run_subagent_loop(&node, "").await;
+        let (result, _turns) = platform.node_runner().run_subagent_loop(&node, "").await;
         assert_eq!(
             result.status,
             NodeStatus::Completed,
@@ -3167,6 +3761,61 @@ mod tests {
         );
         assert!(result.summary.contains("read loop.txt"));
         assert_eq!(result.tool_call_count, 1);
+    }
+
+    #[tokio::test]
+    async fn subagent_loop_history_carries_real_arguments_not_see_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("loop.txt"), "loop-result").unwrap();
+        let provider = Arc::new(RecordingSequenceProvider::new(vec![
+            r#"{"tool_call": {"name": "file.read", "arguments": {"path": "loop.txt"}}}"#,
+            r#"{"done": true, "summary": "read done"}"#,
+        ]));
+        let platform = a1_platform_with_provider(
+            Some(a1_flow_registry()),
+            Some(Arc::new(a1_flow_executor(tmp.path()))),
+            provider.clone(),
+        );
+        let node = flow_node("n1", vec![], "read loop.txt", "file.read", None);
+        let (result, _turns) = platform.node_runner().run_subagent_loop(&node, "").await;
+        assert_eq!(
+            result.status,
+            NodeStatus::Completed,
+            "subagent loop must complete: {:?}",
+            result.error
+        );
+        let calls = provider.captured.lock().unwrap();
+        assert!(
+            calls.len() >= 2,
+            "expect >=2 LLM calls, got {}",
+            calls.len()
+        );
+        let second_call = &calls[1];
+        let assistant_msgs: Vec<&ChatMessage> = second_call
+            .iter()
+            .filter(|m| matches!(m, ChatMessage::Assistant { .. }))
+            .collect();
+        assert_eq!(
+            assistant_msgs.len(),
+            1,
+            "expect exactly one assistant history message"
+        );
+        let (assistant_text, assistant_tool_calls) = match &assistant_msgs[0] {
+            ChatMessage::Assistant { text, tool_calls } => (text.as_str(), tool_calls.as_slice()),
+            _ => unreachable!(),
+        };
+        assert!(
+            assistant_tool_calls.is_empty(),
+            "subagent 循环历史不使用 tool_calls"
+        );
+        assert!(
+            assistant_text.contains("\"path\":\"loop.txt\""),
+            "assistant history must carry real arguments: {assistant_text}"
+        );
+        assert!(
+            !assistant_text.contains("see result"),
+            "history must not contain 'see result': {assistant_text}"
+        );
     }
 
     #[tokio::test]
@@ -3182,7 +3831,7 @@ mod tests {
             provider,
         );
         let node = flow_node("n1", vec![], "do something", "file.read", None);
-        let result = platform.node_runner().run_subagent_loop(&node, "").await;
+        let (result, _turns) = platform.node_runner().run_subagent_loop(&node, "").await;
         assert_eq!(result.status, NodeStatus::Completed);
         assert_eq!(result.summary, "recovered");
     }
@@ -3205,7 +3854,7 @@ mod tests {
             provider,
         );
         let node = flow_node("n1", vec![], "do something", "file.read", None);
-        let result = platform.node_runner().run_subagent_loop(&node, "").await;
+        let (result, _turns) = platform.node_runner().run_subagent_loop(&node, "").await;
         assert_eq!(result.status, NodeStatus::Failed);
         assert!(
             result.error.as_deref().unwrap_or("").contains("max_turns"),
@@ -3300,7 +3949,7 @@ mod tests {
             self.captured.lock().unwrap().push(
                 req.messages
                     .first()
-                    .map(|m| m.content.clone())
+                    .map(|m| m.text().to_string())
                     .unwrap_or_default(),
             );
             Ok(LlmResponse {
@@ -3418,7 +4067,6 @@ mod tests {
                     task_context: r#"{"table":"agent"}"#.to_string(),
                     arguments: None,
                     depends_on: vec![],
-                    max_turns: 1,
                     timeout_seconds: 30,
                 },
                 DagNodeDesign {
@@ -3427,7 +4075,6 @@ mod tests {
                     task_context: r#"{"table":"agent"}"#.to_string(),
                     arguments: None,
                     depends_on: vec!["n1".to_string()],
-                    max_turns: 1,
                     timeout_seconds: 30,
                 },
             ],
@@ -3593,7 +4240,6 @@ mod tests {
                 task_context: "".into(),
                 arguments: None,
                 depends_on: vec![],
-                max_turns: 10,
                 timeout_seconds: 600,
             },
             DagNodeDesign {
@@ -3602,7 +4248,6 @@ mod tests {
                 task_context: "".into(),
                 arguments: None,
                 depends_on: vec!["n1".into()],
-                max_turns: 10,
                 timeout_seconds: 600,
             },
             DagNodeDesign {
@@ -3611,7 +4256,6 @@ mod tests {
                 task_context: "".into(),
                 arguments: None,
                 depends_on: vec!["n2".into()],
-                max_turns: 10,
                 timeout_seconds: 600,
             },
         ];
@@ -3628,7 +4272,6 @@ mod tests {
                 task_context: "".into(),
                 arguments: None,
                 depends_on: vec![],
-                max_turns: 10,
                 timeout_seconds: 600,
             },
             DagNodeDesign {
@@ -3637,7 +4280,6 @@ mod tests {
                 task_context: "".into(),
                 arguments: None,
                 depends_on: vec!["root".into()],
-                max_turns: 10,
                 timeout_seconds: 600,
             },
             DagNodeDesign {
@@ -3646,7 +4288,6 @@ mod tests {
                 task_context: "".into(),
                 arguments: None,
                 depends_on: vec!["root".into()],
-                max_turns: 10,
                 timeout_seconds: 600,
             },
         ];
@@ -3667,7 +4308,6 @@ mod tests {
                 task_context: "".into(),
                 arguments: None,
                 depends_on: vec![],
-                max_turns: 10,
                 timeout_seconds: 600,
             },
             DagNodeDesign {
@@ -3676,7 +4316,6 @@ mod tests {
                 task_context: "".into(),
                 arguments: None,
                 depends_on: vec![],
-                max_turns: 10,
                 timeout_seconds: 600,
             },
             DagNodeDesign {
@@ -3685,7 +4324,6 @@ mod tests {
                 task_context: "".into(),
                 arguments: None,
                 depends_on: vec!["a".into(), "b".into()],
-                max_turns: 10,
                 timeout_seconds: 600,
             },
         ];
@@ -3702,7 +4340,6 @@ mod tests {
                 task_context: "".into(),
                 arguments: None,
                 depends_on: vec!["b".into()],
-                max_turns: 10,
                 timeout_seconds: 600,
             },
             DagNodeDesign {
@@ -3711,7 +4348,6 @@ mod tests {
                 task_context: "".into(),
                 arguments: None,
                 depends_on: vec!["a".into()],
-                max_turns: 10,
                 timeout_seconds: 600,
             },
         ];
@@ -3726,7 +4362,6 @@ mod tests {
             task_context: "".into(),
             arguments: None,
             depends_on: vec!["nonexistent".into()],
-            max_turns: 10,
             timeout_seconds: 600,
         }];
         assert!(topological_sort(&nodes).is_err());
@@ -3740,7 +4375,6 @@ mod tests {
             task_context: "".into(),
             arguments: None,
             depends_on: vec![],
-            max_turns: 10,
             timeout_seconds: 600,
         }];
         let order = topological_sort(&nodes).unwrap();
@@ -3908,7 +4542,6 @@ mod tests {
                     task_context: "step 1".into(),
                     arguments: None,
                     depends_on: vec![],
-                    max_turns: 10,
                     timeout_seconds: 600,
                 },
                 DagNodeDesign {
@@ -3917,7 +4550,6 @@ mod tests {
                     task_context: "step 2".into(),
                     arguments: None,
                     depends_on: vec!["n1".into()],
-                    max_turns: 5,
                     timeout_seconds: 300,
                 },
             ],
@@ -3927,7 +4559,7 @@ mod tests {
         assert_eq!(back.nodes.len(), 2);
         assert_eq!(back.nodes[0].id, "n1");
         assert_eq!(back.nodes[1].depends_on, vec!["n1"]);
-        assert_eq!(back.nodes[1].max_turns, 5);
+        assert_eq!(back.nodes[1].timeout_seconds, 300);
     }
 
     #[test]

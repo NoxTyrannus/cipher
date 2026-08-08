@@ -1,7 +1,8 @@
 use crate::common::Result;
 use crate::data::ModelRow;
+use crate::logic::model::message::{ChatMessage, SystemKind};
 use crate::logic::model::prompts::read_platform_prompt;
-use crate::logic::model::provider::{LlmProvider, LlmRequest, Message, MessageRole};
+use crate::logic::model::provider::{LlmProvider, LlmRequest};
 use secrecy::SecretString;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -239,13 +240,12 @@ impl InsightPlatform {
 
     async fn call_llm_for_insight(&self, prompt: &str) -> Result<InsightRawOutput> {
         let messages = vec![
-            Message {
-                role: MessageRole::System,
-                content: prompt.to_string(),
+            ChatMessage::System {
+                text: prompt.to_string(),
+                kind: SystemKind::Primary,
             },
-            Message {
-                role: MessageRole::User,
-                content: "Perform the three-question self-check now. Output ONLY the JSON."
+            ChatMessage::User {
+                text: "Perform the three-question self-check now. Output ONLY the JSON."
                     .to_string(),
             },
         ];
@@ -262,13 +262,12 @@ impl InsightPlatform {
                      请输出**单个完整 JSON 对象** (analysis 每段 ≤ 2 句简洁, 总输出 ≤ 600 字符, 不要截断)。"
                 );
                 let retry_messages = vec![
-                    Message {
-                        role: MessageRole::System,
-                        content: retry_prompt,
+                    ChatMessage::System {
+                        text: retry_prompt,
+                        kind: SystemKind::Primary,
                     },
-                    Message {
-                        role: MessageRole::User,
-                        content: "Retry: output ONLY the complete JSON.".to_string(),
+                    ChatMessage::User {
+                        text: "Retry: output ONLY the complete JSON.".to_string(),
                     },
                 ];
                 let retry_req = LlmRequest::from_model_row(

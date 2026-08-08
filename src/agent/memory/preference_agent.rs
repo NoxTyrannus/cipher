@@ -6,8 +6,9 @@ use secrecy::SecretString;
 use crate::agent::communication::{AttentionRetireBatch, PreferenceFragment};
 use crate::data::triviumdb::TriviumDb;
 use crate::data::ModelRow;
+use crate::logic::model::message::{ChatMessage, SystemKind};
 use crate::logic::model::prompts::read_platform_prompt;
-use crate::logic::model::provider::{LlmProvider, LlmRequest, Message, MessageRole};
+use crate::logic::model::provider::{LlmProvider, LlmRequest};
 
 #[allow(dead_code)]
 pub struct PreferenceMemoryAgent {
@@ -77,13 +78,12 @@ impl PreferenceMemoryAgent {
         };
 
         let messages = vec![
-            Message {
-                role: MessageRole::System,
-                content: prompt,
+            ChatMessage::System {
+                text: prompt,
+                kind: SystemKind::Primary,
             },
-            Message {
-                role: MessageRole::User,
-                content: "Extract preference memories now. Output ONLY the JSON.".to_string(),
+            ChatMessage::User {
+                text: "Extract preference memories now. Output ONLY the JSON.".to_string(),
             },
         ];
 

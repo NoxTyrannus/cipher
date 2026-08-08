@@ -1,9 +1,6 @@
 use super::error::map_reqwest_error;
-#[cfg(test)]
-use super::provider::Message;
-use super::provider::{
-    LlmProvider, LlmRequest, LlmResponse, MessageRole, ToolCall, ToolCallFormat, Usage,
-};
+use super::message::{normalize_with_system, ChatMessage};
+use super::provider::{LlmProvider, LlmRequest, LlmResponse, ToolCall, ToolCallFormat, Usage};
 use super::stream::{find_double_newline, StreamChunk};
 use crate::common::Result;
 use async_trait::async_trait;
@@ -39,7 +36,7 @@ struct AnthropicRequest<'a> {
     model: &'a str,
     messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    system: Option<Vec<AnthropicSystemBlock>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -58,55 +55,34 @@ struct AnthropicMessage {
     content: serde_json::Value,
 }
 
-#[derive(Debug)]
-struct ToolEnvelope {
-    tool_use_id: String,
-    tool_name: String,
-    tool_input: serde_json::Value,
-    content: String,
-}
-
-fn parse_tool_envelope(raw: &str) -> Option<ToolEnvelope> {
-    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let id = v.get("tool_use_id")?.as_str()?.to_string();
-    let name = v
-        .get("tool_name")
-        .and_then(|s| s.as_str())
-        .unwrap_or("")
-        .to_string();
-    let input = v.get("tool_input")?.clone();
-    let content = match v.get("content") {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(other) => other.to_string(),
-        None => String::new(),
-    };
-    Some(ToolEnvelope {
-        tool_use_id: id,
-        tool_name: name,
-        tool_input: input,
-        content,
-    })
-}
-
-fn tool_use_block(env: &ToolEnvelope) -> serde_json::Value {
-    serde_json::json!({
-        "type": "tool_use",
-        "id": env.tool_use_id,
-        "name": env.tool_name,
-        "input": env.tool_input,
-    })
-}
-
-fn tool_result_block(env: &ToolEnvelope) -> serde_json::Value {
-    serde_json::json!({
-        "type": "tool_result",
-        "tool_use_id": env.tool_use_id,
-        "content": env.content,
-    })
+#[derive(Debug, Serialize)]
+struct AnthropicSystemBlock {
+    #[serde(rename = "type")]
+    kind: String,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<serde_json::Value>,
 }
 
 fn text_block(text: &str) -> serde_json::Value {
     serde_json::json!({"type": "text", "text": text})
+}
+
+fn tool_use_block(id: &str, name: &str, input: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "type": "tool_use",
+        "id": id,
+        "name": name,
+        "input": input,
+    })
+}
+
+fn tool_result_block(id: &str, content: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "tool_result",
+        "tool_use_id": id,
+        "content": content,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -163,45 +139,51 @@ fn build_anthropic_tools(tools: &[serde_json::Value]) -> Result<Vec<AnthropicToo
 }
 
 fn build_anthropic_request(req: &LlmRequest, stream: bool) -> Result<AnthropicRequest<'_>> {
-    let mut system: Option<String> = req.system.clone();
+    let normalized = normalize_with_system(req.system.as_deref(), &req.messages);
+    let system = if normalized.system.is_empty() {
+        None
+    } else {
+        Some(vec![AnthropicSystemBlock {
+            kind: "text".to_string(),
+            text: normalized.system,
+            cache_control: Some(serde_json::json!({"type": "ephemeral"})),
+        }])
+    };
     let mut messages: Vec<AnthropicMessage> = Vec::new();
 
-    let msgs = &req.messages;
+    let msgs = &normalized.messages;
     let mut i = 0;
     while i < msgs.len() {
-        let m = &msgs[i];
-        match m.role {
-            MessageRole::System => {
-                system = Some(match system {
-                    Some(existing) => format!("{existing}\n{}", m.content),
-                    None => m.content.clone(),
+        match &msgs[i] {
+            ChatMessage::System { .. } => unreachable!("normalize 已抽取全部 System"),
+            ChatMessage::User { text } => {
+                messages.push(AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::Value::String(text.clone()),
                 });
                 i += 1;
             }
-            MessageRole::Assistant => {
+            ChatMessage::Assistant { text, tool_calls } => {
                 let mut j = i + 1;
-                let mut tool_uses: Vec<serde_json::Value> = Vec::new();
                 let mut tool_results: Vec<serde_json::Value> = Vec::new();
-                while j < msgs.len() && msgs[j].role == MessageRole::Tool {
-                    match parse_tool_envelope(&msgs[j].content) {
-                        Some(env) => {
-                            tool_uses.push(tool_use_block(&env));
-                            tool_results.push(tool_result_block(&env));
-                        }
-                        None => {
-                            tool_results.push(text_block(&msgs[j].content));
-                        }
+                while j < msgs.len() {
+                    if let ChatMessage::ToolResult { id, text, .. } = &msgs[j] {
+                        tool_results.push(tool_result_block(id, text));
+                        j += 1;
+                    } else {
+                        break;
                     }
-                    j += 1;
                 }
-                let content = if tool_uses.is_empty() {
-                    serde_json::Value::String(m.content.clone())
+                let content = if tool_calls.is_empty() {
+                    serde_json::Value::String(text.clone())
                 } else {
                     let mut blocks = Vec::new();
-                    if !m.content.is_empty() {
-                        blocks.push(text_block(&m.content));
+                    if !text.is_empty() {
+                        blocks.push(text_block(text));
                     }
-                    blocks.extend(tool_uses);
+                    for tc in tool_calls {
+                        blocks.push(tool_use_block(&tc.id, &tc.name, &tc.arguments));
+                    }
                     serde_json::Value::Array(blocks)
                 };
                 messages.push(AnthropicMessage {
@@ -216,28 +198,22 @@ fn build_anthropic_request(req: &LlmRequest, stream: bool) -> Result<AnthropicRe
                 }
                 i = j;
             }
-            MessageRole::Tool => {
+            ChatMessage::ToolResult { .. } => {
                 let mut blocks = Vec::new();
                 let mut j = i;
-                while j < msgs.len() && msgs[j].role == MessageRole::Tool {
-                    match parse_tool_envelope(&msgs[j].content) {
-                        Some(env) => blocks.push(tool_result_block(&env)),
-                        None => blocks.push(text_block(&msgs[j].content)),
+                while j < msgs.len() {
+                    if let ChatMessage::ToolResult { id, text, .. } = &msgs[j] {
+                        blocks.push(tool_result_block(id, text));
+                        j += 1;
+                    } else {
+                        break;
                     }
-                    j += 1;
                 }
                 messages.push(AnthropicMessage {
                     role: "user".to_string(),
                     content: serde_json::Value::Array(blocks),
                 });
                 i = j;
-            }
-            MessageRole::User => {
-                messages.push(AnthropicMessage {
-                    role: m.role.to_string(),
-                    content: serde_json::Value::String(m.content.clone()),
-                });
-                i += 1;
             }
         }
     }
@@ -596,6 +572,7 @@ impl LlmProvider for AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logic::model::message::{ChatMessage, SystemKind};
 
     #[test]
     fn anthropic_id_and_name() {
@@ -604,32 +581,37 @@ mod tests {
         assert_eq!(p.name(), "Anthropic");
     }
 
-    fn tool_msg(content: &str) -> Message {
-        Message {
-            role: MessageRole::Tool,
-            content: content.to_string(),
+    fn tool_result_msg(id: &str, content: &str) -> ChatMessage {
+        ChatMessage::ToolResult {
+            id: id.to_string(),
+            name: "cap_x".to_string(),
+            text: content.to_string(),
+            is_error: false,
         }
     }
 
-    fn assistant_msg(content: &str) -> Message {
-        Message {
-            role: MessageRole::Assistant,
-            content: content.to_string(),
+    fn assistant_with_calls(text: &str, ids: &[&str]) -> ChatMessage {
+        ChatMessage::Assistant {
+            text: text.to_string(),
+            tool_calls: ids
+                .iter()
+                .map(|id| ToolCall {
+                    id: id.to_string(),
+                    name: format!("cap_{id}"),
+                    arguments: serde_json::json!({}),
+                })
+                .collect(),
         }
     }
 
     #[test]
-    fn a2_envelope_tool_results_convert_with_tool_use_injection() {
+    fn tool_results_convert_with_tool_use_injection() {
         let req = LlmRequest {
             model: "m".into(),
             messages: vec![
-                assistant_msg("我来读文件"),
-                tool_msg(
-                    r#"{"tool_use_id":"tu_1","tool_name":"cap_file_read","tool_input":{"path":"a.txt"},"content":"file body"}"#,
-                ),
-                tool_msg(
-                    r#"{"tool_use_id":"tu_2","tool_name":"cap_file_list","tool_input":{"path":"/"},"content":"dir body"}"#,
-                ),
+                assistant_with_calls("我来读文件", &["tu_1", "tu_2"]),
+                tool_result_msg("tu_1", "file body"),
+                tool_result_msg("tu_2", "dir body"),
             ],
             ..Default::default()
         };
@@ -643,7 +625,7 @@ mod tests {
         assert_eq!(a_blocks[0]["type"], "text");
         assert_eq!(a_blocks[1]["type"], "tool_use");
         assert_eq!(a_blocks[1]["id"], "tu_1");
-        assert_eq!(a_blocks[1]["name"], "cap_file_read");
+        assert_eq!(a_blocks[1]["name"], "cap_tu_1");
         assert_eq!(a_blocks[2]["id"], "tu_2");
 
         let u = &msgs[1];
@@ -658,51 +640,66 @@ mod tests {
     }
 
     #[test]
-    fn a2_bare_output_falls_back_to_user_text_blocks() {
+    fn assistant_without_tool_calls_emits_string_content() {
         let req = LlmRequest {
             model: "m".into(),
-            messages: vec![
-                assistant_msg(""),
-                tool_msg(r#"{"content":"hello from wasm","size":15}"#),
-            ],
+            messages: vec![ChatMessage::Assistant {
+                text: "plain reply".into(),
+                tool_calls: vec![],
+            }],
             ..Default::default()
         };
         let body = serde_json::to_value(build_anthropic_request(&req, false).unwrap()).unwrap();
         let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 2);
-
+        assert_eq!(msgs.len(), 1);
         assert!(msgs[0]["content"].is_string());
+        assert_eq!(msgs[0]["content"], "plain reply");
+    }
 
-        let u_blocks = msgs[1]["content"].as_array().unwrap();
-        assert_eq!(u_blocks[0]["type"], "text");
-        assert!(u_blocks[0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("hello from wasm"));
-
+    #[test]
+    fn orphan_tool_result_merges_to_user_with_synthesized_error() {
+        let req = LlmRequest {
+            model: "m".into(),
+            messages: vec![tool_result_msg("tu_9", "raw")],
+            ..Default::default()
+        };
+        let body = serde_json::to_value(build_anthropic_request(&req, false).unwrap()).unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1, "孤儿 ToolResult 合成一条 user: {body}");
+        assert_eq!(msgs[0]["role"], "user");
+        let blocks = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[0]["tool_use_id"], "tu_9");
+        assert!(
+            blocks[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("孤儿工具结果合成"),
+            "{body}"
+        );
         assert!(!body.to_string().contains(r#""role":"tool""#));
     }
 
     #[test]
-    fn a2_tool_without_preceding_assistant_merges_to_user() {
+    fn anthropic_system_is_block_array_with_cache_control() {
         let req = LlmRequest {
-            model: "m".into(),
-            messages: vec![
-                tool_msg(
-                    r#"{"tool_use_id":"tu_9","tool_name":"cap_x","tool_input":{},"content":"r1"}"#,
-                ),
-                tool_msg("plain"),
-            ],
+            model: "claude-3-5-sonnet".to_string(),
+            system: Some("be helpful".to_string()),
+            messages: vec![ChatMessage::User {
+                text: "hi".to_string(),
+            }],
             ..Default::default()
         };
         let body = serde_json::to_value(build_anthropic_request(&req, false).unwrap()).unwrap();
-        let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 1, "连续 Tool 合并一条 user: {body}");
-        assert_eq!(msgs[0]["role"], "user");
-        let blocks = msgs[0]["content"].as_array().unwrap();
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0]["type"], "tool_result");
-        assert_eq!(blocks[1]["type"], "text");
+        let sys = body["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 1);
+        assert_eq!(sys[0]["type"], "text");
+        assert_eq!(sys[0]["text"], "be helpful");
+        assert_eq!(
+            sys[0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
     }
 
     #[test]
@@ -715,7 +712,11 @@ mod tests {
                 role: "user".to_string(),
                 content: serde_json::Value::String("hi".to_string()),
             }],
-            system: Some("be helpful".to_string()),
+            system: Some(vec![AnthropicSystemBlock {
+                kind: "text".to_string(),
+                text: "be helpful".to_string(),
+                cache_control: None,
+            }]),
             max_tokens: 1024,
             tools: vec![],
             stream: false,
@@ -724,6 +725,30 @@ mod tests {
         assert!(j.contains("claude-3-5-sonnet"));
         assert!(j.contains("be helpful"));
         assert!(j.contains("1024"));
+    }
+
+    #[test]
+    fn anthropic_memory_entries_merge_into_single_system_block() {
+        let req = LlmRequest {
+            model: "claude-3-5-sonnet".to_string(),
+            messages: vec![
+                ChatMessage::System {
+                    text: "[EXPERIENCE] fixed: x".into(),
+                    kind: SystemKind::Memory(crate::logic::model::message::MemoryKind::Experience),
+                },
+                ChatMessage::User {
+                    text: "hi".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        let body = serde_json::to_value(build_anthropic_request(&req, false).unwrap()).unwrap();
+        let sys = body["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 1, "system 恰为 1 个 block: {body}");
+        let sys_text = sys[0]["text"].as_str().unwrap();
+        assert!(sys_text.contains("## 经验"));
+        assert!(sys_text.contains("[EXPERIENCE] fixed: x"));
+        assert_eq!(body["messages"][0]["role"], "user");
     }
 
     #[test]

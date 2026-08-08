@@ -1,7 +1,8 @@
 use crate::data::triviumdb::TriviumDb;
 use crate::data::ModelRow;
+use crate::logic::model::message::{ChatMessage, SystemKind};
 use crate::logic::model::prompts::read_platform_prompt;
-use crate::logic::model::provider::{LlmProvider, LlmRequest, Message, MessageRole};
+use crate::logic::model::provider::{LlmProvider, LlmRequest};
 use secrecy::SecretString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -179,13 +180,12 @@ impl MemoryPlatform {
         );
 
         let messages = vec![
-            Message {
-                role: MessageRole::System,
-                content: prompt,
+            ChatMessage::System {
+                text: prompt,
+                kind: SystemKind::Primary,
             },
-            Message {
-                role: MessageRole::User,
-                content: "Extract attention memories now. Output ONLY the JSON.".to_string(),
+            ChatMessage::User {
+                text: "Extract attention memories now. Output ONLY the JSON.".to_string(),
             },
         ];
 
