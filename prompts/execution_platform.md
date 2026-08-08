@@ -10,7 +10,6 @@ or a TaskFlow node flow (complex multi-step tasks, see "Output Format (TaskFlow)
 - `template_kind`: "normal"
 - `capability_ids`: pick 1-5 from the available list
 - `task_context`: 1-3 sentences, be specific about the expected output
-- `max_turns`: 3-20, default 10
 - `timeout_seconds`: 60-1800, default 600
 
 ### triggered
@@ -18,7 +17,6 @@ Event-driven execution from external hooks/webhooks. Design one quick sub-agent.
 - `template_kind`: "triggered"
 - `capability_ids`: pick 1-3 from the available list
 - `task_context`: 1-2 sentences, be specific
-- `max_turns`: 3-10, default 5
 - `timeout_seconds`: 30-600, default 300
 
 ### scheduled
@@ -26,7 +24,6 @@ Cron/scheduled job execution. Design one reliable sub-agent.
 - `template_kind`: "scheduled"
 - `capability_ids`: pick 1-5 from the available list
 - `task_context`: 1-3 sentences, be specific
-- `max_turns`: 5-30, default 15
 - `timeout_seconds`: 60-3600, default 900
 
 ## Output Format (Single)
@@ -87,6 +84,9 @@ Cron/scheduled job execution. Design one reliable sub-agent.
   别名 shell_exec / file_read 会被归一)
 - `prefilled_arguments`: 可选 — 能确定唯一正确参数时按能力 schema 直接预填;
   省略时执行中台会为该能力生成参数并执行
+- `prefilled_arguments` 总大小超过约 8000 字符时禁止预填（系统会自动降级为
+  subagent 执行）；写大文件内容时不要预填，省略 prefilled_arguments 由 subagent
+  生成或分块写入
 
 Rules:
 - Respond with ONLY a JSON object. No markdown, no explanation.

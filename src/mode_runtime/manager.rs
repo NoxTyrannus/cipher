@@ -10,11 +10,9 @@ use crate::common::AgentError;
 use crate::data::duckdb::Registry;
 use crate::data::thought_store::ThoughtStore;
 use crate::data::ModelRow;
-use crate::logic::capability::executor::CapabilityExecutor;
 use crate::logic::model::registry::ProviderRegistry;
 use crate::logic::model::stream::StreamChunk;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Notify;
@@ -46,19 +44,11 @@ pub struct ModeManager {
 
     context_assembler: ContextAssembler,
 
-    capability_executor: CapabilityExecutor,
-
     capability_registry: Registry,
 
     reload_rx: Option<mpsc::Receiver<crate::logic::capability::executor::ReloadEvent>>,
 
     duckdb: Option<std::sync::Arc<std::sync::Mutex<duckdb::Connection>>>,
-
-    reload_tx: Option<mpsc::Sender<crate::logic::capability::executor::ReloadEvent>>,
-
-    wasm_modules_dir: Option<PathBuf>,
-
-    workspace_root: Option<PathBuf>,
 }
 
 impl ModeManager {
@@ -71,26 +61,15 @@ impl ModeManager {
         assembler: ContextAssembler,
         registry: Registry,
         pool: std::sync::Arc<AgentPool>,
-        wasm_modules_dir: Option<PathBuf>,
-        workspace_root: Option<PathBuf>,
         duckdb: Option<std::sync::Arc<std::sync::Mutex<duckdb::Connection>>>,
     ) -> Self {
         let (stream_tx, _) = mpsc::channel(128);
         let (pool_tx, _) = mpsc::channel(128);
 
-        let mut capability_executor = CapabilityExecutor::new();
-        if let (Some(wd), Some(wr)) = (wasm_modules_dir.as_ref(), workspace_root.as_ref()) {
-            capability_executor.set_wasm(wd, wr);
-        }
-        if let Some(db) = &duckdb {
-            capability_executor.set_duckdb(std::sync::Arc::clone(db));
-        }
-
-        let (reload_tx, reload_rx) =
+        let (_reload_tx, reload_rx) =
             mpsc::channel::<crate::logic::capability::executor::ReloadEvent>(32);
-        capability_executor.set_reload_tx(reload_tx.clone());
 
-        let thinking_factory = ThinkingFactory::new_without_provider_tools();
+        let thinking_factory = ThinkingFactory::new();
 
         Self {
             current: ModeKind::Unni,
@@ -108,13 +87,9 @@ impl ModeManager {
             pool_tx,
             active: HashMap::new(),
             context_assembler: assembler,
-            capability_executor,
             capability_registry: registry,
             reload_rx: Some(reload_rx),
-            reload_tx: Some(reload_tx),
             duckdb,
-            wasm_modules_dir,
-            workspace_root,
         }
     }
 
@@ -174,26 +149,12 @@ impl ModeManager {
                             let conn = db.lock().unwrap();
                             match crate::data::duckdb::load_all_into_memory(&conn) {
                                 Ok(new_registry) => {
+                                    tracing::info!(
+                                        "registry reloaded: {} base capabilities, {} composite capabilities",
+                                        new_registry.base_capabilities.len(),
+                                        new_registry.composite_capabilities.len()
+                                    );
                                     self.capability_registry = new_registry;
-                                    let dispatcher =
-                                        crate::agent::dispatcher::CapabilityDispatcher::new(
-                                            &self.capability_registry,
-                                            &self.capability_executor,
-                                        );
-                                    match dispatcher.authorize_provider_tools("agent") {
-                                        Ok(auth_tools) => {
-                                            tracing::info!(
-                                                "registry reloaded: {} tools authorized",
-                                                auth_tools.tools().len()
-                                            );
-                                            self.thinking_factory.update_provider_tools(auth_tools);
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "registry reload: authorize failed: {e}"
-                                            );
-                                        }
-                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!("registry reload: load failed: {e}");
@@ -236,8 +197,6 @@ impl ModeManager {
                 &self.default_model,
                 &self.provider_registry,
                 &self.context_assembler,
-                &self.capability_registry,
-                &self.capability_executor,
                 &self.agent_pool,
                 &self.thought_store,
             )
@@ -343,24 +302,6 @@ impl ModeManager {
 
         let cancel = Arc::new(Notify::new());
 
-        let cap_registry = self.capability_registry.clone();
-        let cap_executor = Arc::new(std::mem::take(&mut self.capability_executor));
-
-        self.capability_executor = {
-            let mut exec = CapabilityExecutor::new();
-            if let (Some(wd), Some(wr)) =
-                (self.wasm_modules_dir.as_ref(), self.workspace_root.as_ref())
-            {
-                exec.set_wasm(wd, wr);
-            }
-            if let Some(db) = self.duckdb.as_ref() {
-                exec.set_duckdb(std::sync::Arc::clone(db));
-            }
-            if let Some(tx) = self.reload_tx.as_ref() {
-                exec.set_reload_tx(tx.clone());
-            }
-            exec
-        };
         let handle = instance
             .spawn_streaming(
                 self.stream_tx.clone(),
@@ -369,8 +310,6 @@ impl ModeManager {
                 self.default_model.clone(),
                 provider,
                 &self.context_assembler,
-                cap_registry,
-                cap_executor,
                 Arc::clone(&self.agent_pool),
                 Arc::clone(&self.thought_store),
                 thought_context,
@@ -581,7 +520,7 @@ mod tests {
     impl UnsolicitedToolProvider {
         fn response() -> LlmResponse {
             LlmResponse {
-                content: String::new(),
+                content: r#"{"think":"ignored tool call","say":"durable reply"}"#.to_string(),
                 tool_calls: vec![ToolCall {
                     id: "unsolicited-call".to_string(),
                     name: "guessed_tool".to_string(),
@@ -654,8 +593,6 @@ mod tests {
             Registry::new(),
             pool,
             None,
-            None,
-            None,
         )
     }
 
@@ -677,8 +614,6 @@ mod tests {
             assembler,
             Registry::new(),
             pool,
-            None,
-            None,
             None,
         )
     }
@@ -709,8 +644,6 @@ mod tests {
                 assembler,
                 Registry::new(),
                 pool,
-                None,
-                None,
                 None,
             ),
             receivers,
@@ -872,7 +805,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocking_unsolicited_tool_call_fails_once_without_retry() {
+    async fn blocking_unsolicited_tool_call_is_ignored_with_warning() {
         let temporary = tempfile::tempdir().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let mut providers = ProviderRegistry::new();
@@ -881,19 +814,20 @@ mod tests {
         }));
         let mut manager = make_mgr_at(temporary.path(), providers);
 
-        let error = manager
+        let response = manager
             .handle_input("do not expose thinking tools")
             .await
-            .unwrap_err();
-        assert!(error.to_string().contains("thinking tools are disabled"));
+            .unwrap();
+        assert_eq!(response.text, "durable reply");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let timeline = manager.thought_store().recover().unwrap();
         let output = timeline.groups[0].contexts[0].output.as_ref().unwrap();
-        assert!(matches!(
+        assert_eq!(
             output.terminal_state,
-            ThinkingTerminalState::Failed { .. }
-        ));
+            ThinkingTerminalState::Completed,
+            "thinking engine has no tools: tool_calls are warned and ignored"
+        );
     }
 
     #[tokio::test]
@@ -1216,7 +1150,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_unsolicited_tool_call_persists_failure_before_signal() {
+    async fn streaming_unsolicited_tool_call_is_ignored_with_warning() {
         let temporary = tempfile::tempdir().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let mut providers = ProviderRegistry::new();
@@ -1227,33 +1161,48 @@ mod tests {
         let (mut stream_rx, mut outcome_rx) = manager.take_channels();
 
         let thought_id = manager
-            .spawn("reject streaming tool".to_string())
+            .spawn("ignore streaming tool call".to_string())
             .await
             .unwrap();
+
         let (signal_id, signal) =
             tokio::time::timeout(std::time::Duration::from_secs(1), stream_rx.recv())
                 .await
-                .expect("error signal should arrive")
+                .expect("think signal should arrive")
                 .expect("stream channel should remain open");
         assert_eq!(signal_id, thought_id);
-        assert!(matches!(
-            signal,
-            StreamChunk::Error(ref error) if error.contains("thinking tools are disabled")
-        ));
+        assert_eq!(signal, StreamChunk::Think("ignored tool call".to_string()));
+
+        let (signal_id, signal) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream_rx.recv())
+                .await
+                .expect("say signal should arrive")
+                .expect("stream channel should remain open");
+        assert_eq!(signal_id, thought_id);
+        assert_eq!(signal, StreamChunk::Delta("durable reply".to_string()));
+
+        let (signal_id, signal) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream_rx.recv())
+                .await
+                .expect("done signal should arrive")
+                .expect("stream channel should remain open");
+        assert_eq!(signal_id, thought_id);
+        assert_eq!(signal, StreamChunk::Done);
+
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), outcome_rx.recv())
             .await
-            .expect("failed outcome should arrive")
+            .expect("outcome should arrive")
             .expect("outcome channel should remain open");
         assert_eq!(outcome.id, thought_id);
-        assert!(outcome.result.is_err());
+        assert!(
+            outcome.result.is_ok(),
+            "thinking engine has no tools: tool_calls are warned and ignored"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let timeline = manager.thought_store().recover().unwrap();
         let output = timeline.groups[0].contexts[0].output.as_ref().unwrap();
-        assert!(matches!(
-            output.terminal_state,
-            ThinkingTerminalState::Failed { .. }
-        ));
+        assert_eq!(output.terminal_state, ThinkingTerminalState::Completed);
     }
 
     #[tokio::test]

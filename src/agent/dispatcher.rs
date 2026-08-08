@@ -1,43 +1,10 @@
-use super::decision::Decision;
 use crate::common::{AgentError, Result};
 use crate::data::duckdb::Registry;
 use crate::logic::capability::composite::CompositeNode;
 use crate::logic::capability::executor::CapabilityExecutor;
-use crate::logic::capability::service::{CapabilityCall, CapabilityService, ProviderToolSet};
-use crate::logic::model::provider::{LlmRequest, ToolCall};
+use crate::logic::capability::service::{CapabilityCall, CapabilityService};
+use crate::logic::model::provider::ToolCall;
 use std::collections::HashMap;
-
-#[derive(Debug, Clone)]
-pub struct AuthorizedProviderTools {
-    agent_id: String,
-    tool_set: ProviderToolSet,
-}
-
-impl AuthorizedProviderTools {
-    pub fn agent_id(&self) -> &str {
-        &self.agent_id
-    }
-
-    pub fn tools(&self) -> &[serde_json::Value] {
-        self.tool_set.tools()
-    }
-
-    pub fn apply_to_request(&self, request: &mut LlmRequest) {
-        request.tools = self.tools().to_vec();
-    }
-
-    pub fn normalize(&self, call: &ToolCall) -> Result<CapabilityCall> {
-        self.tool_set.normalize(&call.name, call.arguments.clone())
-    }
-
-    pub fn dispatch(
-        &self,
-        dispatcher: &CapabilityDispatcher<'_>,
-        call: &ToolCall,
-    ) -> Result<serde_json::Value> {
-        dispatcher.dispatch_provider_call(&self.agent_id, &self.tool_set, call)
-    }
-}
 
 pub struct CapabilityDispatcher<'a> {
     registry: &'a Registry,
@@ -57,25 +24,6 @@ impl<'a> CapabilityDispatcher<'a> {
         CapabilityService::new(self.registry, self.executor)?
             .execute_for_agent(agent_id, call)
             .map(|result| result.output)
-    }
-
-    pub fn authorize_provider_tools(&self, agent_id: &str) -> Result<AuthorizedProviderTools> {
-        let tool_set = CapabilityService::new(self.registry, self.executor)?
-            .provider_tools_for_agent(agent_id)?;
-        Ok(AuthorizedProviderTools {
-            agent_id: agent_id.to_string(),
-            tool_set,
-        })
-    }
-
-    pub fn dispatch_provider_call(
-        &self,
-        agent_id: &str,
-        tool_set: &ProviderToolSet,
-        call: &ToolCall,
-    ) -> Result<serde_json::Value> {
-        let normalized = tool_set.normalize(&call.name, call.arguments.clone())?;
-        self.dispatch_authorized(agent_id, &normalized)
     }
 
     pub fn dispatch(&self, call: &ToolCall) -> Result<serde_json::Value> {
@@ -245,21 +193,6 @@ impl<'a> CapabilityDispatcher<'a> {
             "final": final_output
         }))
     }
-
-    pub fn dispatch_decision(&self, dec: &Decision) -> Result<serde_json::Value> {
-        if dec.action != "call_capability" {
-            return Err(AgentError::NotImplemented(format!(
-                "decision action: {} (iter61 只实现 call_capability)",
-                dec.action
-            )));
-        }
-        match &dec.tool_call {
-            Some(tc) => self.dispatch(tc),
-            None => Err(AgentError::Parse(
-                "call_capability 决策缺 tool_call".to_string(),
-            )),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -373,58 +306,6 @@ mod tests {
     }
 
     #[test]
-    fn dispatcher_dispatch_decision_call_capability() {
-        let reg = make_registry_with_echo();
-        let exec = make_executor_with_echo();
-        let disp = CapabilityDispatcher::new(&reg, &exec);
-        let dec = Decision::call_capability(ToolCall {
-            id: "c1".to_string(),
-            name: "echo".to_string(),
-            arguments: serde_json::json!({"y": 99}),
-        });
-        let r = disp.dispatch_decision(&dec).unwrap();
-        assert_eq!(r, serde_json::json!({"y": 99}));
-    }
-
-    #[test]
-    fn thinking_decision_routes_through_dispatcher() {
-        use crate::agent::thinking::ThinkingFactory;
-        use crate::logic::model::provider::LlmResponse;
-        let reg = make_registry_with_echo();
-        let exec = make_executor_with_echo();
-        let disp = CapabilityDispatcher::new(&reg, &exec);
-        let f = ThinkingFactory::new();
-        let inst = f.create("task-1");
-        let resp = LlmResponse {
-            content: "".to_string(),
-            tool_calls: vec![ToolCall {
-                id: "c1".to_string(),
-                name: "echo".to_string(),
-                arguments: serde_json::json!({"z": 7}),
-            }],
-            usage: None,
-        };
-        let dec = inst.decision(&resp).expect("decision");
-        assert_eq!(dec.action, "call_capability");
-        let r = disp.dispatch_decision(&dec).unwrap();
-        assert_eq!(r, serde_json::json!({"z": 7}));
-    }
-
-    #[test]
-    fn thinking_decision_returns_none_when_no_tool_calls() {
-        use crate::agent::thinking::ThinkingFactory;
-        use crate::logic::model::provider::LlmResponse;
-        let f = ThinkingFactory::new();
-        let inst = f.create("task-1");
-        let resp = LlmResponse {
-            content: "just text".to_string(),
-            tool_calls: vec![],
-            usage: None,
-        };
-        assert!(inst.decision(&resp).is_none());
-    }
-
-    #[test]
     fn authorized_dispatch_uses_actor_tool_caps_and_authority_name() {
         let mut reg = make_registry_with_echo();
         reg.agents.insert(
@@ -457,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_alias_dispatch_normalizes_before_authorization() {
+    fn provider_alias_normalizes_then_dispatch_authorized() {
         let mut reg = make_registry_with_echo();
         reg.agents.insert(
             "agent-1".to_string(),
@@ -481,35 +362,22 @@ mod tests {
             .unwrap()
             .to_string();
 
+        let normalized = tool_set
+            .normalize(&alias, serde_json::json!({"normalized": true}))
+            .unwrap();
         let output = dispatcher
-            .dispatch_provider_call(
-                "agent-1",
-                &tool_set,
-                &ToolCall {
-                    id: "provider-call-1".to_string(),
-                    name: alias,
-                    arguments: serde_json::json!({"normalized": true}),
-                },
-            )
+            .dispatch_authorized("agent-1", &normalized)
             .unwrap();
         assert_eq!(output, serde_json::json!({"normalized": true}));
 
-        let error = dispatcher
-            .dispatch_provider_call(
-                "agent-1",
-                &tool_set,
-                &ToolCall {
-                    id: "provider-call-2".to_string(),
-                    name: "echo".to_string(),
-                    arguments: serde_json::json!({}),
-                },
-            )
+        let error = tool_set
+            .normalize("echo", serde_json::json!({}))
             .unwrap_err();
         assert!(matches!(error, AgentError::NotFound(_)));
     }
 
     #[test]
-    fn authorized_provider_tools_bind_actor_request_and_dispatch() {
+    fn provider_tool_set_carries_request_tools_and_normalizes() {
         let mut reg = make_registry_with_echo();
         reg.agents.insert(
             "agent-1".to_string(),
@@ -526,28 +394,29 @@ mod tests {
         );
         let exec = make_executor_with_echo();
         let dispatcher = CapabilityDispatcher::new(&reg, &exec);
-        let authorized = dispatcher.authorize_provider_tools("agent-1").unwrap();
+        let service = CapabilityService::new(&reg, &exec).unwrap();
+        let tool_set = service.provider_tools_for_agent("agent-1").unwrap();
 
-        assert_eq!(authorized.agent_id(), "agent-1");
-        let mut request = LlmRequest::default();
-        authorized.apply_to_request(&mut request);
-        assert_eq!(request.tools, authorized.tools());
-        assert_eq!(request.tools.len(), 1);
-
-        let alias = request.tools[0]["function"]["name"]
+        assert_eq!(tool_set.tools().len(), 1);
+        let alias = tool_set.tools()[0]["function"]["name"]
             .as_str()
             .unwrap()
             .to_string();
+
         let call = ToolCall {
             id: "provider-call".to_string(),
             name: alias,
             arguments: serde_json::json!({"bound": true}),
         };
-        let normalized = authorized.normalize(&call).unwrap();
+        let normalized = tool_set
+            .normalize(&call.name, call.arguments.clone())
+            .unwrap();
         assert_eq!(normalized.capability_id, "echo");
         assert_eq!(normalized.capability_name, "Echo");
         assert_eq!(
-            authorized.dispatch(&dispatcher, &call).unwrap(),
+            dispatcher
+                .dispatch_authorized("agent-1", &normalized)
+                .unwrap(),
             serde_json::json!({"bound": true})
         );
     }

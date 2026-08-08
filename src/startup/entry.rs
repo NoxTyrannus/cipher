@@ -592,8 +592,6 @@ pub async fn run_normal(
         assembler,
         app_state.registry.clone(),
         pool,
-        Some(config.data_dir.join("wasm")),
-        Some(std::env::current_dir().unwrap_or_default()),
         duckdb_for_mgr,
     );
     tracing::info!("mode_init: ModeManager ready (default: UNNI)");
@@ -1162,6 +1160,65 @@ pub async fn run_streaming_loop(
 
 const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// 构造 echo 轮注入摘要（纯函数, 便于单测）:
+/// 执行结果段逐节点带 summary（失败附 error）, 记忆沉淀段带注意力 content（200 截断）, 整体 4000 兜底。
+fn build_echo_summary(
+    ctx: &crate::agent::communication::TurnContext,
+    turn_id: &str,
+    reason: &str,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(format!("既定目标: {}", ctx.thinking.goal));
+    if let Some(exec) = &ctx.execution {
+        let node_lines: Vec<String> = exec
+            .node_results
+            .iter()
+            .map(|n| match &n.error {
+                Some(err) => format!("{}: 失败[{}]", n.node_id, err),
+                None => format!("{}: {}", n.node_id, n.summary),
+            })
+            .collect();
+        parts.push(format!(
+            "执行结果: {:?}, 节点明细 [{}]",
+            exec.status,
+            node_lines.join("; ")
+        ));
+    }
+    if let Some(ins) = &ctx.insight {
+        parts.push(format!(
+            "洞察: 越界={} 需跟进={}",
+            ins.insight.boundary_check.crossed, ins.insight.needs_followup
+        ));
+    }
+    if let Some(mem) = &ctx.memory {
+        if !mem.attention.is_empty() {
+            let lines: Vec<String> = mem
+                .attention
+                .iter()
+                .map(|a| {
+                    format!(
+                        "{}: {}",
+                        a.focus,
+                        crate::common::json_util::truncate_head_tail(&a.content, 200)
+                    )
+                })
+                .collect();
+            parts.push(format!(
+                "记忆沉淀: 新增注意力 {} 条 [{}]",
+                mem.attention.len(),
+                lines.join("; ")
+            ));
+        }
+        if !mem.experience.is_empty() {
+            parts.push(format!("记忆沉淀: 新增经验 {} 条", mem.experience.len()));
+        }
+    }
+    parts.push(format!(
+        "记忆中台已整理上一轮 (thought_id={turn_id}, reason={reason}). 请基于此继续推进目标."
+    ));
+    crate::common::json_util::truncate_head_tail(&parts.join("\n"), 4000)
+}
+
 async fn spawn_flywheel_echo(
     mode_manager: &mut ModeManager,
     state: &mut TuiState,
@@ -1197,50 +1254,12 @@ async fn spawn_flywheel_echo(
     }
 
     let echo_ctx = pool.get_turn_context(turn_id).await;
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(ctx) = &echo_ctx {
-        parts.push(format!("既定目标: {}", ctx.thinking.goal));
-        if let Some(exec) = &ctx.execution {
-            let fails: Vec<String> = exec
-                .node_results
-                .iter()
-                .filter_map(|n| n.error.as_ref().map(|e| format!("{}: {}", n.node_id, e)))
-                .collect();
-            if fails.is_empty() {
-                parts.push(format!("执行结果: {:?}, 全部节点成功", exec.status));
-            } else {
-                parts.push(format!(
-                    "执行结果: {:?}, 失败节点 [{}]",
-                    exec.status,
-                    fails.join("; ")
-                ));
-            }
-        }
-        if let Some(ins) = &ctx.insight {
-            parts.push(format!(
-                "洞察: 越界={} 需跟进={}",
-                ins.insight.boundary_check.crossed, ins.insight.needs_followup
-            ));
-        }
-
-        if let Some(mem) = &ctx.memory {
-            if !mem.attention.is_empty() {
-                let focuses: Vec<&str> = mem.attention.iter().map(|a| a.focus.as_str()).collect();
-                parts.push(format!(
-                    "记忆沉淀: 新增注意力 {} 条 [{}]",
-                    mem.attention.len(),
-                    focuses.join(", ")
-                ));
-            }
-            if !mem.experience.is_empty() {
-                parts.push(format!("记忆沉淀: 新增经验 {} 条", mem.experience.len()));
-            }
-        }
-    }
-    parts.push(format!(
-        "记忆中台已整理上一轮 (thought_id={turn_id}, reason={reason}). 请基于此继续推进目标."
-    ));
-    let summary = parts.join("\n");
+    let summary = match &echo_ctx {
+        Some(ctx) => build_echo_summary(ctx, turn_id, reason),
+        None => format!(
+            "记忆中台已整理上一轮 (thought_id={turn_id}, reason={reason}). 请基于此继续推进目标."
+        ),
+    };
 
     match mode_manager
         .spawn_with_override(
@@ -1396,6 +1415,156 @@ mod prompt_install_tests {
         assert_eq!(
             std::fs::read_to_string(prompts_dir.join("local_notes.md")).unwrap(),
             "keep this too"
+        );
+    }
+}
+
+#[cfg(test)]
+mod echo_summary_tests {
+    use super::*;
+    use crate::agent::communication::{
+        AttentionFragment, ExecutionOutput, ExecutionStatus, ExperienceFragment, InsightOutput,
+        MemoryOutput, NodeResult, NodeStatus, ThinkDecision, ThinkingOutput, TurnContext,
+        TurnStatus,
+    };
+
+    fn node_result(id: &str, summary: &str, error: Option<&str>) -> NodeResult {
+        NodeResult {
+            node_id: id.into(),
+            status: if error.is_some() {
+                NodeStatus::Failed
+            } else {
+                NodeStatus::Completed
+            },
+            summary: summary.into(),
+            error: error.map(str::to_string),
+            tool_call_count: 1,
+            tool_call_logs: vec![],
+        }
+    }
+
+    fn turn_context(
+        execution: Option<ExecutionOutput>,
+        memory: Option<MemoryOutput>,
+    ) -> TurnContext {
+        TurnContext {
+            turn_id: "t1".into(),
+            thinking: ThinkingOutput {
+                decision: ThinkDecision::Execute,
+                goal: "统计 ERROR 总数".into(),
+                constraints: vec![],
+                message: String::new(),
+            },
+            execution,
+            insight: Some(InsightOutput {
+                insight: crate::agent::communication::InsightResult {
+                    boundary_check: crate::agent::communication::BoundaryCheck {
+                        crossed: false,
+                        violations: vec![],
+                        analysis: String::new(),
+                    },
+                    goal_alignment: crate::agent::communication::GoalAlignment {
+                        aligned: true,
+                        deviation: None,
+                        analysis: String::new(),
+                    },
+                    growth_check: crate::agent::communication::GrowthCheck {
+                        growth_detected: false,
+                        growth_type: None,
+                        analysis: String::new(),
+                    },
+                    needs_followup: false,
+                    followup_hint: None,
+                },
+                tool_memory: vec![],
+            }),
+            memory,
+            status: TurnStatus::Memorizing,
+            user_message: String::new(),
+            input_kind: "echo".into(),
+            say_published: true,
+        }
+    }
+
+    #[test]
+    fn echo_summary_includes_node_summaries_and_attention_content() {
+        let ctx = turn_context(
+            Some(ExecutionOutput {
+                dag: crate::agent::communication::ExecutionDag::Single {
+                    template_kind: "normal".into(),
+                    capability_ids: vec!["shell.exec".into()],
+                    task_context: String::new(),
+                },
+                node_results: vec![
+                    node_result("n1", "ERROR 计数: a=3, b=2, c=2", None),
+                    node_result("n2", "counted all", Some("文件缺失")),
+                ],
+                status: ExecutionStatus::PartialFailure,
+            }),
+            Some(MemoryOutput {
+                attention: vec![AttentionFragment {
+                    focus: "ERROR统计结果-a.log".into(),
+                    content: "logs/a.log 中 ERROR 出现 3 次".into(),
+                }],
+                experience: vec![ExperienceFragment {
+                    title: "经验1".into(),
+                    summary: "s".into(),
+                }],
+                preference: vec![],
+                cognitive: vec![],
+            }),
+        );
+        let summary = build_echo_summary(&ctx, "t1", "echo");
+        assert!(
+            summary.contains("n1: ERROR 计数: a=3, b=2, c=2"),
+            "{summary}"
+        );
+        assert!(summary.contains("n2: 失败[文件缺失]"), "{summary}");
+        assert!(
+            summary.contains("logs/a.log 中 ERROR 出现 3 次"),
+            "{summary}"
+        );
+        assert!(summary.contains("ERROR统计结果-a.log"), "{summary}");
+        assert!(summary.contains("新增经验 1 条"), "{summary}");
+        assert!(summary.contains("既定目标: 统计 ERROR 总数"), "{summary}");
+    }
+
+    #[test]
+    fn echo_summary_empty_context_does_not_panic() {
+        let ctx = turn_context(None, None);
+        let summary = build_echo_summary(&ctx, "t1", "echo");
+        assert!(summary.contains("既定目标: 统计 ERROR 总数"), "{summary}");
+        assert!(
+            summary.contains("记忆中台已整理上一轮 (thought_id=t1, reason=echo)"),
+            "{summary}"
+        );
+        assert!(!summary.contains("节点明细"), "{summary}");
+    }
+
+    #[test]
+    fn echo_summary_truncates_overlong_total() {
+        let ctx = turn_context(
+            Some(ExecutionOutput {
+                dag: crate::agent::communication::ExecutionDag::Single {
+                    template_kind: "normal".into(),
+                    capability_ids: vec!["shell.exec".into()],
+                    task_context: String::new(),
+                },
+                node_results: vec![node_result("n1", &"x".repeat(5000), None)],
+                status: ExecutionStatus::Success,
+            }),
+            None,
+        );
+        let summary = build_echo_summary(&ctx, "t1", "echo");
+        assert!(
+            summary.contains("truncated"),
+            "must carry truncation marker"
+        );
+        assert!(summary.contains("请基于此继续推进目标"), "{summary}");
+        assert!(
+            summary.chars().count() < 4000 + 64,
+            "summary must stay near 4000-char budget, got {}",
+            summary.chars().count()
         );
     }
 }
