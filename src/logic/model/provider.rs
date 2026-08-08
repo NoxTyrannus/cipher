@@ -1,3 +1,4 @@
+use super::message::ChatMessage;
 use super::stream::StreamChunk;
 use crate::common::{AgentError, Result};
 use crate::data::ModelRow;
@@ -5,47 +6,37 @@ use async_trait::async_trait;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct LlmRequest {
     pub model: String,
 
-    #[serde(default)]
     pub system: Option<String>,
 
-    pub messages: Vec<Message>,
+    pub messages: Vec<ChatMessage>,
 
-    #[serde(default)]
     pub temperature: Option<f32>,
 
-    #[serde(default)]
     pub top_p: Option<f32>,
 
-    #[serde(default)]
     pub max_tokens: Option<u32>,
 
-    #[serde(default)]
     pub tools: Vec<serde_json::Value>,
 
-    #[serde(default)]
     pub stream: bool,
 
-    #[serde(default)]
     pub api_url: String,
 
-    #[serde(skip, default)]
     pub api_key: Option<SecretString>,
 
-    #[serde(default)]
     pub provider_kind: String,
 
-    #[serde(default)]
     pub config: Option<serde_json::Value>,
 }
 
 impl LlmRequest {
     pub fn from_model_row(
         model_row: &ModelRow,
-        messages: Vec<Message>,
+        messages: Vec<ChatMessage>,
         api_key: SecretString,
     ) -> Result<Self> {
         let config = model_row.config.clone();
@@ -76,52 +67,6 @@ impl LlmRequest {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MessageRole {
-    System,
-    User,
-    Assistant,
-    Tool,
-}
-
-impl MessageRole {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            MessageRole::System => "system",
-            MessageRole::User => "user",
-            MessageRole::Assistant => "assistant",
-            MessageRole::Tool => "tool",
-        }
-    }
-}
-
-impl std::fmt::Display for MessageRole {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for MessageRole {
-    type Err = AgentError;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "system" => Ok(MessageRole::System),
-            "user" => Ok(MessageRole::User),
-            "assistant" => Ok(MessageRole::Assistant),
-            "tool" => Ok(MessageRole::Tool),
-            other => Err(AgentError::Parse(format!("unknown message role: {other}"))),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Message {
-    pub role: MessageRole,
-    pub content: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolCall {
     pub id: String,
@@ -136,8 +81,6 @@ pub enum ToolCallFormat {
     OpenAI,
 
     Anthropic,
-
-    Ark,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,9 +149,8 @@ mod tests {
         let p = StubProvider;
         let req = LlmRequest {
             model: "x".to_string(),
-            messages: vec![Message {
-                role: MessageRole::User,
-                content: "hi".to_string(),
+            messages: vec![ChatMessage::User {
+                text: "hi".to_string(),
             }],
             ..Default::default()
         };
@@ -217,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn request_serializes_with_optional_fields() {
+    fn request_keeps_optional_fields() {
         let req = LlmRequest {
             model: "gpt-4o".to_string(),
             messages: vec![],
@@ -225,9 +167,10 @@ mod tests {
             max_tokens: Some(1024),
             ..Default::default()
         };
-        let j = serde_json::to_string(&req).unwrap();
-        assert!(j.contains("gpt-4o"));
-        assert!(j.contains("0.7"));
+        assert_eq!(req.model, "gpt-4o");
+        assert_eq!(req.temperature, Some(0.7));
+        assert_eq!(req.max_tokens, Some(1024));
+        assert!(req.messages.is_empty());
     }
 
     #[test]
@@ -243,13 +186,10 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_format_enum_3_variants() {
+    fn tool_call_format_enum_2_variants() {
         let a = ToolCallFormat::OpenAI;
         let b = ToolCallFormat::Anthropic;
-        let c = ToolCallFormat::Ark;
         assert_ne!(a, b);
-        assert_ne!(a, c);
-        assert_ne!(b, c);
     }
 
     #[test]
@@ -269,9 +209,8 @@ mod tests {
         let p = StubProvider;
         let req = LlmRequest {
             model: "x".to_string(),
-            messages: vec![Message {
-                role: MessageRole::User,
-                content: "hi".to_string(),
+            messages: vec![ChatMessage::User {
+                text: "hi".to_string(),
             }],
             ..Default::default()
         };

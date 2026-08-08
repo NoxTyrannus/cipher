@@ -1,9 +1,8 @@
 use crate::common::{AgentError, Result, UtcTimestamp};
 use crate::data::thought_store::ThoughtStore;
-use crate::logic::capability::executor::CapabilityExecutor;
-use crate::logic::model::provider::{LlmResponse, Message, MessageRole, ToolCall};
-use crate::logic::model::stream::{StreamChunk, ToolResult};
-use std::collections::HashSet;
+use crate::logic::model::message::{ChatMessage, SystemKind};
+use crate::logic::model::provider::LlmResponse;
+use crate::logic::model::stream::StreamChunk;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -13,8 +12,6 @@ use tokio::task::JoinHandle;
 use super::agent_pool::AgentPool;
 use super::communication::{ThinkDecision, ThinkingOutput, TurnContext, TurnStatus};
 use super::context_assembler::ContextAssembler;
-use super::decision::Decision;
-use super::dispatcher::{AuthorizedProviderTools, CapabilityDispatcher};
 use super::output::{
     parse_agent_output, strip_loop_say, validate_agent_output, AgentOutput, OutputValidationError,
 };
@@ -22,8 +19,6 @@ use super::thought::{
     DownstreamRequest, ThinkingFailureInput, ThinkingInput as PersistentThinkingInput,
     ThinkingOutput as PersistentThinkingOutput, ThoughtContext, ThoughtId,
 };
-
-const MAX_TOOL_ITERATIONS: u32 = 10;
 
 #[derive(Debug, Default)]
 pub struct KeepSayQuota {
@@ -69,57 +64,6 @@ impl Drop for KeepSayReservation {
     fn drop(&mut self) {
         if !self.committed {
             self.quota.consumed.store(false, Ordering::Release);
-        }
-    }
-}
-
-fn tool_call_key(tc: &ToolCall) -> String {
-    format!("{}:{}", tc.name, tc.arguments)
-}
-
-#[derive(Debug, Clone)]
-enum ProviderToolAccess {
-    Authorized(AuthorizedProviderTools),
-
-    Disabled,
-}
-
-impl ProviderToolAccess {
-    fn apply_to_request(&self, request: &mut crate::logic::model::provider::LlmRequest) {
-        if let Self::Authorized(provider_tools) = self {
-            provider_tools.apply_to_request(request);
-        }
-    }
-
-    fn dispatch(
-        &self,
-        dispatcher: &CapabilityDispatcher<'_>,
-        call: &ToolCall,
-    ) -> Result<serde_json::Value> {
-        match self {
-            Self::Authorized(provider_tools) => provider_tools.dispatch(dispatcher, call),
-            Self::Disabled => Err(AgentError::NotFound(format!(
-                "provider tool '{}' is unavailable without an authorized actor",
-                call.name
-            ))),
-        }
-    }
-
-    fn validate_calls(&self, calls: &[ToolCall]) -> Result<()> {
-        match self {
-            Self::Authorized(provider_tools) => {
-                for call in calls {
-                    provider_tools.normalize(call)?;
-                }
-                Ok(())
-            }
-            Self::Disabled => match calls.first() {
-                Some(call) => Err(AgentError::NotFound(format!(
-                    "provider tool '{}' is unavailable because thinking tools are disabled",
-                    call.name
-                ))),
-                None => Ok(()),
-            },
         }
     }
 }
@@ -383,7 +327,6 @@ pub struct ThinkingInstance {
     pub input: String,
 
     input_override: Option<super::thought::ThinkingInput>,
-    provider_tool_access: ProviderToolAccess,
 
     keep_say_quota: Option<Arc<KeepSayQuota>>,
 }
@@ -425,7 +368,6 @@ impl ThinkingInstance {
             mode_kind: None,
             mode_hint: String::new(),
             input: String::new(),
-            provider_tool_access: ProviderToolAccess::Disabled,
             keep_say_quota: None,
             input_override: None,
         }
@@ -457,15 +399,9 @@ impl ThinkingInstance {
             mode_kind: Some(mode_kind),
             mode_hint: canonical_mode_hint,
             input,
-            provider_tool_access: ProviderToolAccess::Disabled,
             keep_say_quota: None,
             input_override: None,
         })
-    }
-
-    fn with_provider_tool_access(mut self, access: ProviderToolAccess) -> Self {
-        self.provider_tool_access = access;
-        self
     }
 
     fn with_keep_say_quota(mut self, quota: Option<Arc<KeepSayQuota>>) -> Self {
@@ -498,24 +434,16 @@ impl ThinkingInstance {
         }
     }
 
-    pub fn decision(&self, llm_resp: &LlmResponse) -> Option<Decision> {
-        llm_resp
-            .tool_calls
-            .first()
-            .map(|tc| Decision::call_capability(tc.clone()))
-    }
-
     pub async fn run(
         &mut self,
         model_row: &crate::data::ModelRow,
         registry: &crate::logic::model::registry::ProviderRegistry,
         assembler: &ContextAssembler,
-        dispatcher: &CapabilityDispatcher<'_>,
     ) -> Result<LlmResponse> {
         use crate::logic::model::api_key::resolve_api_key;
         use crate::logic::model::provider::LlmRequest;
 
-        let (system_prompt, mut messages) =
+        let (system_prompt, messages) =
             assembler.build_messages(&self.input, &self.mode_hint).await;
 
         let self_awareness = assembler.build_self_awareness().await;
@@ -535,77 +463,20 @@ impl ThinkingInstance {
             ))
         })?;
 
-        let mut last_response: Option<LlmResponse> = None;
-        let mut seen_tool_calls: HashSet<String> = HashSet::new();
-        let mut iteration: u32 = 0;
+        let mut req = LlmRequest::from_model_row(model_row, messages, api_key)?;
+        req.system = Some(system_prompt);
 
-        loop {
-            if iteration >= MAX_TOOL_ITERATIONS {
-                tracing::warn!(
-                    "run: tool_calls sub-loop hit max_iterations={MAX_TOOL_ITERATIONS}, truncating"
-                );
-                break;
-            }
+        let resp = provider.call(&req).await?;
 
-            let mut req = LlmRequest::from_model_row(model_row, messages.clone(), api_key.clone())?;
-            req.system = Some(system_prompt.clone());
-            self.provider_tool_access.apply_to_request(&mut req);
-
-            let resp = provider.call(&req).await?;
-            self.provider_tool_access.validate_calls(&resp.tool_calls)?;
-
-            if resp.tool_calls.is_empty() {
-                last_response = Some(resp);
-                break;
-            }
-
-            iteration += 1;
-            let mut tool_results: Vec<Message> = Vec::new();
-
-            for tc in &resp.tool_calls {
-                let key = tool_call_key(tc);
-                if !seen_tool_calls.insert(key.clone()) {
-                    tracing::warn!(
-                        "run: skipping duplicate tool_call: {} (iteration {iteration})",
-                        key
-                    );
-                    tool_results.push(Message {
-                        role: MessageRole::Tool,
-                        content: format!("{{\"warning\": \"Skipped duplicate call: {}\"}}", key),
-                    });
-                    continue;
-                }
-
-                let result = match self.provider_tool_access.dispatch(dispatcher, tc) {
-                    Ok(val) => val,
-                    Err(e) => {
-                        tracing::warn!("run: tool_call '{}' dispatch error: {e}", tc.name);
-                        serde_json::json!({"error": e.to_string()})
-                    }
-                };
-
-                tool_results.push(Message {
-                    role: MessageRole::Tool,
-                    content: result.to_string(),
-                });
-            }
-
-            let assistant_content = resp.content.clone();
-            messages.push(Message {
-                role: MessageRole::Assistant,
-                content: assistant_content,
-            });
-            messages.extend(tool_results);
-
-            last_response = Some(resp);
+        if !resp.tool_calls.is_empty() {
+            tracing::warn!(
+                "run: thinking engine has no tools; ignoring {} unexpected tool_call(s)",
+                resp.tool_calls.len()
+            );
         }
 
         self.state = ThinkState::Design;
-        Ok(last_response.unwrap_or_else(|| LlmResponse {
-            content: String::new(),
-            tool_calls: vec![],
-            usage: None,
-        }))
+        Ok(resp)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -617,8 +488,6 @@ impl ThinkingInstance {
         model_row: crate::data::ModelRow,
         provider: Arc<dyn crate::logic::model::provider::LlmProvider>,
         assembler: &ContextAssembler,
-        capability_registry: crate::data::duckdb::Registry,
-        capability_executor: Arc<CapabilityExecutor>,
         agent_pool: Arc<AgentPool>,
         thought_store: Arc<ThoughtStore>,
         mut thought_context: ThoughtContext,
@@ -692,16 +561,12 @@ impl ThinkingInstance {
         let cancel2 = cancel.clone();
         let pool = Arc::clone(&agent_pool);
         let thought_store2 = Arc::clone(&thought_store);
-        let provider_tool_access = self.provider_tool_access.clone();
         let mode_snapshot = self.mode_hint.clone();
         let keep_say_quota = self.keep_say_quota.clone();
 
         tokio::spawn(async move {
-            use crate::agent::dispatcher::CapabilityDispatcher;
-
             let say_published2: bool;
 
-            let dispatcher = CapabilityDispatcher::new(&capability_registry, &capability_executor);
             let mut on_chunk = {
                 let id = id2.clone();
                 move |_chunk: StreamChunk| {
@@ -712,272 +577,138 @@ impl ThinkingInstance {
                 }
             };
 
-            let mut loop_messages = messages.clone();
-            let mut iteration: u32 = 0;
-            let mut seen_tool_calls: HashSet<String> = HashSet::new();
-            let mut final_response: Option<LlmResponse> = None;
             let mut thought_context = thought_context;
 
-            loop {
-                if iteration >= MAX_TOOL_ITERATIONS {
-                    tracing::warn!(
-                        "spawn_streaming: hit max_iterations={MAX_TOOL_ITERATIONS}, truncating"
-                    );
-                    break;
+            let phase_t0 = std::time::Instant::now();
+            tracing::info!(
+                "spawn_streaming: [timing] request build start thought_id={}",
+                id2
+            );
+            let req = match LlmRequest::from_model_row(&model_row, messages, api_key.clone()) {
+                Ok(mut request) => {
+                    request.system = Some(system_prompt.clone());
+                    request
                 }
-
-                let phase_t0 = std::time::Instant::now();
-                tracing::info!(
-                    "spawn_streaming: [timing] iteration={} request build start thought_id={}",
-                    iteration,
-                    id2
-                );
-                let req = match LlmRequest::from_model_row(
-                    &model_row,
-                    loop_messages.clone(),
-                    api_key.clone(),
-                ) {
-                    Ok(mut request) => {
-                        request.system = Some(system_prompt.clone());
-                        provider_tool_access.apply_to_request(&mut request);
-                        request
-                    }
-                    Err(e) => {
-                        let signal_error = match persist_terminal_output(
-                            &thought_store2,
-                            &mut thought_context,
-                            PersistentThinkingOutput::failed(e.to_string()),
-                        ) {
-                            Ok(()) => e,
-                            Err(persist_error) => {
-                                tracing::error!(
-                                    "spawn_streaming: failed to persist request-build failure for thought_id={}: {}",
-                                    id2,
-                                    persist_error
-                                );
-                                persist_error
-                            }
-                        };
-                        if let Err(send_e) = stream_tx2
-                            .try_send((id2.clone(), StreamChunk::Error(signal_error.to_string())))
-                        {
-                            tracing::warn!(
-                                "spawn_streaming: stream_tx2 send error turn_id={}, error={}",
-                                id2,
-                                send_e
-                            );
-                        }
-                        if let Err(send_e) = pool_tx2.try_send(InstanceOutcome {
-                            id: id2.clone(),
-                            result: Err(signal_error),
-                        }) {
-                            tracing::warn!(
-                                "spawn_streaming: pool_tx2 send error turn_id={}, error={}",
-                                id2,
-                                send_e
-                            );
-                        }
-                        return;
-                    }
-                };
-
-                tracing::info!(
-                    "spawn_streaming: [timing] call_stream start thought_id={}",
-                    id2
-                );
-                let resp = tokio::select! {
-                    resp = provider.call_stream(&req, &mut on_chunk) => {
-                        match resp {
-                            Ok(r) => {
-                                tracing::info!("spawn_streaming: [timing] call_stream returned {:?} thought_id={}", phase_t0.elapsed(), id2);
-                                r
-                            }
-                            Err(e) => {
-                                let signal_error = match persist_terminal_output(
-                                    &thought_store2,
-                                    &mut thought_context,
-                                    PersistentThinkingOutput::failed(e.to_string()),
-                                ) {
-                                    Ok(()) => e,
-                                    Err(persist_error) => {
-                                        tracing::error!(
-                                            "spawn_streaming: failed to persist provider failure for thought_id={}: {}",
-                                            id2,
-                                            persist_error
-                                        );
-                                        persist_error
-                                    }
-                                };
-                                if let Err(send_e) = stream_tx2.try_send((id2.clone(), StreamChunk::Error(signal_error.to_string()))) {
-                                    tracing::warn!("spawn_streaming: stream_tx2 send error turn_id={}, error={}", id2, send_e);
-                                }
-                                if let Err(send_e) = pool_tx2.try_send(InstanceOutcome { id: id2.clone(), result: Err(signal_error) }) {
-                                    tracing::warn!("spawn_streaming: pool_tx2 send error turn_id={}, error={}", id2, send_e);
-                                }
-                                return;
-                            }
-                        }
-                    }
-                    _ = cancel2.notified() => {
-                        match persist_terminal_output(
-                            &thought_store2,
-                            &mut thought_context,
-                            PersistentThinkingOutput::cancelled(Some("stream cancelled".to_string())),
-                        ) {
-                            Ok(()) => {
-                                if let Err(send_e) = stream_tx2.try_send((id2.clone(), StreamChunk::Cancelled)) {
-                                    tracing::warn!("spawn_streaming: stream_tx2 send error turn_id={}, error={}", id2, send_e);
-                                }
-                            }
-                            Err(persist_error) => {
-                                tracing::error!(
-                                    "spawn_streaming: failed to persist cancellation for thought_id={}: {}",
-                                    id2,
-                                    persist_error
-                                );
-                                if let Err(send_e) = stream_tx2.try_send((
-                                    id2.clone(),
-                                    StreamChunk::Error(persist_error.to_string()),
-                                )) {
-                                    tracing::warn!("spawn_streaming: stream_tx2 send error turn_id={}, error={}", id2, send_e);
-                                }
-                                if let Err(send_e) = pool_tx2.try_send(InstanceOutcome {
-                                    id: id2.clone(),
-                                    result: Err(persist_error),
-                                }) {
-                                    tracing::warn!("spawn_streaming: pool_tx2 send error turn_id={}, error={}", id2, send_e);
-                                }
-                            }
-                        }
-                        return;
-                    }
-                };
-
-                if let Err(error) = provider_tool_access.validate_calls(&resp.tool_calls) {
+                Err(e) => {
                     let signal_error = match persist_terminal_output(
                         &thought_store2,
                         &mut thought_context,
-                        PersistentThinkingOutput::failed(error.to_string()),
+                        PersistentThinkingOutput::failed(e.to_string()),
                     ) {
-                        Ok(()) => error,
+                        Ok(()) => e,
                         Err(persist_error) => {
                             tracing::error!(
-                                "spawn_streaming: failed to persist rejected tool call for thought_id={}: {}",
+                                "spawn_streaming: failed to persist request-build failure for thought_id={}: {}",
                                 id2,
                                 persist_error
                             );
                             persist_error
                         }
                     };
-                    if let Err(send_error) = stream_tx2
+                    if let Err(send_e) = stream_tx2
                         .try_send((id2.clone(), StreamChunk::Error(signal_error.to_string())))
                     {
                         tracing::warn!(
                             "spawn_streaming: stream_tx2 send error turn_id={}, error={}",
                             id2,
-                            send_error
+                            send_e
                         );
                     }
-                    if let Err(send_error) = pool_tx2.try_send(InstanceOutcome {
+                    if let Err(send_e) = pool_tx2.try_send(InstanceOutcome {
                         id: id2.clone(),
                         result: Err(signal_error),
                     }) {
                         tracing::warn!(
                             "spawn_streaming: pool_tx2 send error turn_id={}, error={}",
                             id2,
-                            send_error
+                            send_e
                         );
                     }
                     return;
                 }
+            };
 
-                if resp.tool_calls.is_empty() {
-                    final_response = Some(resp);
-                    break;
-                }
-
-                iteration += 1;
-                if let Err(send_e) =
-                    stream_tx2.try_send((id2.clone(), StreamChunk::ToolCallStart { iteration }))
-                {
-                    tracing::warn!(
-                        "spawn_streaming: stream_tx2 send error turn_id={}, error={}",
-                        id2,
-                        send_e
-                    );
-                }
-
-                let mut tool_results: Vec<Message> = Vec::new();
-                let mut tool_result_chunks: Vec<ToolResult> = Vec::new();
-
-                for tc in &resp.tool_calls {
-                    let key = tool_call_key(tc);
-                    if !seen_tool_calls.insert(key.clone()) {
-                        tracing::warn!(
-                            "spawn_streaming: skipping duplicate tool_call: {} (iteration {iteration})",
-                            key
-                        );
-                        let content = serde_json::json!({"warning": format!("Skipped duplicate call: {}", key)});
-                        tool_results.push(Message {
-                            role: MessageRole::Tool,
-                            content: content.to_string(),
-                        });
-                        tool_result_chunks.push(ToolResult {
-                            tool_call_id: tc.id.clone(),
-                            content,
-                        });
-                        continue;
-                    }
-
-                    let result = match provider_tool_access.dispatch(&dispatcher, tc) {
-                        Ok(val) => val,
-                        Err(e) => {
-                            tracing::warn!(
-                                "spawn_streaming: dispatch error for '{}': {e}",
-                                tc.name
-                            );
-                            serde_json::json!({"error": e.to_string()})
+            tracing::info!(
+                "spawn_streaming: [timing] call_stream start thought_id={}",
+                id2
+            );
+            let resp = tokio::select! {
+                resp = provider.call_stream(&req, &mut on_chunk) => {
+                    match resp {
+                        Ok(r) => {
+                            tracing::info!("spawn_streaming: [timing] call_stream returned {:?} thought_id={}", phase_t0.elapsed(), id2);
+                            r
                         }
-                    };
-
-                    tool_results.push(Message {
-                        role: MessageRole::Tool,
-                        content: result.to_string(),
-                    });
-                    tool_result_chunks.push(ToolResult {
-                        tool_call_id: tc.id.clone(),
-                        content: result,
-                    });
+                        Err(e) => {
+                            let signal_error = match persist_terminal_output(
+                                &thought_store2,
+                                &mut thought_context,
+                                PersistentThinkingOutput::failed(e.to_string()),
+                            ) {
+                                Ok(()) => e,
+                                Err(persist_error) => {
+                                    tracing::error!(
+                                        "spawn_streaming: failed to persist provider failure for thought_id={}: {}",
+                                        id2,
+                                        persist_error
+                                    );
+                                    persist_error
+                                }
+                            };
+                            if let Err(send_e) = stream_tx2.try_send((id2.clone(), StreamChunk::Error(signal_error.to_string()))) {
+                                tracing::warn!("spawn_streaming: stream_tx2 send error turn_id={}, error={}", id2, send_e);
+                            }
+                            if let Err(send_e) = pool_tx2.try_send(InstanceOutcome { id: id2.clone(), result: Err(signal_error) }) {
+                                tracing::warn!("spawn_streaming: pool_tx2 send error turn_id={}, error={}", id2, send_e);
+                            }
+                            return;
+                        }
+                    }
                 }
-
-                if let Err(send_e) = stream_tx2.try_send((
-                    id2.clone(),
-                    StreamChunk::ToolCallResult {
-                        results: tool_result_chunks,
-                    },
-                )) {
-                    tracing::warn!(
-                        "spawn_streaming: stream_tx2 send error turn_id={}, error={}",
-                        id2,
-                        send_e
-                    );
+                _ = cancel2.notified() => {
+                    match persist_terminal_output(
+                        &thought_store2,
+                        &mut thought_context,
+                        PersistentThinkingOutput::cancelled(Some("stream cancelled".to_string())),
+                    ) {
+                        Ok(()) => {
+                            if let Err(send_e) = stream_tx2.try_send((id2.clone(), StreamChunk::Cancelled)) {
+                                tracing::warn!("spawn_streaming: stream_tx2 send error turn_id={}, error={}", id2, send_e);
+                            }
+                        }
+                        Err(persist_error) => {
+                            tracing::error!(
+                                "spawn_streaming: failed to persist cancellation for thought_id={}: {}",
+                                id2,
+                                persist_error
+                            );
+                            if let Err(send_e) = stream_tx2.try_send((
+                                id2.clone(),
+                                StreamChunk::Error(persist_error.to_string()),
+                            )) {
+                                tracing::warn!("spawn_streaming: stream_tx2 send error turn_id={}, error={}", id2, send_e);
+                            }
+                            if let Err(send_e) = pool_tx2.try_send(InstanceOutcome {
+                                id: id2.clone(),
+                                result: Err(persist_error),
+                            }) {
+                                tracing::warn!("spawn_streaming: pool_tx2 send error turn_id={}, error={}", id2, send_e);
+                            }
+                        }
+                    }
+                    return;
                 }
+            };
 
-                let assistant_text = resp.content.clone();
-                loop_messages.push(Message {
-                    role: MessageRole::Assistant,
-                    content: assistant_text,
-                });
-                loop_messages.extend(tool_results);
-
-                final_response = Some(resp);
+            if !resp.tool_calls.is_empty() {
+                tracing::warn!(
+                    "spawn_streaming: thinking engine has no tools; ignoring {} unexpected tool_call(s) thought_id={}",
+                    resp.tool_calls.len(),
+                    id2
+                );
             }
 
-            let final_response = final_response.unwrap_or_else(|| LlmResponse {
-                content: String::new(),
-                tool_calls: vec![],
-                usage: None,
-            });
+            let final_response = resp;
             let final_content = final_response.content.clone();
             let (output, keep_say_reservation) = match validate_and_persist_model_output(
                 &thought_store2,
@@ -1158,35 +889,14 @@ impl ThinkingInstance {
 }
 
 pub struct ThinkingFactory {
-    provider_tool_access: ProviderToolAccess,
-
     current_keep_quota: Option<Arc<KeepSayQuota>>,
 }
 
 impl ThinkingFactory {
     pub fn new() -> Self {
         Self {
-            provider_tool_access: ProviderToolAccess::Disabled,
             current_keep_quota: None,
         }
-    }
-
-    pub fn new_with_provider_tools(provider_tools: AuthorizedProviderTools) -> Self {
-        Self {
-            provider_tool_access: ProviderToolAccess::Authorized(provider_tools),
-            current_keep_quota: None,
-        }
-    }
-
-    pub fn new_without_provider_tools() -> Self {
-        Self {
-            provider_tool_access: ProviderToolAccess::Disabled,
-            current_keep_quota: None,
-        }
-    }
-
-    pub fn update_provider_tools(&mut self, provider_tools: AuthorizedProviderTools) {
-        self.provider_tool_access = ProviderToolAccess::Authorized(provider_tools);
     }
 
     pub fn reset_keep_quota(&mut self) {
@@ -1215,7 +925,6 @@ impl ThinkingFactory {
 
     pub fn create(&self, task_id: &str) -> ThinkingInstance {
         ThinkingInstance::new(ThoughtId::new(), UtcTimestamp::now(), task_id)
-            .with_provider_tool_access(self.provider_tool_access.clone())
     }
 
     pub fn create_from_mode(
@@ -1249,7 +958,6 @@ impl ThinkingFactory {
             mode_hint,
             input,
         )?
-        .with_provider_tool_access(self.provider_tool_access.clone())
         .with_keep_say_quota(keep_say_quota))
     }
 
@@ -1261,22 +969,14 @@ impl ThinkingFactory {
         model_row: &crate::data::ModelRow,
         registry: &crate::logic::model::registry::ProviderRegistry,
         assembler: &ContextAssembler,
-        dispatcher_registry: &crate::data::duckdb::Registry,
-        capability_executor: &CapabilityExecutor,
         thought_store: &ThoughtStore,
     ) -> Result<super::output::AgentOutput> {
-        use super::dispatcher::CapabilityDispatcher;
-
         let mut instance =
             self.create_from_mode(mode_hint, mode_hint.to_string(), input.to_string())?;
         let mut thought_context = instance.thought_context();
         thought_store.persist_input(&thought_context)?;
 
-        let dispatcher = CapabilityDispatcher::new(dispatcher_registry, capability_executor);
-        let llm_resp = match instance
-            .run(model_row, registry, assembler, &dispatcher)
-            .await
-        {
+        let llm_resp = match instance.run(model_row, registry, assembler).await {
             Ok(response) => response,
             Err(error) => {
                 persist_terminal_output(
@@ -1323,8 +1023,6 @@ impl ThinkingFactory {
         model_row: &crate::data::ModelRow,
         registry: &crate::logic::model::registry::ProviderRegistry,
         assembler: &ContextAssembler,
-        dispatcher_registry: &crate::data::duckdb::Registry,
-        capability_executor: &CapabilityExecutor,
         pool: &AgentPool,
         thought_store: &ThoughtStore,
     ) -> Result<super::output::AgentOutput> {
@@ -1334,8 +1032,6 @@ impl ThinkingFactory {
             model_row,
             registry,
             assembler,
-            dispatcher_registry,
-            capability_executor,
             pool,
             thought_store,
         )
@@ -1350,12 +1046,9 @@ impl ThinkingFactory {
         model_row: &crate::data::ModelRow,
         registry: &crate::logic::model::registry::ProviderRegistry,
         assembler: &ContextAssembler,
-        dispatcher_registry: &crate::data::duckdb::Registry,
-        capability_executor: &CapabilityExecutor,
         pool: &AgentPool,
         thought_store: &ThoughtStore,
     ) -> Result<super::output::AgentOutput> {
-        use super::dispatcher::CapabilityDispatcher;
         use crate::logic::model::api_key::resolve_api_key;
         use crate::logic::model::provider::LlmRequest;
 
@@ -1384,11 +1077,7 @@ impl ThinkingFactory {
             ))
         })?;
 
-        let dispatcher = CapabilityDispatcher::new(dispatcher_registry, capability_executor);
-        let llm_resp = match instance
-            .run(model_row, registry, assembler, &dispatcher)
-            .await
-        {
+        let llm_resp = match instance.run(model_row, registry, assembler).await {
             Ok(response) => response,
             Err(error) => {
                 persist_terminal_output(
@@ -1480,9 +1169,9 @@ impl ThinkingFactory {
                             .collect::<Vec<_>>()
                             .join("; ")
                     );
-                    retry_messages.push(Message {
-                        role: MessageRole::System,
-                        content: feedback,
+                    retry_messages.push(ChatMessage::System {
+                        text: feedback,
+                        kind: SystemKind::Meta,
                     });
 
                     let mut req = LlmRequest::from_model_row(
@@ -1491,7 +1180,6 @@ impl ThinkingFactory {
                         api_key.clone(),
                     )?;
                     req.system = Some(system_prompt.clone());
-                    self.provider_tool_access.apply_to_request(&mut req);
                     match provider.call(&req).await {
                         Ok(resp) => {
                             current_raw = resp.content;

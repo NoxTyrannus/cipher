@@ -1,7 +1,6 @@
 use super::error::map_reqwest_error;
-use super::provider::{
-    LlmProvider, LlmRequest, LlmResponse, Message, MessageRole, ToolCall, ToolCallFormat, Usage,
-};
+use super::message::{normalize_with_system, ChatMessage};
+use super::provider::{LlmProvider, LlmRequest, LlmResponse, ToolCall, ToolCallFormat, Usage};
 use super::stream::{find_double_newline, StreamChunk};
 use crate::common::Result;
 use async_trait::async_trait;
@@ -55,46 +54,76 @@ pub struct OpenAiMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub tool_call_id: Option<String>,
+
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    pub tool_calls: Vec<OpenAiToolCallOut>,
 }
 
-fn parse_tool_envelope(raw: &str) -> Option<(String, String)> {
-    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let id = v.get("tool_use_id")?.as_str()?.to_string();
-    let content = match v.get("content") {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(other) => other.to_string(),
-        None => String::new(),
-    };
-    Some((id, content))
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OpenAiToolCallOut {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: OpenAiFunctionOut,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OpenAiFunctionOut {
+    pub name: String,
+    pub arguments: String,
 }
 
 fn build_openai_request(req: &LlmRequest, stream: bool) -> OpenAiRequest<'_> {
-    let system_msg = req.system.as_ref().map(|s| OpenAiMessage {
-        role: "system".to_string(),
-        content: s.clone(),
-        tool_call_id: None,
-    });
+    let normalized = normalize_with_system(req.system.as_deref(), &req.messages);
+    let mut messages: Vec<OpenAiMessage> = Vec::new();
+    if !normalized.system.is_empty() {
+        messages.push(OpenAiMessage {
+            role: "system".to_string(),
+            content: normalized.system,
+            tool_call_id: None,
+            tool_calls: vec![],
+        });
+    }
+    for msg in &normalized.messages {
+        match msg {
+            ChatMessage::User { text } => messages.push(OpenAiMessage {
+                role: "user".to_string(),
+                content: text.clone(),
+                tool_call_id: None,
+                tool_calls: vec![],
+            }),
+            ChatMessage::Assistant { text, tool_calls } => {
+                let tool_calls: Vec<OpenAiToolCallOut> = tool_calls
+                    .iter()
+                    .map(|tc| OpenAiToolCallOut {
+                        id: tc.id.clone(),
+                        kind: "function".to_string(),
+                        function: OpenAiFunctionOut {
+                            name: tc.name.clone(),
+                            arguments: serde_json::to_string(&tc.arguments).unwrap_or_default(),
+                        },
+                    })
+                    .collect();
+                messages.push(OpenAiMessage {
+                    role: "assistant".to_string(),
+                    content: text.clone(),
+                    tool_call_id: None,
+                    tool_calls,
+                });
+            }
+            ChatMessage::ToolResult { id, text, .. } => messages.push(OpenAiMessage {
+                role: "tool".to_string(),
+                content: text.clone(),
+                tool_call_id: Some(id.clone()),
+                tool_calls: vec![],
+            }),
+            ChatMessage::System { .. } => unreachable!("normalize 已抽取全部 System"),
+        }
+    }
     OpenAiRequest {
         model: &req.model,
-        messages: system_msg
-            .into_iter()
-            .chain(req.messages.iter().map(|message: &Message| {
-                if message.role == MessageRole::Tool {
-                    if let Some((id, content)) = parse_tool_envelope(&message.content) {
-                        return OpenAiMessage {
-                            role: message.role.to_string(),
-                            content,
-                            tool_call_id: Some(id),
-                        };
-                    }
-                }
-                OpenAiMessage {
-                    role: message.role.to_string(),
-                    content: message.content.clone(),
-                    tool_call_id: None,
-                }
-            }))
-            .collect(),
+        messages,
         temperature: req.temperature,
         top_p: req.top_p,
         max_tokens: req.max_tokens,
@@ -441,42 +470,103 @@ impl LlmProvider for OpenAiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logic::model::message::{ChatMessage, SystemKind};
+
+    fn tool_result_msg(id: &str, text: &str) -> ChatMessage {
+        ChatMessage::ToolResult {
+            id: id.to_string(),
+            name: "cap_x".to_string(),
+            text: text.to_string(),
+            is_error: false,
+        }
+    }
+
+    fn user_msg(text: &str) -> ChatMessage {
+        ChatMessage::User {
+            text: text.to_string(),
+        }
+    }
 
     #[test]
-    fn a2_envelope_tool_content_unwrapped_with_tool_call_id() {
+    fn tool_result_emits_role_tool_with_tool_call_id() {
         let req = LlmRequest {
             model: "m".into(),
-            messages: vec![Message {
-                role: MessageRole::Tool,
-                content: r#"{"tool_use_id":"call_1","tool_name":"cap_x","tool_input":{},"content":"plain result"}"#.into(),
-            }],
+            messages: vec![
+                ChatMessage::Assistant {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".into(),
+                        name: "cap_x".into(),
+                        arguments: serde_json::json!({}),
+                    }],
+                },
+                tool_result_msg("call_1", "plain result"),
+            ],
             ..Default::default()
         };
         let body = serde_json::to_value(build_openai_request(&req, false)).unwrap();
-        let m = &body["messages"][0];
+        let m = &body["messages"][1];
         assert_eq!(m["role"], "tool");
         assert_eq!(m["content"], "plain result");
         assert_eq!(m["tool_call_id"], "call_1");
     }
 
     #[test]
-    fn a2_bare_tool_content_passthrough() {
+    fn assistant_tool_calls_emit_openai_shape() {
         let req = LlmRequest {
             model: "m".into(),
-            messages: vec![Message {
-                role: MessageRole::Tool,
-                content: r#"{"stdout":"ok","exit_code":0}"#.into(),
-            }],
+            messages: vec![
+                ChatMessage::Assistant {
+                    text: "我来读文件".into(),
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".into(),
+                        name: "cap_file_read".into(),
+                        arguments: serde_json::json!({"path": "a.txt"}),
+                    }],
+                },
+                tool_result_msg("call_1", "file body"),
+            ],
             ..Default::default()
         };
         let body = serde_json::to_value(build_openai_request(&req, false)).unwrap();
-        let m = &body["messages"][0];
-        assert_eq!(m["role"], "tool");
-        assert!(m["content"].as_str().unwrap().contains("stdout"));
-        assert!(
-            m.get("tool_call_id").is_none(),
-            "裸输出无 tool_call_id 字段"
+        let a = &body["messages"][0];
+        assert_eq!(a["role"], "assistant");
+        assert_eq!(a["content"], "我来读文件");
+        assert_eq!(a["tool_calls"][0]["id"], "call_1");
+        assert_eq!(a["tool_calls"][0]["type"], "function");
+        assert_eq!(a["tool_calls"][0]["function"]["name"], "cap_file_read");
+        assert_eq!(
+            a["tool_calls"][0]["function"]["arguments"],
+            r#"{"path":"a.txt"}"#
         );
+        let t = &body["messages"][1];
+        assert_eq!(t["role"], "tool");
+        assert_eq!(t["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn memory_entries_merge_into_single_system_message() {
+        let req = LlmRequest {
+            model: "m".into(),
+            system: Some("你是助手".into()),
+            messages: vec![
+                ChatMessage::System {
+                    text: "[ATTENTION] focus: x".into(),
+                    kind: SystemKind::Memory(crate::logic::model::message::MemoryKind::Attention),
+                },
+                user_msg("hi"),
+            ],
+            ..Default::default()
+        };
+        let body = serde_json::to_value(build_openai_request(&req, false)).unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2, "system 恰为 1 条: {body}");
+        assert_eq!(msgs[0]["role"], "system");
+        let sys_text = msgs[0]["content"].as_str().unwrap();
+        assert!(sys_text.contains("你是助手"));
+        assert!(sys_text.contains("## 注意力"));
+        assert!(sys_text.contains("[ATTENTION] focus: x"));
+        assert_eq!(msgs[1]["role"], "user");
     }
 
     #[test]
@@ -494,6 +584,7 @@ mod tests {
                 role: "user".to_string(),
                 content: "hi".to_string(),
                 tool_call_id: None,
+                tool_calls: vec![],
             }],
             temperature: None,
             top_p: None,
@@ -516,6 +607,7 @@ mod tests {
                 role: "user".to_string(),
                 content: "hi".to_string(),
                 tool_call_id: None,
+                tool_calls: vec![],
             }],
             temperature: None,
             top_p: None,

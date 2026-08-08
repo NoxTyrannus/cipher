@@ -7,8 +7,9 @@ use crate::data::workspace_store::{WorkspaceRow, WorkspaceStore};
 use crate::data::ModelRow;
 use crate::logic::model::anthropic::AnthropicProvider;
 use crate::logic::model::api_key::resolve_api_key;
+use crate::logic::model::message::ChatMessage;
 use crate::logic::model::openai::OpenAiProvider;
-use crate::logic::model::provider::{LlmRequest, Message, MessageRole};
+use crate::logic::model::provider::LlmRequest;
 use crate::logic::model::registry::ProviderRegistry;
 use crate::logic::model::responses::ResponsesProvider;
 use secrecy::SecretString;
@@ -16,12 +17,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 const PRESET_TEMPLATES: &[(&str, &str, &str, &str)] = &[
-    (
-        "Ark Agent Plan (火山方舟)",
-        "agent_plan",
-        "https://ark.cn-beijing.volces.com/api/plan/v3",
-        "OpenAI",
-    ),
     (
         "OpenAI 官方",
         "openai",
@@ -203,9 +198,8 @@ pub fn build_provider_registry(model_row: &ModelRow) -> Result<ProviderRegistry,
 
 pub async fn ping_model(row: &ModelRow) -> Result<(), AgentError> {
     let api_key = resolve_api_key(row)?;
-    let messages = vec![Message {
-        role: MessageRole::User,
-        content: "ping (cipher init_flow 首启验证, 设计点 19)".to_string(),
+    let messages = vec![ChatMessage::User {
+        text: "ping (cipher init_flow 首启验证, 设计点 19)".to_string(),
     }];
     let req = LlmRequest::from_model_row(row, messages, api_key)?;
 
