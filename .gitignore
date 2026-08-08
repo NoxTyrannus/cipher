@@ -3,5 +3,7 @@
 /.tmp
 /.superpowers
 /.gitnexus
+/.devdocs
+/results
 /data/*.db
 /data/*.db.wal

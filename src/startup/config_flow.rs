@@ -12,12 +12,6 @@ use super::config::{Config, MemoryMode};
 
 const PRESET_TEMPLATES: &[(&str, &str, &str, &str)] = &[
     (
-        "Ark Agent Plan (火山方舟)",
-        "agent_plan",
-        "https://ark.cn-beijing.volces.com/api/plan/v3",
-        "OpenAI",
-    ),
-    (
         "OpenAI 官方",
         "openai",
         "https://api.openai.com/v1",

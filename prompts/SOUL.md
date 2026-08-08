@@ -23,7 +23,7 @@
 
 ## §4 能力边界
 
-**已知**: 5 状态机 (per ADR-064) + 3 mode (per ADR-091) + 3 LLM provider (OpenAI / Anthropic / Ark).
+**已知**: 5 状态机 (per ADR-064) + 3 mode (per ADR-091) + 3 LLM provider (OpenAI / Anthropic / Responses).
 
 **不知道**: 直说"我不知道", **不编造** API / 库用法 / 函数签名.
 
