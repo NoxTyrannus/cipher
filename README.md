@@ -14,12 +14,20 @@ Cipher 是一个运行在终端中的 AI 代理：你在终端里输入任务，
 
 ## 安装
 
-### 前置要求
+### 方式一：下载预编译二进制（推荐）
 
-- Rust 工具链 1.96.0（`rustup` 自动按 `rust-toolchain.toml` 安装）
-- Linux / macOS / Windows
+从 [Releases](https://github.com/NoxTyrannus/cipher/releases) 下载对应平台的二进制，装入 PATH 即可全局使用：
 
-### 快速安装
+```bash
+# Linux x86_64 示例
+curl -L -o cipher https://github.com/NoxTyrannus/cipher/releases/latest/download/cipher-linux-x86_64
+chmod +x cipher
+sudo mv cipher /usr/local/bin/   # 或 mv 到 ~/.local/bin（免 sudo）
+```
+
+### 方式二：源码构建安装
+
+前置要求：Rust 工具链 1.96.0（`rustup` 自动按 `rust-toolchain.toml` 安装）；Linux / macOS / Windows。
 
 ```bash
 git clone https://github.com/NoxTyrannus/cipher.git
@@ -27,25 +35,23 @@ cd cipher
 ./install.sh
 ```
 
-`install.sh` 会检查 Rust 工具链并执行 `cargo build --release`，产物在 `target/release/cipher`。也可手动构建：
+`install.sh` 检查工具链并执行 `cargo build --release`，然后把 `cipher` 复制到 `~/.local/bin`（不可写时降级 `sudo` 安装到 `/usr/local/bin`）——安装完成后即可在任意目录直接运行 `cipher`。
+
+### 初始化
 
 ```bash
-cargo build --release
+cipher setup
 ```
 
-### 首次启动
+`setup` 引导配置：选择模型供应商 → 填写模型标识与 API key → 连接性验证。也可随时用 `cipher config` 管理模型与配置。
+
+### 启动
 
 ```bash
-./target/release/cipher setup
+cipher
 ```
 
-`setup` 引导配置：选择模型供应商 → 填写模型标识与 API key → 连接性验证。完成后：
-
-```bash
-./target/release/cipher
-```
-
-进入 TUI 交互界面。`cipher config` 可管理模型与配置。
+进入 TUI 交互界面。可选全局参数：`--config <路径>` / `--data-dir <路径>`。
 
 ## 三种工作模式
 
@@ -97,8 +103,8 @@ cargo build --release
 |---|---|
 | `file.read` / `file.write` | 读写本地文件（沙箱路径限制） |
 | `file.list` / `file.delete` / `file.move` | 文件管理 |
+| `text.grep` | 文本检索 |
 | `shell.exec` | 执行 shell 命令（权限策略控制） |
-| `code.exec` | 在 Wasmtime 沙箱中执行代码 |
 
 ## 模型支持
 
@@ -119,7 +125,7 @@ data → logic → agent → mode_runtime → ui   (严格单向依赖)
 ```
 
 - **data**：DuckDB 注册表（模型/能力/代理）+ TriviumDB 记忆（注意力/经验/认知/偏好）+ Thought 时间线
-- **logic**：LLM 提供商（OpenAI/Anthropic 协议）、能力服务、Wasm 沙箱脚本
+- **logic**：LLM 提供商适配（OpenAI / Anthropic / Responses 三协议，内部统一消息 IR）、能力服务、Wasm 沙箱脚本
 - **agent**：思考引擎（严格 think/say 契约）+ 执行/洞察/记忆三中台
 - **mode_runtime**：UNNI/KEEP/LOOP 模式管理（配额/剥离/飞轮）
 - **ui**：ratatui TUI
