@@ -16,14 +16,24 @@ Cipher 是一个运行在终端中的 AI 代理：你在终端里输入任务，
 
 ### 方式一：下载预编译二进制（推荐）
 
-从 [Releases](https://github.com/NoxTyrannus/cipher/releases) 下载对应平台的二进制，装入 PATH 即可全局使用：
+先确认平台与架构：
 
 ```bash
-# Linux x86_64 示例
+uname -s -m
+# Linux x86_64  → cipher-linux-x86_64     Linux aarch64 → cipher-linux-arm64
+# macOS x86_64  → cipher-macos-x86_64     macOS arm64(M系) → cipher-macos-arm64
+# Windows 按系统类型选择 cipher-windows-x86_64.exe / cipher-windows-arm64.exe
+```
+
+从 [Releases](https://github.com/NoxTyrannus/cipher/releases) 下载对应资产，装入 PATH 即可全局使用（Linux 示例）：
+
+```bash
 curl -L -o cipher https://github.com/NoxTyrannus/cipher/releases/latest/download/cipher-linux-x86_64
 chmod +x cipher
 sudo mv cipher /usr/local/bin/   # 或 mv 到 ~/.local/bin（免 sudo）
 ```
+
+每个 Release 附 `SHA256SUMS.txt`，可用 `sha256sum -c` 校验下载完整性。
 
 ### 方式二：源码构建安装
 

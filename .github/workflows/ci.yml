@@ -13,12 +13,24 @@ env:
 
 jobs:
   test:
-    name: cargo quality gates (${{ matrix.os }})
+    name: cargo quality gates (${{ matrix.asset }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14, windows-latest]
+        include:
+          - os: ubuntu-latest
+            asset: cipher-linux-x86_64
+          - os: ubuntu-24.04-arm
+            asset: cipher-linux-arm64
+          - os: macos-13
+            asset: cipher-macos-x86_64
+          - os: macos-14
+            asset: cipher-macos-arm64
+          - os: windows-latest
+            asset: cipher-windows-x86_64.exe
+          - os: windows-11-arm
+            asset: cipher-windows-arm64.exe
 
     steps:
       - name: Checkout
@@ -36,14 +48,14 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build
         run: cargo build --release
 
       - name: Test
         run: cargo test --all-targets
-        continue-on-error: ${{ matrix.os == 'windows-latest' }}
+        continue-on-error: ${{ startsWith(matrix.os, 'windows') }}
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
@@ -54,7 +66,7 @@ jobs:
       - name: Upload release binary
         uses: actions/upload-artifact@v4
         with:
-          name: cipher-${{ matrix.os }}
+          name: cipher-bin-${{ matrix.asset }}
           path: |
             target/release/cipher
             target/release/cipher.exe
@@ -82,15 +94,11 @@ jobs:
         run: |
           mkdir -p release
           find artifacts -type f \( -name cipher -o -name cipher.exe \) | while read f; do
-            os=$(echo "$f" | sed -E 's|artifacts/cipher-([^/]+)/.*|\1|')
-            case "$os" in
-              ubuntu-latest) target="cipher-linux-x86_64" ;;
-              macos-14) target="cipher-macos-x86_64" ;;
-              windows-latest) target="cipher-windows-x86_64.exe" ;;
-            esac
-            cp "$f" "release/$target"
+            asset=$(echo "$f" | sed -E 's|artifacts/cipher-bin-([^/]+)/.*|\1|')
+            cp "$f" "release/$asset"
           done
-          chmod +x release/cipher-* 2>/dev/null || true
+          chmod +x release/cipher-linux-* release/cipher-macos-* 2>/dev/null || true
+          (cd release && sha256sum cipher-* > SHA256SUMS.txt)
           ls -la release/
 
       - name: Create GitHub Release
