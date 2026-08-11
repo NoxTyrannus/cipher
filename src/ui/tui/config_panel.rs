@@ -21,7 +21,7 @@ pub const PRESET_TEMPLATES: &[(&str, &str, &str, &str)] = &[
 const MENU_ITEMS: &[(&str, bool)] = &[
     ("Model + Provider", true),
     ("工作区管理", false),
-    ("Agent 改名", false),
+    ("Agent 改名", true),
     ("默认设置", false),
     ("记忆中台模式", true),
     ("上下文编辑", false),
@@ -71,6 +71,12 @@ pub struct SetDefaultSelect {
     pub submitted: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RenameAgentForm {
+    pub name: String,
+    pub submitted: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum ConfigView {
     Menu,
@@ -98,6 +104,8 @@ pub enum ConfigView {
         cursor: usize,
         submitted: bool,
     },
+
+    RenameAgent(RenameAgentForm),
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +157,10 @@ pub enum DbRequest {
 
     SaveMemoryMode {
         mode: String,
+    },
+
+    SubmitRenameAgent {
+        display_name: String,
     },
 
     None,
@@ -223,6 +235,9 @@ impl ConfigPanel {
                     mode: mode.to_string(),
                 }
             }
+            ConfigView::RenameAgent(form) if form.submitted => DbRequest::SubmitRenameAgent {
+                display_name: form.name.clone(),
+            },
             _ => DbRequest::None,
         }
     }
@@ -234,6 +249,7 @@ impl ConfigPanel {
             ConfigView::ChangeKey(f) => f.submitted = false,
             ConfigView::SetDefault(s) => s.submitted = false,
             ConfigView::MemoryModeSelect { submitted, .. } => *submitted = false,
+            ConfigView::RenameAgent(f) => f.submitted = false,
             _ => {}
         }
     }
@@ -313,6 +329,13 @@ impl ConfigPanel {
                 }
                 r
             }
+            ConfigView::RenameAgent(mut form) => {
+                let r = self.handle_rename_agent_key(key, &mut form);
+                if matches!(self.view, ConfigView::Menu) {
+                    self.view = ConfigView::RenameAgent(form);
+                }
+                r
+            }
         }
     }
 
@@ -340,6 +363,8 @@ impl ConfigPanel {
                             cursor: 1,
                             submitted: false,
                         };
+                    } else if idx == 2 {
+                        self.view = ConfigView::RenameAgent(RenameAgentForm::default());
                     } else {
                         self.view = ConfigView::ModelList;
                     }
@@ -649,6 +674,35 @@ impl ConfigPanel {
         }
     }
 
+    fn handle_rename_agent_key(
+        &mut self,
+        key: KeyCode,
+        form: &mut RenameAgentForm,
+    ) -> ActionResult {
+        match key {
+            KeyCode::Left | KeyCode::Esc => {
+                self.view = ConfigView::Menu;
+                self.expanded = None;
+                ActionResult::Navigate
+            }
+            KeyCode::Enter => {
+                if !form.name.is_empty() {
+                    form.submitted = true;
+                }
+                ActionResult::Navigate
+            }
+            KeyCode::Backspace => {
+                form.name.pop();
+                ActionResult::Navigate
+            }
+            KeyCode::Char(c) => {
+                form.name.push(c);
+                ActionResult::Navigate
+            }
+            _ => ActionResult::Navigate,
+        }
+    }
+
     pub fn nav_help(&self) -> &'static str {
         match &self.view {
             ConfigView::Menu => "← 退出设置    ↑↓ 选择    → 进入    Esc 退出",
@@ -664,6 +718,7 @@ impl ConfigPanel {
             ConfigView::AddModel(_) | ConfigView::QuickAdd(_) | ConfigView::ChangeKey(_) => {
                 "← 取消        Tab 下一字段  Enter 确认    Esc 退出设置"
             }
+            ConfigView::RenameAgent(_) => "← 取消    Enter 确认    Esc 退出设置",
         }
     }
 }
@@ -719,6 +774,9 @@ pub fn render(panel: &ConfigPanel, frame: &mut Frame, area: Rect) {
         ConfigView::SetDefault(sel) => render_set_default(panel, frame, content_area, sel),
         ConfigView::MemoryModeSelect { cursor, .. } => {
             render_memory_mode_select(panel, frame, content_area, *cursor);
+        }
+        ConfigView::RenameAgent(form) => {
+            render_rename_agent(panel, frame, content_area, form);
         }
     }
 
@@ -1056,6 +1114,49 @@ fn render_memory_mode_select(_panel: &ConfigPanel, frame: &mut Frame, area: Rect
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+fn render_rename_agent(
+    _panel: &ConfigPanel,
+    frame: &mut Frame,
+    area: Rect,
+    form: &RenameAgentForm,
+) {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+
+    let lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "输入 agent 的新显示名称:",
+            Style::default().fg(Color::Gray),
+        )]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  ▶ ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "新名称: ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(form.name.clone(), Style::default().fg(Color::White)),
+            Span::styled("_", Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  Enter 确认    ← 取消",
+            Style::default().fg(Color::DarkGray),
+        )]),
+    ];
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1083,8 +1184,8 @@ mod tests {
 
         let pending_count = text.matches('(').count();
         assert_eq!(
-            pending_count, 4,
-            "4 disabled items show (待后续), got: {text}"
+            pending_count, 3,
+            "3 disabled items show (待后续), got: {text}"
         );
     }
 

@@ -43,6 +43,8 @@ pub struct TuiState {
 
     pub input: String,
 
+    pub agent_name: String,
+
     pub config_panel: ConfigPanel,
 
     pub status_line: StatusLineState,
@@ -58,6 +60,7 @@ impl TuiState {
             current_mode: ModeKind::Unni,
             current_error: None,
             input: String::new(),
+            agent_name: "cipher".to_string(),
             config_panel: ConfigPanel::new(),
             status_line: StatusLineState::new(),
             scroll_offset: 0,

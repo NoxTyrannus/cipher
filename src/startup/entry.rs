@@ -3,8 +3,8 @@ use super::{init, self_check};
 use crate::agent::context_assembler::{ContextAssembler, ContextConfig};
 use crate::common::AgentError;
 use crate::data::duckdb::loader::{
-    has_configured_model, insert_model, load_all_into_memory, update_model_api_key_by_provider,
-    ModelRow,
+    has_configured_model, insert_model, load_all_into_memory, rename_agent,
+    update_model_api_key_by_provider, ModelRow,
 };
 use crate::logic::model::stream::StreamChunk;
 use crate::mode_runtime::ModeManager;
@@ -155,6 +155,7 @@ pub async fn run_setup(
     let config = load_config(&config_path, data_dir_override)?;
     let app_state = crate::data::bootstrap(&config.data_dir)?;
     ensure_default_prompts(&config.data_dir)?;
+    crate::data::factory::ensure_default_wasm_modules(&config.data_dir)?;
     crate::data::cognitive_seed::ensure_default_cognitive_seed(&config.data_dir)?;
     tracing::info!(data_dir = ?config.data_dir, "setup: bootstrap ready");
     if has_configured_model(&app_state.duckdb)? {
@@ -178,6 +179,7 @@ pub async fn run_normal(
     let app_state = crate::data::bootstrap(&config.data_dir)?;
     ensure_default_prompts(&config.data_dir)?;
     tracing::info!(data_dir = ?config.data_dir, "normal: bootstrap ready");
+    crate::data::factory::ensure_default_wasm_modules(&config.data_dir)?;
     crate::data::cognitive_seed::ensure_default_cognitive_seed(&config.data_dir)?;
 
     if !has_configured_model(&app_state.duckdb)? {
@@ -260,6 +262,10 @@ pub async fn run_normal(
     }
 
     {
+        let shell_id = crate::data::factory::default_shell_capability_id();
+        let shell_name = crate::data::factory::default_shell_capability_name();
+        let shell_executor = format!("wasm:{}", shell_id.replace('.', "_"));
+
         let seed_sql = [
             "INSERT OR REPLACE INTO base_capability (id, name, type, description, schema_in, schema_out, executor, version, enabled) VALUES
              ('file.read', 'Read File', 'function', 'Read file content',
@@ -291,11 +297,6 @@ pub async fn run_normal(
               '{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"}},\"required\":[\"pattern\",\"path\"]}',
               '{\"type\":\"object\",\"properties\":{\"matches\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}}}',
               'wasm:text.grep', '1.0.0', true)",
-            "INSERT OR REPLACE INTO base_capability (id, name, type, description, schema_in, schema_out, executor, version, enabled) VALUES
-             ('shell.exec', 'Execute Shell', 'function', 'Execute shell command in workspace',
-              '{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"]}',
-              '{\"type\":\"object\",\"properties\":{\"stdout\":{\"type\":\"string\"},\"stderr\":{\"type\":\"string\"},\"exit_code\":{\"type\":\"integer\"}}}',
-              'wasm:shell.exec', '1.0.0', true)",
         ];
         for sql in &seed_sql {
             app_state
@@ -307,11 +308,40 @@ pub async fn run_normal(
         app_state
             .duckdb
             .execute(
-                "UPDATE agent SET tool_caps = '[\"file.read\",\"file.write\",\"file.list\",\"file.delete\",\"file.move\",\"text.grep\",\"shell.exec\"]' WHERE id = 'agent'",
+                &format!(
+                    "INSERT OR REPLACE INTO base_capability (id, name, type, description, schema_in, schema_out, executor, version, enabled) VALUES
+                     ('{}', '{}', 'function', '{} command in workspace',
+                      '{{\"type\":\"object\",\"properties\":{{\"command\":{{\"type\":\"string\"}}}},\"required\":[\"command\"]}}',
+                      '{{\"type\":\"object\",\"properties\":{{\"stdout\":{{\"type\":\"string\"}},\"stderr\":{{\"type\":\"string\"}},\"exit_code\":{{\"type\":\"integer\"}}}}}}',
+                      '{}', '1.0.0', true)",
+                    shell_id, shell_name, shell_name, shell_executor
+                ),
+                [],
+            )
+            .map_err(|e| AgentError::Bootstrap(format!("seed shell capability: {e}")))?;
+
+        let mut caps = vec![
+            "file.read",
+            "file.write",
+            "file.list",
+            "file.delete",
+            "file.move",
+            "text.grep",
+        ];
+        caps.push(shell_id);
+        let caps_json = serde_json::to_string(&caps)
+            .map_err(|e| AgentError::Bootstrap(format!("serialize tool_caps: {e}")))?;
+        app_state
+            .duckdb
+            .execute(
+                &format!(
+                    "UPDATE agent SET tool_caps = '{}' WHERE id = 'agent'",
+                    caps_json
+                ),
                 [],
             )
             .ok();
-        tracing::info!("wasm: seeded 7 base capabilities + agent tool_caps");
+        tracing::info!("factory: seeded 7 base capabilities + agent tool_caps (shell={shell_id})");
     }
 
     let memory_db = {
@@ -334,15 +364,7 @@ pub async fn run_normal(
         crate::data::platform_cursor::CursorStore::open(&config.data_dir, "execution")?,
     ));
     let exec_prompts_dir = prompts_dir.clone();
-    let exec_capability_ids = vec![
-        "file.read".to_string(),
-        "file.write".to_string(),
-        "file.list".to_string(),
-        "file.delete".to_string(),
-        "file.move".to_string(),
-        "text.grep".to_string(),
-        "shell.exec".to_string(),
-    ];
+    let exec_capability_ids = crate::data::factory::default_shell_capability_ids();
 
     let exec_registry = Some(app_state.registry.clone());
     let exec_executor = {
@@ -652,6 +674,7 @@ pub async fn run_config(
     let config = load_config(&config_path, data_dir_override)?;
     let app_state = crate::data::bootstrap(&config.data_dir)?;
     ensure_default_prompts(&config.data_dir)?;
+    crate::data::factory::ensure_default_wasm_modules(&config.data_dir)?;
     tracing::info!(data_dir = ?config.data_dir, "config: bootstrap ready");
     crate::data::cognitive_seed::ensure_default_cognitive_seed(&config.data_dir)?;
     crate::startup::config_flow::run(&app_state)?;
@@ -729,6 +752,9 @@ pub async fn run_streaming_loop(
 
     let mut state = TuiState::new();
     state.current_mode = mode_manager.current_kind();
+    if let Some(name) = load_default_agent_display_name(&app.duckdb) {
+        state.agent_name = name;
+    }
     let mut guard = StreamingTerminalGuard::new()?;
 
     let mut pool_state_rx = pool.subscribe_state();
@@ -881,6 +907,26 @@ pub async fn run_streaming_loop(
                                         format!("记忆中台模式已切换 → {} (运行时生效)", parsed.as_str()),
                                         false,
                                     ));
+                                }
+                                state.config_panel.clear_db_request();
+                            }
+                            DbRequest::SubmitRenameAgent { display_name } => {
+                                match rename_agent(&app.duckdb, "agent", &display_name) {
+                                    Ok(_) => {
+                                        state.agent_name = display_name.clone();
+                                        state.config_panel.message = Some((
+                                            format!("agent 已改名为: {}", display_name),
+                                            false,
+                                        ));
+                                        state.config_panel.view = ConfigView::Menu;
+                                        state.config_panel.expanded = None;
+                                    }
+                                    Err(e) => {
+                                        state.config_panel.message = Some((
+                                            format!("改名失败: {e}"),
+                                            true,
+                                        ));
+                                    }
                                 }
                                 state.config_panel.clear_db_request();
                             }
@@ -1357,6 +1403,15 @@ fn print_welcome_and_help() {
     println!("      /config           打开配置管理 (改模型 / 切默认)");
     println!("      /exit              退出");
     println!();
+}
+
+fn load_default_agent_display_name(conn: &duckdb::Connection) -> Option<String> {
+    conn.query_row(
+        "SELECT COALESCE(display_name, name) FROM agent WHERE is_default = true LIMIT 1",
+        [],
+        |row| row.get(0),
+    )
+    .ok()
 }
 
 #[cfg(test)]

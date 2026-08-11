@@ -60,7 +60,6 @@ mod tests {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("prompts");
         let p = compose_prompt(&dir, "unni");
         assert!(p.contains("UNNI"), "compose_prompt(unni) missing 'UNNI'");
-        assert!(p.contains("五态"), "compose_prompt(unni) missing '五态'");
         assert!(
             p.contains("cipher"),
             "compose_prompt(unni) missing 'cipher'"
@@ -84,7 +83,6 @@ mod tests {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("prompts");
         let p = compose_prompt(&dir, "loop");
         assert!(p.contains("LOOP"), "compose_prompt(loop) missing 'LOOP'");
-        assert!(p.contains("飞轮"), "compose_prompt(loop) missing '飞轮'");
         assert!(
             p.contains("禁止 `say`"),
             "compose_prompt(loop) missing say prohibition"
@@ -113,5 +111,30 @@ mod tests {
         assert_ne!(unni, keep, "UNNI == KEEP 提示词 (per P1.5 应互不相同)");
         assert_ne!(unni, loop_p, "UNNI == LOOP 提示词 (per P1.5 应互不相同)");
         assert_ne!(keep, loop_p, "KEEP == LOOP 提示词 (per P1.5 应互不相同)");
+    }
+
+    #[test]
+    fn default_prompts_have_no_dev_or_internal_architecture_references() {
+        const FORBIDDEN: &[&str] = &[
+            "ADR",
+            "iter",
+            "per spec",
+            "设计点",
+            "五态",
+            "中台",
+            "spec 4",
+            "iter59",
+            "ADR-095",
+            "ADR-064",
+            "ADR-091",
+        ];
+        for (name, content) in DEFAULT_PROMPTS {
+            for &word in FORBIDDEN {
+                assert!(
+                    !content.contains(word),
+                    "{name} 不应包含开发/内部架构引用: '{word}'"
+                );
+            }
+        }
     }
 }
