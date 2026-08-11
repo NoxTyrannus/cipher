@@ -528,7 +528,7 @@ fn parse_subagent_output(content: &str) -> SubagentAction {
     SubagentAction::Invalid(specific_reason.unwrap_or_else(|| {
         format!(
             "输出缺少 arguments 或 done 字段或 JSON 非法: {}",
-            &content[..content.len().min(120)]
+            crate::common::json_util::truncate_utf8_boundary(content, 120)
         )
     }))
 }
@@ -3197,6 +3197,13 @@ mod tests {
                 other => panic!("expected Invalid for {bad}, got: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn subagent_output_invalid_with_cjk_truncation_is_safe() {
+        let content = "本".repeat(100);
+        let result = parse_subagent_output(&content);
+        assert!(matches!(result, SubagentAction::Invalid(_)));
     }
 
     #[test]
