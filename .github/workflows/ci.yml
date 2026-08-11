@@ -93,11 +93,39 @@ jobs:
         shell: bash
         run: |
           mkdir -p release
+
           find artifacts -type f \( -name cipher -o -name cipher.exe \) | while read f; do
             asset=$(echo "$f" | sed -E 's|artifacts/cipher-bin-([^/]+)/.*|\1|')
-            cp "$f" "release/$asset"
+            pkg_name="${asset%.exe}"
+            tmpdir="$(mktemp -d)"
+
+            cp "$f" "$tmpdir/cipher${asset##*cipher}"
+
+            case "$pkg_name" in
+              *-linux-*)
+                cp install.sh "$tmpdir/"
+                chmod +x "$tmpdir/install.sh"
+                pkg="$pkg_name.tar.gz"
+                (cd "$tmpdir" && tar czf "$OLDPWD/release/$pkg" .)
+                echo "packaged: $pkg"
+                ;;
+              *-macos-*)
+                cp install.sh "$tmpdir/"
+                chmod +x "$tmpdir/install.sh"
+                pkg="$pkg_name.tar.gz"
+                (cd "$tmpdir" && tar czf "$OLDPWD/release/$pkg" .)
+                echo "packaged: $pkg"
+                ;;
+              *-windows-*)
+                cp install.ps1 "$tmpdir/"
+                pkg="$pkg_name.zip"
+                (cd "$tmpdir" && zip -q -r "$OLDPWD/release/$pkg" .)
+                echo "packaged: $pkg"
+                ;;
+            esac
+            rm -rf "$tmpdir"
           done
-          chmod +x release/cipher-linux-* release/cipher-macos-* 2>/dev/null || true
+
           (cd release && sha256sum cipher-* > SHA256SUMS.txt)
           ls -la release/
 
