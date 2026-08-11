@@ -23,10 +23,10 @@ jobs:
             asset: cipher-linux-x86_64
           - os: ubuntu-24.04-arm
             asset: cipher-linux-arm64
-          - os: macos-13
-            asset: cipher-macos-x86_64
           - os: macos-14
             asset: cipher-macos-arm64
+          # macOS x86_64 (Intel) 临时移除: GitHub macos-13 runner 排队阻塞
+          # 后续恢复: - os: macos-13  asset: cipher-macos-x86_64
           - os: windows-latest
             asset: cipher-windows-x86_64.exe
           - os: windows-11-arm
