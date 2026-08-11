@@ -246,7 +246,7 @@ async fn main() -> ExitCode {
             "file.delete".to_string(),
             "file.move".to_string(),
             "text.grep".to_string(),
-            "shell.exec".to_string(),
+            cipher::data::factory::default_shell_capability_id().to_string(),
         ],
         Some(registry),
         Some(Arc::new(executor)),

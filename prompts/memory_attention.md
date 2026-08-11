@@ -27,6 +27,6 @@
 
 格式约束:
 - 每个节点一句话，不超过100字符
-- 注意力的作用是让思考引擎在后续对话中快速回忆关键信息
+- 注意力的作用是让后续对话中快速回忆关键信息
 - 无变更时返回 {"settle": {"new_attention": [], "retired_focus": []}}
 - Respond with ONLY the JSON object. No markdown, no explanation.

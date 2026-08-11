@@ -4590,7 +4590,10 @@ mod tests {
     fn dag_prompt_contains_depends_on() {
         let p = select_prompt("dag", Path::new("prompts"));
         assert!(p.contains("depends_on"));
-        assert!(p.contains("DAG"), "dag prompt should contain 'DAG'");
+        assert!(
+            p.contains("TaskFlow"),
+            "dag prompt should contain 'TaskFlow'"
+        );
     }
 
     #[test]

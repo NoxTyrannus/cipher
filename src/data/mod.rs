@@ -1,6 +1,7 @@
 pub mod bootstrap;
 pub mod cognitive_seed;
 pub mod duckdb;
+pub mod factory;
 pub mod migration;
 pub mod permissions;
 pub mod platform_cursor;

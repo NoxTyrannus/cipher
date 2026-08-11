@@ -39,6 +39,7 @@ fn render_messages(state: &TuiState, frame: &mut Frame, area: Rect) {
     }
     let user_w = area.width as usize;
     let inner_w = area.width.saturating_sub(2) as usize;
+    let agent_name = &state.agent_name;
     let heights: Vec<u16> = state
         .messages
         .iter()
@@ -51,7 +52,7 @@ fn render_messages(state: &TuiState, frame: &mut Frame, area: Rect) {
         let constraints: Vec<Constraint> = heights.iter().map(|&h| Constraint::Length(h)).collect();
         let rects = Layout::vertical(constraints).split(area);
         for (msg, rect) in state.messages.iter().zip(rects.iter()) {
-            render_one_message(msg, *rect, frame);
+            render_one_message(msg, *rect, frame, agent_name);
         }
     } else {
         let mut skip = 0u16;
@@ -85,7 +86,7 @@ fn render_messages(state: &TuiState, frame: &mut Frame, area: Rect) {
             .collect();
         let rects = Layout::vertical(visible_heights).split(area);
         for (i, rect) in rects.iter().enumerate() {
-            render_one_message(&state.messages[render_from + i], *rect, frame);
+            render_one_message(&state.messages[render_from + i], *rect, frame, agent_name);
         }
     }
 }
@@ -115,7 +116,7 @@ fn wrapped_lines(text: &str, width: usize) -> u16 {
     total.max(1) as u16
 }
 
-fn render_one_message(msg: &TuiMessage, rect: Rect, frame: &mut Frame) {
+fn render_one_message(msg: &TuiMessage, rect: Rect, frame: &mut Frame, agent_name: &str) {
     match msg {
         TuiMessage::User(text) => {
             let para = Paragraph::new(vec![
@@ -132,7 +133,7 @@ fn render_one_message(msg: &TuiMessage, rect: Rect, frame: &mut Frame) {
             rect,
             text,
             BorderType::LightDoubleDashed,
-            "cipher · 消息",
+            &format!("{agent_name} · 消息"),
             Color::Gray,
         ),
         TuiMessage::Streaming {
@@ -142,11 +143,11 @@ fn render_one_message(msg: &TuiMessage, rect: Rect, frame: &mut Frame) {
             ..
         } => {
             let (title, color) = if error.is_some() {
-                ("cipher · 错误", Color::Red)
+                (format!("{agent_name} · 错误"), Color::Red)
             } else if *finished {
-                ("cipher · 消息", Color::Gray)
+                (format!("{agent_name} · 消息"), Color::Gray)
             } else {
-                ("cipher · 流式", Color::Gray)
+                (format!("{agent_name} · 思考中"), Color::Gray)
             };
             let display_text = content_to_display(content, error.as_deref());
             render_bordered(
@@ -154,7 +155,7 @@ fn render_one_message(msg: &TuiMessage, rect: Rect, frame: &mut Frame) {
                 rect,
                 &display_text,
                 BorderType::LightDoubleDashed,
-                title,
+                &title,
                 color,
             );
         }
@@ -163,7 +164,7 @@ fn render_one_message(msg: &TuiMessage, rect: Rect, frame: &mut Frame) {
             rect,
             text,
             BorderType::LightDoubleDashed,
-            "cipher · 思考",
+            &format!("{agent_name} · 思考"),
             Color::DarkGray,
         ),
         TuiMessage::Request(text) => render_bordered(
@@ -171,7 +172,7 @@ fn render_one_message(msg: &TuiMessage, rect: Rect, frame: &mut Frame) {
             rect,
             text,
             BorderType::Plain,
-            "cipher · 请求",
+            &format!("{agent_name} · 请求"),
             Color::Cyan,
         ),
     }

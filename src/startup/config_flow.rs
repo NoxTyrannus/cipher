@@ -99,8 +99,8 @@ fn manage_models_and_providers(app: &AppState) -> Result<(), AgentError> {
         list_models(app)?;
         let items = vec![
             "新增 model",
-            "快速新增 (选已有 provider 带出, T9 快捷路径)",
-            "改 provider 的 api_key (设计点 23 一致性)",
+            "快速新增 (选已有 provider 带出)",
+            "改 provider 的 api_key",
             "切默认模型",
             "返回 /config 主菜单",
         ];
@@ -175,7 +175,7 @@ fn add_model(app: &AppState) -> Result<(), AgentError> {
     let (api_url, api_type, api_key) = match existing.as_ref() {
         Some(em) if em.api_key.as_ref().map(|k| !k.is_empty()).unwrap_or(false) => {
             println!(
-                "provider={} 已存在, 带出 api_url/api_key/api_type (设计点 23), 只填 name + model_id",
+                "provider={} 已存在，已自动带出其 api_url/api_key/api_type，只填 name + model_id",
                 provider
             );
             (
@@ -186,7 +186,7 @@ fn add_model(app: &AppState) -> Result<(), AgentError> {
         }
         _ => {
             let api_key = Password::new()
-                .with_prompt("API key (整体落盘 model.api_key, 设计点 16)")
+                .with_prompt("API key")
                 .interact()
                 .map_err(|e| AgentError::Parse(format!("api_key: {}", e)))?;
             (default_api_url, default_api_type, api_key)
@@ -217,7 +217,7 @@ fn add_model(app: &AppState) -> Result<(), AgentError> {
     let secret = SecretString::new(api_key);
     let n = update_model_api_key_by_provider(&app.duckdb, &provider, &secret)?;
     println!(
-        "已新增 model 行 {} (provider={} 共 {} 行 key 一致, 设计点 23)",
+        "已新增 model 行 {} (provider={} 共 {} 行 key 已同步)",
         row.id, provider, n
     );
     Ok(())
@@ -277,7 +277,7 @@ fn quick_add_model(app: &AppState) -> Result<(), AgentError> {
     insert_model(&app.duckdb, &row)?;
     let n = update_model_api_key_by_provider(&app.duckdb, &provider, &SecretString::new(key))?;
     println!(
-        "已快速新增 model 行 {} (provider={} 共 {} 行 key 一致, 设计点 23)",
+        "已快速新增 model 行 {} (provider={} 共 {} 行 key 已同步)",
         row.id, provider, n
     );
     Ok(())
@@ -300,10 +300,7 @@ fn change_provider_key(app: &AppState) -> Result<(), AgentError> {
             provider
         );
     } else {
-        println!(
-            "已 update provider={} 的 {} 行 api_key (设计点 23 一致性)",
-            provider, n
-        );
+        println!("已 update provider={} 的 {} 行 api_key", provider, n);
     }
     Ok(())
 }

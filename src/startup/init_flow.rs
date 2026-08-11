@@ -33,11 +33,9 @@ const PRESET_TEMPLATES: &[(&str, &str, &str, &str)] = &[
 
 pub async fn init_flow(app: &AppState, data_dir: &Path) -> Result<(), AgentError> {
     if has_configured_model(&app.duckdb)? {
-        tracing::info!(
-            "init_flow: model 表已有已配置 model (api_key 非空), 跳过首启引导 (设计点 1)"
-        );
+        tracing::info!("init_flow: 已有已配置 model, 跳过首启引导");
     } else {
-        tracing::info!("init_flow: 首启, 进入交互引导 (设计点 2 必配 1 模型 + ping 无逃生)");
+        tracing::info!("init_flow: 首启, 进入交互引导");
         prompt_and_configure_model(app, data_dir).await?;
     }
 
@@ -51,7 +49,7 @@ pub async fn init_flow(app: &AppState, data_dir: &Path) -> Result<(), AgentError
         path: workspace.clone(),
         is_default: true,
     })? {
-        tracing::info!(path = workspace, "seed default workspace (设计点 20)");
+        tracing::info!(path = workspace, "seed default workspace");
     }
 
     let inserted = app
@@ -64,7 +62,7 @@ pub async fn init_flow(app: &AppState, data_dir: &Path) -> Result<(), AgentError
         )
         .map_err(|error| AgentError::Bootstrap(format!("seed default agent: {error}")))?;
     if inserted > 0 {
-        tracing::info!(name = "Agent", "seed default agent (设计点 20)");
+        tracing::info!(name = "Agent", "seed default agent");
     }
     Ok(())
 }
@@ -79,7 +77,7 @@ async fn prompt_and_configure_model(app: &AppState, _data_dir: &Path) -> Result<
             .collect();
         items.push("自定义".to_string());
         let sel = Select::new()
-            .with_prompt("选择 LLM provider (设计点 8 预置模板)")
+            .with_prompt("选择 LLM provider")
             .items(&items)
             .default(0)
             .interact()
@@ -90,9 +88,7 @@ async fn prompt_and_configure_model(app: &AppState, _data_dir: &Path) -> Result<
             (t.1.to_string(), t.2.to_string(), t.3.to_string())
         } else {
             let p = Input::<String>::new()
-                .with_prompt(
-                    "provider 标识 (与 api_url 匹配的简短标识, e.g. openai / anthropic / minimax)",
-                )
+                .with_prompt("provider 标识 (如 openai / anthropic / minimax)")
                 .interact_text()
                 .map_err(|e| AgentError::Parse(format!("provider input: {}", e)))?;
             let u = Input::<String>::new()
@@ -112,15 +108,15 @@ async fn prompt_and_configure_model(app: &AppState, _data_dir: &Path) -> Result<
             .interact_text()
             .map_err(|e| AgentError::Parse(format!("name input: {}", e)))?;
         let model_id = Input::<String>::new()
-            .with_prompt("model_id (传服务商, e.g. ep-xxx / gpt-4o)")
+            .with_prompt("model_id (如 ep-xxx / gpt-4o)")
             .interact_text()
             .map_err(|e| AgentError::Parse(format!("model_id input: {}", e)))?;
         let api_key = Password::new()
-            .with_prompt("API key (整体落盘 model.api_key, 设计点 16)")
+            .with_prompt("API key")
             .interact()
-            .map_err(|e| AgentError::Parse(format!("api_key input: {}", e)))?;
+            .map_err(|k| AgentError::Parse(format!("api_key input: {}", k)))?;
         if api_key.trim().is_empty() {
-            eprintln!("api_key 不能为空 (设计点 4 必选). 请重填 (设计点 22).");
+            eprintln!("API key 不能为空，请重填。");
             continue;
         }
 
@@ -153,12 +149,12 @@ async fn prompt_and_configure_model(app: &AppState, _data_dir: &Path) -> Result<
             insert_model(&app.duckdb, &row)?;
             tracing::info!(id = %row.id, "init_flow: 新 provider, insert 用户配置行");
         } else {
-            tracing::info!(provider = %provider, updated = n, "init_flow: provider api_key 一致性 update (设计点 23)");
+            tracing::info!(provider = %provider, updated = n, "init_flow: provider api_key 同步完成");
         }
 
         match ping_model(&row).await {
             Ok(_) => {
-                tracing::info!("init_flow: ping 成功, 模型配置完成 (设计点 19)");
+                tracing::info!("init_flow: ping 成功, 模型配置完成");
 
                 let config_path = crate::startup::Config::default_path();
                 if let Ok(mut config) = crate::startup::init::init(&config_path) {
@@ -173,7 +169,7 @@ async fn prompt_and_configure_model(app: &AppState, _data_dir: &Path) -> Result<
                 return Ok(());
             }
             Err(e) => {
-                eprintln!("ping 失败: {}. 请重填 (设计点 22 无逃生, 失败必须重填).", e);
+                eprintln!("ping 失败: {}。请检查配置后重填。", e);
                 continue;
             }
         }
@@ -199,7 +195,7 @@ pub fn build_provider_registry(model_row: &ModelRow) -> Result<ProviderRegistry,
 pub async fn ping_model(row: &ModelRow) -> Result<(), AgentError> {
     let api_key = resolve_api_key(row)?;
     let messages = vec![ChatMessage::User {
-        text: "ping (cipher init_flow 首启验证, 设计点 19)".to_string(),
+        text: "ping (cipher 首启验证)".to_string(),
     }];
     let req = LlmRequest::from_model_row(row, messages, api_key)?;
 
