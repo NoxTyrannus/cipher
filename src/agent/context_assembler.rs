@@ -194,12 +194,6 @@ impl ContextAssembler {
         } else {
             Vec::new()
         };
-        let attention_msgs = if self.memory_kind_active(MemoryVersionKind::Attention) {
-            self.read_trivium_memories("attention", attention_quota)
-                .await
-        } else {
-            Vec::new()
-        };
         let experience_msgs = self
             .read_trivium_memories("experience", experience_quota)
             .await;
@@ -208,28 +202,31 @@ impl ContextAssembler {
             .await;
 
         let cognitive_tokens = total_tokens(&cognitive_msgs);
-        let attention_tokens = total_tokens(&attention_msgs);
         let experience_tokens = total_tokens(&experience_msgs);
         let preference_tokens = total_tokens(&preference_msgs);
 
-        let fixed_tokens = system_tokens
-            + cognitive_tokens
-            + attention_tokens
-            + experience_tokens
-            + preference_tokens
-            + user_tokens;
+        let fixed_tokens =
+            system_tokens + cognitive_tokens + experience_tokens + preference_tokens + user_tokens;
         let dynamic_budget = window.saturating_sub(fixed_tokens);
 
         let rag_reserve = pct_of(dynamic_budget, self.config.rag_reserve_pct);
         let history_budget = dynamic_budget.saturating_sub(rag_reserve);
 
-        let recent_messages = self.read_conversation_history(history_budget);
+        let (recent_messages, history_truncated) = self.read_conversation_history(history_budget);
+
+        let attention_msgs =
+            if history_truncated && self.memory_kind_active(MemoryVersionKind::Attention) {
+                self.read_trivium_memories("attention", attention_quota)
+                    .await
+            } else {
+                Vec::new()
+            };
 
         let mut messages = Vec::new();
 
         if !attention_msgs.is_empty() {
             tracing::debug!(
-                "ContextAssembler: injecting {} attention memories (active version)",
+                "ContextAssembler: 历史被裁剪, 注入 {} attention memories 替补被裁轮次",
                 attention_msgs.len()
             );
         }
@@ -322,7 +319,8 @@ impl ContextAssembler {
         crate::data::triviumdb::TriviumDb::open(&path, crate::data::triviumdb::DEFAULT_DIM)
     }
 
-    fn read_conversation_history(&self, budget: usize) -> Vec<ParsedMessage> {
+    /// 读取对话历史。返回 (选中的历史消息, 是否因预算不足被裁剪)。
+    fn read_conversation_history(&self, budget: usize) -> (Vec<ParsedMessage>, bool) {
         let mut all_messages = match &self.thought_store {
             Some(thought_store) => match self.read_thought_messages(thought_store) {
                 Ok(messages) if !messages.is_empty() => messages,
@@ -332,25 +330,30 @@ impl ContextAssembler {
                         tracing::warn!(
                             "ContextAssembler: read legacy conversation history failed: {error}"
                         );
-                        return Vec::new();
+                        return (Vec::new(), false);
                     }
                 },
                 Err(error) => {
                     tracing::warn!("ContextAssembler: recover thought history failed: {error}");
-                    return Vec::new();
+                    return (Vec::new(), false);
                 }
             },
             None => match self.read_all_messages(&self.conversations_dir) {
                 Ok(messages) => messages,
                 Err(error) => {
                     tracing::warn!("ContextAssembler: read conversation history failed: {error}");
-                    return Vec::new();
+                    return (Vec::new(), false);
                 }
             },
         };
 
         if all_messages.is_empty() {
-            return Vec::new();
+            return (Vec::new(), false);
+        }
+
+        let total_tokens: usize = all_messages.iter().map(|m| m.token_count).sum();
+        if total_tokens <= budget {
+            return (all_messages, false);
         }
 
         all_messages.reverse();
@@ -364,7 +367,7 @@ impl ContextAssembler {
             selected.push(msg);
         }
         selected.reverse();
-        selected
+        (selected, true)
     }
 
     fn read_all_messages(&self, session_dir: &Path) -> Result<Vec<ParsedMessage>> {
@@ -419,18 +422,15 @@ impl ContextAssembler {
 
                 messages.push(parsed_thinking_input(context.input));
 
-                let mut history_output = serde_json::Map::new();
+                let mut parts: Vec<String> = Vec::new();
                 if let Some(think) = output.think.filter(|think| !think.is_empty()) {
-                    history_output.insert("think".to_string(), serde_json::Value::String(think));
+                    parts.push(think);
                 }
                 if let Some(say) = output.say.filter(|say| !say.is_empty()) {
-                    history_output.insert("say".to_string(), serde_json::Value::String(say));
+                    parts.push(say);
                 }
-                if !history_output.is_empty() {
-                    messages.push(parsed_message(
-                        "assistant",
-                        serde_json::Value::Object(history_output).to_string(),
-                    ));
+                if !parts.is_empty() {
+                    messages.push(parsed_message("assistant", parts.join("\n")));
                 }
             }
         }
@@ -1055,15 +1055,18 @@ mod tests {
             .iter()
             .find(|message| matches!(message, ChatMessage::Assistant { .. }))
             .expect("completed Thought should produce assistant history");
-        let parsed_history =
-            crate::agent::output::parse_agent_output(message_text(assistant_history)).unwrap();
-        assert_eq!(
-            parsed_history.think.as_deref(),
-            Some("durable earlier work")
+        let flat_history = message_text(assistant_history);
+        assert!(
+            flat_history.contains("durable earlier work"),
+            "平铺后历史应含 think 文本: {flat_history}"
         );
-        assert_eq!(
-            parsed_history.say.as_deref(),
-            Some("durable earlier answer")
+        assert!(
+            flat_history.contains("durable earlier answer"),
+            "平铺后历史应含 say 文本: {flat_history}"
+        );
+        assert!(
+            !flat_history.contains("{\"think\""),
+            "平铺后历史不应是 JSON 外壳: {flat_history}"
         );
         assert!(!messages
             .iter()
@@ -1162,11 +1165,98 @@ mod tests {
             .unwrap();
             mv::publish(&conn, vid).unwrap();
         }
+
         let (_s, msgs) = assembler.build_messages("q", "unni").await;
         assert!(
-            msgs.iter()
+            !msgs
+                .iter()
                 .any(|m| message_text(m).contains("用户偏好 Rust")),
-            "publish 后 attention 应注入上下文"
+            "历史未超预算时不需要 attention 替补 (历史优先策略)"
+        );
+    }
+
+    #[tokio::test]
+    async fn attention_injected_as_backup_when_history_truncated() {
+        use crate::agent::memory::memory_version as mv;
+
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let thought_store = Arc::new(ThoughtStore::open(&data_dir).unwrap());
+
+        for i in 0..6 {
+            let mut ctx = ThoughtContext::new_at(
+                ThoughtId::parse(format!("ca76123{i}-ed42-11ce-bacd-00aa0057b223").as_str())
+                    .unwrap(),
+                UtcTimestamp::parse(&format!("2026-07-1{i}T12:34:56.123456789Z")).unwrap(),
+                ThinkingInput::User {
+                    text: format!("第 {i} 轮用户问题"),
+                },
+            );
+            thought_store.persist_input(&ctx).unwrap();
+            ctx.set_output(ThinkingOutput::completed(
+                None,
+                Some(format!(
+                    "第 {i} 轮回答内容 {}",
+                    "文本文本文本内容填充填充".repeat(10)
+                )),
+                None,
+            ));
+            thought_store.persist_output(&ctx).unwrap();
+        }
+
+        let trivium_path = data_dir.join("memory.trivium");
+        {
+            let mut db = crate::data::triviumdb::TriviumDb::open(
+                &trivium_path,
+                crate::data::triviumdb::DEFAULT_DIM,
+            )
+            .unwrap();
+            let payload = serde_json::json!({
+                "_memory_type": "attention",
+                "focus": "替补注意力",
+                "content": "历史被裁剪时的注意力要点",
+            });
+            let zero_vec = vec![0.0_f32; db.db().dim()];
+            db.db_mut().insert(&zero_vec, payload).unwrap();
+            db.flush().unwrap();
+        }
+
+        let memory_conn = duckdb::Connection::open_in_memory().unwrap();
+        mv::create_memory_version_tables(&memory_conn).unwrap();
+        let memory_db = std::sync::Arc::new(std::sync::Mutex::new(memory_conn));
+        {
+            let conn = memory_db.lock().unwrap();
+            let vid = mv::stage(
+                &conn,
+                mv::MemoryVersionKind::Attention,
+                "trivium://attention/t1",
+                &["t1".to_string()],
+            )
+            .unwrap();
+            mv::publish(&conn, vid).unwrap();
+        }
+
+        let mut assembler = ContextAssembler::new(
+            ContextConfig::default(),
+            &data_dir,
+            Some(trivium_path.clone()),
+        );
+        assembler.set_thought_store(Arc::clone(&thought_store));
+        assembler.set_memory_db(std::sync::Arc::clone(&memory_db));
+
+        let tight = ContextConfig {
+            context_window: 1000,
+            rag_reserve_pct: 10.0,
+            ..ContextConfig::default()
+        };
+        let mut assembler_tight = ContextAssembler::new(tight, &data_dir, Some(trivium_path));
+        assembler_tight.set_thought_store(Arc::clone(&thought_store));
+        assembler_tight.set_memory_db(std::sync::Arc::clone(&memory_db));
+
+        let (_s, msgs) = assembler_tight.build_messages("q", "unni").await;
+        assert!(
+            msgs.iter().any(|m| message_text(m).contains("替补注意力")),
+            "历史超预算被裁剪时, attention 应替补注入"
         );
     }
 
