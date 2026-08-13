@@ -179,6 +179,7 @@ impl InsightPlatform {
         );
 
         let prompt = build_insight_prompt(
+            turn_id,
             &ctx.thinking.goal,
             &ctx.thinking.constraints,
             execution,
@@ -283,6 +284,7 @@ impl InsightPlatform {
 }
 
 fn build_insight_prompt(
+    turn_id: &str,
     goal: &str,
     constraints: &[String],
     execution: &ExecutionOutput,
@@ -334,14 +336,27 @@ fn build_insight_prompt(
 
     let pool_summary = build_pool_snapshot_summary(pool_snapshot);
 
+    let dag_design = serde_json::to_string_pretty(&execution.dag)
+        .unwrap_or_else(|_| format!("{:?}", execution.dag));
+
+    let trace_hint = format!(
+        "## Trace Access\n\n\
+         本轮的完整执行记录已落盘，可按索引查证：\n\
+         - 索引格式: `turn_id={turn_id}` + `node_id=<节点id>`\n\
+         - 通过执行记录读取能力获取单个节点的原始工具调用、参数与输出\n\
+         - 需要核对某个节点的细节（原始参数/输出/错误堆栈）时，先按节点 id 查证，再作判断\n"
+    );
+
     format!(
-        "{}\n\n## Task Input\n\n**Goal:** {}\n\n**Constraints:**\n{}\n\n## Execution Results\n\n**Overall Status:** {:?}\n\n**Node Results:**\n{}\n\n## Failure Summary\n\n{}\n\n## Agent Pool Status\n\n{}",
+        "{}\n\n## Task Input\n\n**Goal:** {}\n\n**Constraints:**\n{}\n\n## Execution Design (DAG)\n\n{}\n\n## Execution Results\n\n**Overall Status:** {:?}\n\n**Node Results:**\n{}\n\n## Failure Summary\n\n{}\n\n{}\n\n## Agent Pool Status\n\n{}",
         base,
         goal,
         constraints_str,
+        dag_design,
         execution.status,
         nodes_summary,
         failure_summary,
+        trace_hint,
         pool_summary,
     )
 }
@@ -662,12 +677,15 @@ mod tests {
             status: ExecutionStatus::Failure,
         };
 
-        let prompt = build_insight_prompt("test goal", &[], &execution, &[], None);
+        let prompt = build_insight_prompt("turn-1", "test goal", &[], &execution, &[], None);
         assert!(prompt.contains("test goal"));
         assert!(prompt.contains("Failure"));
         assert!(prompt.contains("n1"));
         assert!(prompt.contains("connection refused"));
         assert!(prompt.contains("HTTP GET"));
+        assert!(prompt.contains("Execution Design (DAG)"));
+        assert!(prompt.contains("turn_id=turn-1"));
+        assert!(prompt.contains("Trace Access"));
     }
 
     #[test]
@@ -709,7 +727,7 @@ mod tests {
             ),
         ];
 
-        let prompt = build_insight_prompt("test goal", &[], &execution, &snapshot, None);
+        let prompt = build_insight_prompt("turn-1", "test goal", &[], &execution, &snapshot, None);
         assert!(prompt.contains("Agent Pool Status"));
         assert!(prompt.contains("Total agents in pool: 3"));
         assert!(prompt.contains("execution=1"));

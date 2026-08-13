@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 const THOUGHTS_DIR: &str = "thoughts";
@@ -21,6 +21,7 @@ const FAILURE_FILE: &str = "failure.json";
 pub struct ThoughtStore {
     root: PathBuf,
     write_lock: Mutex<()>,
+    recover_cache: Mutex<Option<Arc<crate::agent::thought::ThoughtTimeline>>>,
 }
 
 impl ThoughtStore {
@@ -30,6 +31,7 @@ impl ThoughtStore {
         Ok(Self {
             root,
             write_lock: Mutex::new(()),
+            recover_cache: Mutex::new(None),
         })
     }
 
@@ -54,7 +56,11 @@ impl ThoughtStore {
         self.ensure_record_parent(context.occurred_at.clone())?;
         ensure_secure_directory(&record_dir)?;
         secure_record_files(&record_dir)?;
-        atomic_write_json(&record_dir, INPUT_FILE, &input_record)
+        let result = atomic_write_json(&record_dir, INPUT_FILE, &input_record);
+        if result.is_ok() {
+            self.invalidate_recover_cache();
+        }
+        result
     }
 
     pub fn persist_output(&self, context: &ThoughtContext) -> Result<()> {
@@ -88,7 +94,11 @@ impl ThoughtStore {
             ));
         }
 
-        atomic_write_json(&record_dir, OUTPUT_FILE, &output_record)
+        let result = atomic_write_json(&record_dir, OUTPUT_FILE, &output_record);
+        if result.is_ok() {
+            self.invalidate_recover_cache();
+        }
+        result
     }
 
     pub fn persist_failure_input(
@@ -147,7 +157,11 @@ impl ThoughtStore {
         }
 
         atomic_write_bytes(&record_dir, RAW_MODEL_OUTPUT_FILE_NAME, raw_model_output)?;
-        atomic_write_json(&record_dir, FAILURE_FILE, failure)
+        let result = atomic_write_json(&record_dir, FAILURE_FILE, failure);
+        if result.is_ok() {
+            self.invalidate_recover_cache();
+        }
+        result
     }
 
     pub fn load_failure_input(
@@ -233,11 +247,17 @@ impl ThoughtStore {
     }
 
     pub fn recover(&self) -> Result<ThoughtTimeline> {
+        if let Ok(cache_guard) = self.recover_cache.lock() {
+            if let Some(cached) = cache_guard.as_ref() {
+                return Ok((**cached).clone());
+            }
+        }
+
         secure_existing_tree(&self.root)?;
         let mut grouped = BTreeMap::<UtcTimestamp, Vec<ThoughtContext>>::new();
         collect_contexts(&self.root, &mut grouped)?;
 
-        Ok(ThoughtTimeline {
+        let timeline = ThoughtTimeline {
             groups: grouped
                 .into_iter()
                 .map(|(occurred_at, contexts)| ThoughtTimestampGroup {
@@ -245,7 +265,19 @@ impl ThoughtStore {
                     contexts,
                 })
                 .collect(),
-        })
+        };
+
+        if let Ok(mut cache_guard) = self.recover_cache.lock() {
+            *cache_guard = Some(Arc::new(timeline.clone()));
+        }
+
+        Ok(timeline)
+    }
+
+    fn invalidate_recover_cache(&self) {
+        if let Ok(mut cache_guard) = self.recover_cache.lock() {
+            *cache_guard = None;
+        }
     }
 
     fn ensure_record_parent(&self, occurred_at: UtcTimestamp) -> Result<()> {
@@ -1137,5 +1169,48 @@ mod tests {
         fs::write(&external_record, b"not a thought record").unwrap();
         symlink(&external_record, &input_path).unwrap();
         assert!(record_store.persist_input(&thought).is_err());
+    }
+
+    #[test]
+    fn recover_uses_cache_and_invalidates_on_persist() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ThoughtStore::open(temporary.path()).unwrap();
+
+        let mut thought = context("ca761232-ed42-11ce-bacd-00aa0057b223");
+        store.persist_input(&thought).unwrap();
+        thought.set_output(ThinkingOutput::completed(
+            None,
+            Some("hello".to_string()),
+            None,
+        ));
+        store.persist_output(&thought).unwrap();
+
+        let first = store.recover().unwrap();
+        assert_eq!(first.groups.len(), 1);
+        assert_eq!(
+            first.groups[0].contexts[0]
+                .output
+                .as_ref()
+                .unwrap()
+                .say
+                .as_deref(),
+            Some("hello")
+        );
+
+        let second = store.recover().unwrap();
+        assert_eq!(first, second, "缓存命中时应返回相同 timeline");
+
+        let mut other = context("b0e42fe1-2a5c-4a4f-9f1c-123456789abc");
+        store.persist_input(&other).unwrap();
+        other.set_output(ThinkingOutput::completed(
+            None,
+            Some("world".to_string()),
+            None,
+        ));
+        store.persist_output(&other).unwrap();
+
+        let third = store.recover().unwrap();
+        let total: usize = third.groups.iter().map(|g| g.contexts.len()).sum();
+        assert_eq!(total, 2, "persist 后缓存失效, recover 应重建包含新记录");
     }
 }
