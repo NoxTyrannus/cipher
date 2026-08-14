@@ -1265,6 +1265,25 @@ fn build_echo_summary(
     crate::common::json_util::truncate_head_tail(&parts.join("\n"), 4000)
 }
 
+/// KEEP 周期是否应停止飞轮续跑。
+///
+/// - say 配额已用（KEEP 周期内成功 say 过一次，用于目标对齐）
+/// - 且当前轮决策既不是执行（Execute）也不是失败（Failure）
+///
+/// 失败轮（think 解析失败）不属于"任务结束"信号，应继续修复续跑。
+fn should_stop_keep_flywheel(
+    decision: Option<crate::agent::communication::ThinkDecision>,
+    say_consumed: bool,
+) -> bool {
+    if !say_consumed {
+        return false;
+    }
+    decision.is_some_and(|d| {
+        d != crate::agent::communication::ThinkDecision::Execute
+            && d != crate::agent::communication::ThinkDecision::Failure
+    })
+}
+
 async fn spawn_flywheel_echo(
     mode_manager: &mut ModeManager,
     state: &mut TuiState,
@@ -1274,10 +1293,11 @@ async fn spawn_flywheel_echo(
 ) {
     if state.current_mode == crate::mode_runtime::ModeKind::Keep {
         let say_consumed = mode_manager.keep_say_quota_consumed();
-        let no_exec_intent = pool.get_turn_context(turn_id).await.is_some_and(|ctx| {
-            ctx.thinking.decision != crate::agent::communication::ThinkDecision::Execute
-        });
-        if say_consumed && no_exec_intent {
+        let decision = pool
+            .get_turn_context(turn_id)
+            .await
+            .map(|ctx| ctx.thinking.decision);
+        if should_stop_keep_flywheel(decision, say_consumed) {
             tracing::info!(
                 "streaming_loop: KEEP period finished (final report), \
                  flywheel stops for thought_id={turn_id}"
@@ -1470,6 +1490,48 @@ mod prompt_install_tests {
         assert_eq!(
             std::fs::read_to_string(prompts_dir.join("local_notes.md")).unwrap(),
             "keep this too"
+        );
+    }
+
+    use crate::agent::communication::ThinkDecision as D;
+
+    #[test]
+    fn keep_flywheel_failure_decision_does_not_stop() {
+        assert!(
+            !should_stop_keep_flywheel(Some(D::Failure), true),
+            "失败轮(think 解析失败)不应停止 KEEP 飞轮, 应继续修复续跑"
+        );
+        assert!(
+            !should_stop_keep_flywheel(Some(D::Execute), true),
+            "执行轮不应停止"
+        );
+        assert!(
+            !should_stop_keep_flywheel(Some(D::Execute), false),
+            "say 未消耗时不应停止"
+        );
+    }
+
+    #[test]
+    fn keep_flywheel_stops_only_on_non_exec_intent_after_say() {
+        assert!(
+            should_stop_keep_flywheel(Some(D::Reply), true),
+            "say 已用 + 非执行/非失败决策 → 停止"
+        );
+        assert!(
+            should_stop_keep_flywheel(Some(D::Inherit), true),
+            "say 已用 + Inherit → 停止"
+        );
+        assert!(
+            should_stop_keep_flywheel(Some(D::Cancel), true),
+            "say 已用 + Cancel → 停止"
+        );
+        assert!(
+            !should_stop_keep_flywheel(None, true),
+            "上下文缺失(None) → 保守不停止, 避免临时丢失终止循环"
+        );
+        assert!(
+            !should_stop_keep_flywheel(Some(D::Reply), false),
+            "say 未消耗 → 不停止"
         );
     }
 }
