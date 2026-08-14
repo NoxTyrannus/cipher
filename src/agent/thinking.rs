@@ -553,9 +553,14 @@ impl ThinkingInstance {
 
         let input_kind2 = match &self.input_override {
             Some(super::thought::ThinkingInput::PlatformEcho { .. }) => "echo".to_string(),
+            Some(super::thought::ThinkingInput::ReflectOnly { .. }) => "reflect".to_string(),
             Some(super::thought::ThinkingInput::ModeTrigger { .. }) => "mode".to_string(),
             _ => "user".to_string(),
         };
+        let reflect_only = matches!(
+            self.input_override,
+            Some(super::thought::ThinkingInput::ReflectOnly { .. })
+        );
         let stream_tx2 = stream_tx.clone();
         let pool_tx2 = pool_tx.clone();
         let cancel2 = cancel.clone();
@@ -632,72 +637,94 @@ impl ThinkingInstance {
                 "spawn_streaming: [timing] call_stream start thought_id={}",
                 id2
             );
-            let resp = tokio::select! {
-                resp = provider.call_stream(&req, &mut on_chunk) => {
-                    match resp {
-                        Ok(r) => {
-                            tracing::info!("spawn_streaming: [timing] call_stream returned {:?} thought_id={}", phase_t0.elapsed(), id2);
-                            r
+            // 指数退避重试（缺陷2 配套）：可重试错误（429/408/5xx/超时/网络）退避后重试，
+            // 起始 3s、60s 封顶、无总次数硬限；进度经 StreamChunk::Status 暴露给用户。
+            let mut llm_attempt: u32 = 0;
+            let resp = loop {
+                let attempt_err = tokio::select! {
+                    resp = provider.call_stream(&req, &mut on_chunk) => {
+                        match resp {
+                            Ok(r) => {
+                                tracing::info!("spawn_streaming: [timing] call_stream returned {:?} thought_id={}", phase_t0.elapsed(), id2);
+                                break r;
+                            }
+                            Err(e) => e,
                         }
-                        Err(e) => {
-                            let signal_error = match persist_terminal_output(
-                                &thought_store2,
-                                &mut thought_context,
-                                PersistentThinkingOutput::failed(e.to_string()),
-                            ) {
-                                Ok(()) => e,
-                                Err(persist_error) => {
-                                    tracing::error!(
-                                        "spawn_streaming: failed to persist provider failure for thought_id={}: {}",
-                                        id2,
-                                        persist_error
-                                    );
-                                    persist_error
+                    }
+                    _ = cancel2.notified() => {
+                        match persist_terminal_output(
+                            &thought_store2,
+                            &mut thought_context,
+                            PersistentThinkingOutput::cancelled(Some("stream cancelled".to_string())),
+                        ) {
+                            Ok(()) => {
+                                if let Err(send_e) = stream_tx2.try_send((id2.clone(), StreamChunk::Cancelled)) {
+                                    tracing::warn!("spawn_streaming: stream_tx2 send error turn_id={}, error={}", id2, send_e);
                                 }
-                            };
-                            if let Err(send_e) = stream_tx2.try_send((id2.clone(), StreamChunk::Error(signal_error.to_string()))) {
-                                tracing::warn!("spawn_streaming: stream_tx2 send error turn_id={}, error={}", id2, send_e);
                             }
-                            if let Err(send_e) = pool_tx2.try_send(InstanceOutcome { id: id2.clone(), result: Err(signal_error) }) {
-                                tracing::warn!("spawn_streaming: pool_tx2 send error turn_id={}, error={}", id2, send_e);
+                            Err(persist_error) => {
+                                tracing::error!(
+                                    "spawn_streaming: failed to persist cancellation for thought_id={}: {}",
+                                    id2,
+                                    persist_error
+                                );
+                                if let Err(send_e) = stream_tx2.try_send((
+                                    id2.clone(),
+                                    StreamChunk::Error(persist_error.to_string()),
+                                )) {
+                                    tracing::warn!("spawn_streaming: stream_tx2 send error turn_id={}, error={}", id2, send_e);
+                                }
+                                if let Err(send_e) = pool_tx2.try_send(InstanceOutcome {
+                                    id: id2.clone(),
+                                    result: Err(persist_error),
+                                }) {
+                                    tracing::warn!("spawn_streaming: pool_tx2 send error turn_id={}, error={}", id2, send_e);
+                                }
                             }
-                            return;
                         }
+                        return;
                     }
+                };
+
+                // —— 失败分类：可重试 → 指数退避后继续；永久 → 走原失败路径 ——
+                if crate::logic::model::is_retryable_llm_error(&attempt_err) {
+                    llm_attempt += 1;
+                    let delay_secs = crate::logic::model::backoff_delay_secs(llm_attempt);
+                    tracing::warn!(
+                        "spawn_streaming: LLM call failed (retryable, attempt={llm_attempt}) thought_id={id2}, backoff {delay_secs}s: {attempt_err}"
+                    );
+                    let _ = stream_tx2.try_send((
+                        id2.clone(),
+                        StreamChunk::Status(format!(
+                            "思考请求失败（{attempt_err}），{delay_secs}s 后重试（第 {llm_attempt} 次）"
+                        )),
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                    continue;
                 }
-                _ = cancel2.notified() => {
-                    match persist_terminal_output(
-                        &thought_store2,
-                        &mut thought_context,
-                        PersistentThinkingOutput::cancelled(Some("stream cancelled".to_string())),
-                    ) {
-                        Ok(()) => {
-                            if let Err(send_e) = stream_tx2.try_send((id2.clone(), StreamChunk::Cancelled)) {
-                                tracing::warn!("spawn_streaming: stream_tx2 send error turn_id={}, error={}", id2, send_e);
-                            }
-                        }
-                        Err(persist_error) => {
-                            tracing::error!(
-                                "spawn_streaming: failed to persist cancellation for thought_id={}: {}",
-                                id2,
-                                persist_error
-                            );
-                            if let Err(send_e) = stream_tx2.try_send((
-                                id2.clone(),
-                                StreamChunk::Error(persist_error.to_string()),
-                            )) {
-                                tracing::warn!("spawn_streaming: stream_tx2 send error turn_id={}, error={}", id2, send_e);
-                            }
-                            if let Err(send_e) = pool_tx2.try_send(InstanceOutcome {
-                                id: id2.clone(),
-                                result: Err(persist_error),
-                            }) {
-                                tracing::warn!("spawn_streaming: pool_tx2 send error turn_id={}, error={}", id2, send_e);
-                            }
-                        }
+
+                let signal_error = match persist_terminal_output(
+                    &thought_store2,
+                    &mut thought_context,
+                    PersistentThinkingOutput::failed(attempt_err.to_string()),
+                ) {
+                    Ok(()) => attempt_err,
+                    Err(persist_error) => {
+                        tracing::error!(
+                            "spawn_streaming: failed to persist provider failure for thought_id={}: {}",
+                            id2,
+                            persist_error
+                        );
+                        persist_error
                     }
-                    return;
+                };
+                if let Err(send_e) = stream_tx2.try_send((id2.clone(), StreamChunk::Error(signal_error.to_string()))) {
+                    tracing::warn!("spawn_streaming: stream_tx2 send error turn_id={}, error={}", id2, send_e);
                 }
+                if let Err(send_e) = pool_tx2.try_send(InstanceOutcome { id: id2.clone(), result: Err(signal_error) }) {
+                    tracing::warn!("spawn_streaming: pool_tx2 send error turn_id={}, error={}", id2, send_e);
+                }
+                return;
             };
 
             if !resp.tool_calls.is_empty() {
@@ -831,7 +858,11 @@ impl ThinkingInstance {
                 let ctx = TurnContext {
                     turn_id: id2.clone(),
                     thinking: ThinkingOutput {
-                        decision: ThinkDecision::Execute,
+                        decision: if reflect_only {
+                            ThinkDecision::Reply
+                        } else {
+                            ThinkDecision::Execute
+                        },
                         goal: think.clone(),
                         constraints: vec![],
                         message: think,
@@ -839,20 +870,32 @@ impl ThinkingInstance {
                     execution: None,
                     insight: None,
                     memory: None,
-                    status: TurnStatus::Executing,
+                    status: if reflect_only {
+                        TurnStatus::Done
+                    } else {
+                        TurnStatus::Executing
+                    },
                     user_message,
                     input_kind: input_kind2.clone(),
                     say_published: say_published2,
                 };
                 pool.create_turn_context(ctx).await;
-                if let Err(send_err) = pool.send_execute(&id2).await {
-                    tracing::warn!(
-                        "spawn_streaming: send_execute failed turn_id={}: {}",
-                        id2,
-                        send_err
+                if reflect_only {
+                    // 融合思考反思实例：只产出 think 文本，不触发执行链，直接完成。
+                    tracing::info!(
+                        "spawn_streaming: turn_id={}, reflect-only instance finished (no execution)",
+                        id2
                     );
+                } else {
+                    if let Err(send_err) = pool.send_execute(&id2).await {
+                        tracing::warn!(
+                            "spawn_streaming: send_execute failed turn_id={}: {}",
+                            id2,
+                            send_err
+                        );
+                    }
+                    tracing::info!("spawn_streaming: turn_id={}, Execute DM sent", id2);
                 }
-                tracing::info!("spawn_streaming: turn_id={}, Execute DM sent", id2);
             } else {
                 tracing::debug!(
                     "spawn_streaming: turn_id={}, say-only output, routing to insight+memory chain (no execution)",

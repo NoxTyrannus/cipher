@@ -10,6 +10,9 @@ pub enum StreamChunk {
 
     Think(String),
 
+    /// 过程状态通知（如 LLM 调用指数退避重试进度），不改变消息流。
+    Status(String),
+
     Done,
 
     Cancelled,

@@ -11,7 +11,10 @@ pub mod responses;
 pub mod stream;
 
 pub use anthropic::AnthropicProvider;
-pub use error::map_reqwest_error;
+pub use error::{
+    backoff_delay_secs, extract_http_status, is_retryable_llm_error, is_retryable_status,
+    map_reqwest_error,
+};
 pub use message::{
     normalize, normalize_with_system, ChatMessage, MemoryKind, Normalized, SystemKind,
 };

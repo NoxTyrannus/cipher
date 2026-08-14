@@ -8,7 +8,7 @@ use crate::data::workspace_store::{WorkspaceRow, WorkspaceStore};
 use dialoguer::{Input, Password, Select};
 use secrecy::SecretString;
 
-use super::config::{Config, MemoryMode};
+use super::config::{CollaborationStyle, Config, TriggerNode};
 
 const PRESET_TEMPLATES: &[(&str, &str, &str, &str)] = &[
     (
@@ -32,7 +32,7 @@ pub fn run(app: &AppState) -> Result<(), AgentError> {
             "工作区管理",
             "agent 改名",
             "切默认 workspace/agent",
-            "记忆中台模式 (sync / mixed / async)",
+            "协同模式风格 (Mode Style: 协同方式/协同节点/预算/融合思考)",
             "手动改上下文 (待后续)",
             "退出 /config",
         ];
@@ -47,50 +47,182 @@ pub fn run(app: &AppState) -> Result<(), AgentError> {
             1 => manage_workspaces(app)?,
             2 => manage_agents(app)?,
             3 => switch_defaults(app)?,
-            4 => manage_memory_mode()?,
+            4 => manage_mode_styles()?,
             5 => println!("手动改上下文: 运行时上下文编辑, 待后续落地 (非 workspace/agent schema)"),
             _ => return Ok(()),
         }
     }
 }
 
-fn manage_memory_mode() -> Result<(), AgentError> {
+/// 三模式协同风格管理：UNNI 可配置协同方式/协同节点，KEEP 配置预算，LOOP 配置融合思考。
+fn manage_mode_styles() -> Result<(), AgentError> {
     let config_path = Config::default_path();
     let Some(mut config) = Config::load(&config_path)? else {
         println!("未找到 config.toml, 请先运行 `cipher setup` 初始化。");
         return Ok(());
     };
-    let items = vec![
-        "sync  — 同步: 记忆回音触发续跑 (记忆 settle 完成后新实例)",
-        "mixed — 混合: 洞察回音触发 + 有界等待 settle (默认)",
-        "async — 异步: 洞察回音触发, 记忆异步落库按时间戳替换",
-    ];
-    let default_index = match config.memory_mode {
-        MemoryMode::Sync => 0,
-        MemoryMode::Mixed => 1,
-        MemoryMode::Async => 2,
-    };
+    loop {
+        let unni = config.mode_styles.unni;
+        let keep = config.mode_styles.keep;
+        let r#loop = config.mode_styles.r#loop;
+        let items = vec![
+            format!("UNNI 协同方式 (当前: {})", unni.style.as_str()),
+            format!("UNNI 协同节点 (当前: {})", unni.node.as_str()),
+            format!("KEEP Token 预算 (当前: {}K)", keep.token_budget / 1000),
+            format!("KEEP 时间预算 (当前: {}min)", keep.time_budget_secs / 60),
+            format!(
+                "LOOP 融合思考 (当前: {})",
+                if r#loop.mix_thinking { "开" } else { "关" }
+            ),
+            "返回 /config 主菜单".to_string(),
+        ];
+        let sel = Select::new()
+            .with_prompt("协同模式风格 — 选择管理项 (KEEP/LOOP 协同方式/节点固定不可设置)")
+            .items(&items)
+            .default(0)
+            .interact()
+            .map_err(|e| AgentError::Parse(format!("mode style select: {e}")))?;
+        match sel {
+            0 => manage_unni_style(&mut config, &config_path, true)?,
+            1 => manage_unni_style(&mut config, &config_path, false)?,
+            2 => manage_keep_token(&mut config, &config_path)?,
+            3 => manage_keep_time(&mut config, &config_path)?,
+            4 => manage_loop_mix(&mut config, &config_path)?,
+            _ => return Ok(()),
+        }
+    }
+}
+
+fn manage_unni_style(
+    config: &mut Config,
+    config_path: &std::path::Path,
+    pick_style: bool,
+) -> Result<(), AgentError> {
+    if pick_style {
+        let current = config.mode_styles.unni.style;
+        let items = vec![
+            CollaborationStyle::Autonomous.label(),
+            CollaborationStyle::Follow.label(),
+        ];
+        let default_index = match current {
+            CollaborationStyle::Autonomous => 0,
+            CollaborationStyle::Follow => 1,
+        };
+        let sel = Select::new()
+            .with_prompt(format!("UNNI 协同方式 (当前: {})", current.as_str()))
+            .items(&items)
+            .default(default_index)
+            .interact()
+            .map_err(|e| AgentError::Parse(format!("unni style select: {e}")))?;
+        let next = match sel {
+            0 => CollaborationStyle::Autonomous,
+            _ => CollaborationStyle::Follow,
+        };
+        if next == current {
+            println!("协同方式未变, 保持 {}", current.as_str());
+            return Ok(());
+        }
+        config.mode_styles.unni.style = next;
+        config.save(config_path)?;
+        println!("UNNI 协同方式已切换为 {} (config.toml)", next.as_str());
+    } else {
+        let current = config.mode_styles.unni.node;
+        let items = vec![
+            TriggerNode::Execution.label(),
+            TriggerNode::Insight.label(),
+            TriggerNode::Memory.label(),
+        ];
+        let default_index = match current {
+            TriggerNode::Execution => 0,
+            TriggerNode::Insight => 1,
+            TriggerNode::Memory => 2,
+        };
+        let sel = Select::new()
+            .with_prompt(format!("UNNI 协同节点 (当前: {})", current.as_str()))
+            .items(&items)
+            .default(default_index)
+            .interact()
+            .map_err(|e| AgentError::Parse(format!("unni node select: {e}")))?;
+        let next = match sel {
+            0 => TriggerNode::Execution,
+            1 => TriggerNode::Insight,
+            _ => TriggerNode::Memory,
+        };
+        if next == current {
+            println!("协同节点未变, 保持 {}", current.as_str());
+            return Ok(());
+        }
+        config.mode_styles.unni.node = next;
+        config.save(config_path)?;
+        println!("UNNI 协同节点已切换为 {} (config.toml)", next.as_str());
+    }
+    Ok(())
+}
+
+fn manage_keep_token(config: &mut Config, config_path: &std::path::Path) -> Result<(), AgentError> {
+    let input = Input::<u64>::new()
+        .with_prompt(format!(
+            "KEEP Token 预算 (当前: {}, 单位 千 token, 最小 100)",
+            config.mode_styles.keep.token_budget / 1000
+        ))
+        .default(config.mode_styles.keep.token_budget / 1000)
+        .interact_text()
+        .map_err(|e| AgentError::Parse(format!("keep token budget: {e}")))?;
+    let budget = input.saturating_mul(1000).max(100_000);
+    if budget == config.mode_styles.keep.token_budget {
+        println!("Token 预算未变");
+        return Ok(());
+    }
+    config.mode_styles.keep.token_budget = budget;
+    config.save(config_path)?;
+    println!("KEEP Token 预算已设为 {}K (config.toml)", budget / 1000);
+    Ok(())
+}
+
+fn manage_keep_time(config: &mut Config, config_path: &std::path::Path) -> Result<(), AgentError> {
+    let input = Input::<u64>::new()
+        .with_prompt(format!(
+            "KEEP 时间预算 (当前: {}min, 最小 5)",
+            config.mode_styles.keep.time_budget_secs / 60
+        ))
+        .default(config.mode_styles.keep.time_budget_secs / 60)
+        .interact_text()
+        .map_err(|e| AgentError::Parse(format!("keep time budget: {e}")))?;
+    let secs = input.saturating_mul(60).max(300);
+    if secs == config.mode_styles.keep.time_budget_secs {
+        println!("时间预算未变");
+        return Ok(());
+    }
+    config.mode_styles.keep.time_budget_secs = secs;
+    config.save(config_path)?;
+    println!("KEEP 时间预算已设为 {}min (config.toml)", secs / 60);
+    Ok(())
+}
+
+fn manage_loop_mix(config: &mut Config, config_path: &std::path::Path) -> Result<(), AgentError> {
+    let current = config.mode_styles.r#loop.mix_thinking;
+    let items = vec!["关 (默认, 顺序触发)", "开 (流水线并行 + 拼接合并)"];
+    let default_index = if current { 1 } else { 0 };
     let sel = Select::new()
         .with_prompt(format!(
-            "记忆中台模式 (当前: {})",
-            config.memory_mode.as_str()
+            "LOOP 融合思考 (当前: {})",
+            if current { "开" } else { "关" }
         ))
         .items(&items)
         .default(default_index)
         .interact()
-        .map_err(|e| AgentError::Parse(format!("memory mode select: {e}")))?;
-    let mode = match sel {
-        0 => MemoryMode::Sync,
-        1 => MemoryMode::Mixed,
-        _ => MemoryMode::Async,
-    };
-    if mode == config.memory_mode {
-        println!("模式未变, 保持 {}", mode.as_str());
+        .map_err(|e| AgentError::Parse(format!("loop mix select: {e}")))?;
+    let next = sel == 1;
+    if next == current {
+        println!("融合思考未变");
         return Ok(());
     }
-    config.memory_mode = mode;
-    config.save(&config_path)?;
-    println!("记忆中台模式已切换为 {} (config.toml)", mode.as_str());
+    config.mode_styles.r#loop.mix_thinking = next;
+    config.save(config_path)?;
+    println!(
+        "LOOP 融合思考已切换为 {} (config.toml)",
+        if next { "开" } else { "关" }
+    );
     Ok(())
 }
 

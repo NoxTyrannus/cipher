@@ -1,4 +1,4 @@
-use super::config::{Config, MemoryMode};
+use super::config::{CollaborationStyle, Config, ModeStyles, TriggerNode};
 use super::{init, self_check};
 use crate::agent::context_assembler::{ContextAssembler, ContextConfig};
 use crate::common::AgentError;
@@ -176,7 +176,7 @@ pub async fn run_normal(
 
     super::config::migrate_data_dir()?;
     let config = load_config(&config_path, data_dir_override)?;
-    let app_state = crate::data::bootstrap(&config.data_dir)?;
+    let mut app_state = crate::data::bootstrap(&config.data_dir)?;
     ensure_default_prompts(&config.data_dir)?;
     tracing::info!(data_dir = ?config.data_dir, "normal: bootstrap ready");
     crate::data::factory::ensure_default_wasm_modules(&config.data_dir)?;
@@ -351,6 +351,12 @@ pub async fn run_normal(
             .ok();
         tracing::info!("factory: seeded 7 base capabilities + agent tool_caps (shell={shell_id})");
     }
+
+    // 关键：能力/agent 种子在上述块中才写入 DuckDB，而 `app_state.registry`
+    // 在 bootstrap() 时已加载（早于种子）。若不在此时重载，执行平台与模式管理器
+    // 拿到的注册表缺 agent 行（新目录）或 tool_caps 为 NULL（setup 后），
+    // 真实能力执行（shell.exec/file.* 等）将全部失败。
+    app_state.registry = crate::data::duckdb::loader::load_all_into_memory(&app_state.duckdb)?;
 
     let memory_db = {
         let memory_db_path = config.data_dir.join("memory.duckdb");
@@ -641,13 +647,19 @@ pub async fn run_normal(
     if std::io::stdout().is_terminal() {
         tracing::info!("tui_run: 真 ratatui TUI streaming loop starting");
 
-        let memory_mode_shared = std::sync::Arc::new(std::sync::Mutex::new(config.memory_mode));
+        let mode_styles_shared = std::sync::Arc::new(std::sync::Mutex::new(config.mode_styles));
+        let keep_budget_tracker =
+            std::sync::Arc::new(std::sync::Mutex::new(KeepBudgetTracker::new(
+                config.mode_styles.keep.token_budget,
+                config.mode_styles.keep.time_budget_secs,
+            )));
         run_streaming_loop(
             &mut mode_manager,
             trigger_fwd_rx,
             &app_state,
             pool_for_status,
-            memory_mode_shared,
+            mode_styles_shared,
+            keep_budget_tracker,
         )
         .await?;
     } else {
@@ -750,7 +762,8 @@ pub async fn run_streaming_loop(
     mut trigger_rx: mpsc::Receiver<crate::agent::agent_pool::channels::TriggerEvent>,
     app: &crate::data::bootstrap::AppState,
     pool: std::sync::Arc<crate::agent::agent_pool::AgentPool>,
-    memory_mode_shared: std::sync::Arc<std::sync::Mutex<MemoryMode>>,
+    mode_styles_shared: std::sync::Arc<std::sync::Mutex<ModeStyles>>,
+    keep_budget_tracker: std::sync::Arc<std::sync::Mutex<KeepBudgetTracker>>,
 ) -> Result<(), AgentError> {
     use crossterm::event::{Event, EventStream};
     use futures::StreamExt;
@@ -777,11 +790,18 @@ pub async fn run_streaming_loop(
 
     let mut render_tick = time::interval(Duration::from_millis(16));
 
-    let mut pending_settle: std::collections::HashMap<String, std::time::Instant> =
-        std::collections::HashMap::new();
-    let mut settle_tick = time::interval(Duration::from_millis(250));
-
     let mut should_exit = false;
+
+    let mut mix_state = MixThinkingState::default();
+
+    // Mix join（缺陷2）：依赖实例注册表 + 待推进状态，事件驱动不阻塞主循环。
+    let mix_registry = MixDepRegistry::default();
+    let mut mix_join: Option<PendingMix> = None;
+    let mut final_wanted = false;
+
+    // 自动修复（F1）：按用户输入原文计数的防循环上限。
+    let mut auto_repair_counts: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
     loop {
         if should_exit {
             break;
@@ -884,38 +904,56 @@ pub async fn run_streaming_loop(
                                 state.config_panel.view = ConfigView::ModelList;
                                 state.config_panel.clear_db_request();
                             }
-                            DbRequest::SaveMemoryMode { mode } => {
-                                let parsed = match mode.as_str() {
-                                    "sync" => MemoryMode::Sync,
-                                    "async" => MemoryMode::Async,
-                                    _ => MemoryMode::Mixed,
+                            DbRequest::SaveModeStyle { target, value } => {
+                                let config_path = crate::startup::Config::default_path();
+                                let mut config = crate::startup::init::init(&config_path)?;
+                                let mut styles = *mode_styles_shared.lock().unwrap();
+                                let msg = match target {
+                                    0 => {
+                                        let next = match value.as_str() {
+                                            "follow" => CollaborationStyle::Follow,
+                                            _ => CollaborationStyle::Autonomous,
+                                        };
+                                        config.mode_styles.unni.style = next;
+                                        styles.unni.style = next;
+                                        format!("UNNI 协同方式已切换 → {:?}", next)
+                                    }
+                                    1 => {
+                                        let next = match value.as_str() {
+                                            "insight" => TriggerNode::Insight,
+                                            "memory" => TriggerNode::Memory,
+                                            _ => TriggerNode::Execution,
+                                        };
+                                        config.mode_styles.unni.node = next;
+                                        styles.unni.node = next;
+                                        format!("UNNI 协同节点已切换 → {:?}", next)
+                                    }
+                                    2 => {
+                                        let budget = value.parse::<u64>().unwrap_or(100_000).max(100_000);
+                                        config.mode_styles.keep.token_budget = budget;
+                                        styles.keep.token_budget = budget;
+                                        // 同步运行时预算追踪器（保持周期内已用 token 不回退）
+                                        keep_budget_tracker.lock().unwrap().token_budget = budget;
+                                        format!("KEEP Token 预算已切换 → {}K", budget / 1000)
+                                    }
+                                    3 => {
+                                        let secs = value.parse::<u64>().unwrap_or(300).max(300);
+                                        config.mode_styles.keep.time_budget_secs = secs;
+                                        styles.keep.time_budget_secs = secs;
+                                        keep_budget_tracker.lock().unwrap().time_budget_secs = secs;
+                                        format!("KEEP 时间预算已切换 → {}min", secs / 60)
+                                    }
+                                    _ => {
+                                        let on = value == "on";
+                                        config.mode_styles.r#loop.mix_thinking = on;
+                                        styles.r#loop.mix_thinking = on;
+                                        format!("LOOP 融合思考已切换 → {}", if on { "开" } else { "关" })
+                                    }
                                 };
-
-
-                                if !mode_manager.active_is_empty() {
-                                    state.config_panel.message = Some((
-                                        format!("拒绝切换: 仍有运行中实例 ({} 个), 请等待完成后再试", mode_manager.active_count()),
-                                        true,
-                                    ));
-                                } else if !matches!(
-                                    state.current_mode,
-                                    crate::mode_runtime::ModeKind::Unni | crate::mode_runtime::ModeKind::Keep
-                                ) {
-                                    state.config_panel.message = Some((
-                                        "拒绝切换: 仅允许在 UNNI/KEEP 模式下切换 (LOOP 运行中不可切换)".to_string(),
-                                        true,
-                                    ));
-                                } else {
-                                    let config_path = crate::startup::Config::default_path();
-                                    let mut config = crate::startup::init::init(&config_path)?;
-                                    config.memory_mode = parsed;
-                                    config.save(&config_path)?;
-                                    *memory_mode_shared.lock().unwrap() = parsed;
-                                    state.config_panel.message = Some((
-                                        format!("记忆中台模式已切换 → {} (运行时生效)", parsed.as_str()),
-                                        false,
-                                    ));
-                                }
+                                config.save(&config_path)?;
+                                *mode_styles_shared.lock().unwrap() = styles;
+                                state.config_panel.message = Some((msg, false));
+                                state.config_panel.view = ConfigView::ModeStyleSubMenu { cursor: 0 };
                                 state.config_panel.clear_db_request();
                             }
                             DbRequest::SubmitRenameAgent { display_name } => {
@@ -993,7 +1031,21 @@ pub async fn run_streaming_loop(
                                 }
                                 state.push_user(input.clone());
 
-                                match mode_manager.spawn(input).await {
+                                // 跟随模式：合并 pending context（协同节点完成后的摘要）进本次输入
+                                let spawn_input = if let Some((pending_turn, pending_summary)) =
+                                    state.take_pending_context()
+                                {
+                                    tracing::info!(
+                                        "streaming_loop: merging pending context (thought_id={pending_turn}) into user input"
+                                    );
+                                    format!(
+                                        "[上一轮整理上下文 (thought_id={pending_turn})]\n{pending_summary}\n\n——用户新输入——\n{input}"
+                                    )
+                                } else {
+                                    input
+                                };
+
+                                match mode_manager.spawn(spawn_input).await {
                                     Ok(id) => {
 
                                         state.push_streaming(id);
@@ -1048,6 +1100,11 @@ pub async fn run_streaming_loop(
                             .draw(|f| crate::ui::tui::render::render(&state, f))
                             .map_err(|e| AgentError::Io(format!("draw: {e}")))?;
                     }
+                    StreamChunk::Status(msg) => {
+                        // 过程状态（如思考请求指数退避重试进度）：消息面板错误条暴露
+                        state.set_error(msg.clone());
+                        tracing::info!("streaming_loop: status (thought_id={id}): {msg}");
+                    }
                     StreamChunk::Error(msg) => {
                         state.mark_error(&id, &msg);
                         mode_manager.remove_active(&id);
@@ -1066,7 +1123,67 @@ pub async fn run_streaming_loop(
 
 
             Some(outcome) = pool_rx.recv() => {
+                // Mix 依赖注册表更新（缺陷2）：实例结果到达 → 状态更新 + 事件驱动推进 join
+                let oid = outcome.id.clone();
+                let outcome_ok = outcome.result.is_ok();
+                let outcome_err = outcome.result.as_ref().err().map(|e| e.to_string());
+                tracing::debug!(
+                    "streaming_loop: pool outcome id={oid} ok={outcome_ok} join={mix_join:?}"
+                );
+                mix_registry.on_outcome(&oid, outcome_ok, outcome_err);
+                try_progress_mix(
+                    mode_manager, &mut state, &pool, &mut mix_state,
+                    &mix_registry, &mut mix_join, &mut final_wanted,
+                )
+                .await;
+
+                // F1: invalid_json 重试耗尽后保留用户输入意图，自动续跑修复轮（不回到询问状态）。
+                let repair_hint = match &outcome.result {
+                    Err(AgentError::ThinkingOutputInvalid(msg)) => Some(msg.clone()),
+                    _ => None,
+                };
+                let failed_id = outcome.id.clone();
                 mode_manager.bookkeep(outcome, &state.last_user_message());
+
+                if let Some(failure_msg) = repair_hint {
+                    // 内部实例（融合思考反思/echo 轮）失败不触发自动修复——
+                    // 它们不是用户可见的请求轮，自动重试会打乱 Mix 状态机。
+                    let failed_ctx = pool.get_turn_context(&failed_id).await;
+                    let is_internal = failed_ctx
+                        .as_ref()
+                        .is_some_and(|c| c.input_kind == "reflect" || c.input_kind == "echo");
+                    let original = failed_ctx
+                        .map(|c| c.user_message)
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| state.last_user_message());
+                    if is_internal {
+                        tracing::debug!(
+                            "streaming_loop: internal instance ({failed_id}) failed with invalid output — skipped auto-repair"
+                        );
+                    } else {
+                        let count = auto_repair_counts.entry(original.clone()).or_insert(0u32);
+                        if *count < MAX_AUTO_REPAIRS {
+                            *count += 1;
+                            tracing::info!(
+                                "streaming_loop: auto-repair round {count}/{MAX_AUTO_REPAIRS} for user intent (failed instance {failed_id})",
+                            );
+                            let repair_input = format!(
+                                "[自动修复] 你上一轮对用户请求的输出格式无效，未获得执行授权。\n\
+                                 用户请求: {original}\n\
+                                 失败原因: {failure_msg}\n\
+                                 请重新思考并输出符合格式要求的回复，继续完成用户请求。"
+                            );
+                            match mode_manager.spawn(repair_input).await {
+                                Ok(id) => state.push_streaming(id),
+                                Err(e) => state.set_error(e.to_string()),
+                            }
+                        } else {
+                            tracing::warn!(
+                                "streaming_loop: auto-repair exhausted for user intent (failed instance {failed_id}), giving up to avoid loop",
+                            );
+                        }
+                    }
+                }
                 guard
                     .get_mut()
                     .draw(|f| crate::ui::tui::render::render(&state, f))
@@ -1088,117 +1205,145 @@ pub async fn run_streaming_loop(
                     event.turn_id, event.reason
                 );
 
+                // 统一触发调度（分组 C）：
+                // 1. 当前模式 → style（UNNI 用用户配置, KEEP/LOOP 固定）
+                // 2. 事件 reason → platform
+                // 3. 仅当 platform == 协同节点时触发/暂存；协同节点后的异步中台只沉淀不触发。
+                let mode_name = mode_manager.current_name().to_ascii_lowercase();
+                let styles = *mode_styles_shared.lock().unwrap();
+                let style = styles.style_for(&mode_name);
 
-                let flywheel = matches!(
-                    state.current_mode,
-                    crate::mode_runtime::ModeKind::Loop
-                        | crate::mode_runtime::ModeKind::Keep
-                        | crate::mode_runtime::ModeKind::Unni
-                );
-                let mem_mode = *memory_mode_shared.lock().unwrap();
-                match (mem_mode, event.reason.as_str(), flywheel) {
-
-                    (MemoryMode::Sync, "memory_complete", true) => {
-                        spawn_flywheel_echo(
-                            mode_manager,
-                            &mut state,
-                            &pool,
-                            &event.turn_id,
-                            &event.reason,
-                        )
-                        .await;
-                    }
-
-                    (MemoryMode::Async, "insight_complete", true) => {
-                        spawn_flywheel_echo(
-                            mode_manager,
-                            &mut state,
-                            &pool,
-                            &event.turn_id,
-                            &event.reason,
-                        )
-                        .await;
-                    }
-
-
-                    (MemoryMode::Mixed, "insight_complete", true) => {
-                        let settled = pool
-                            .get_turn_context(&event.turn_id)
-                            .await
-                            .is_some_and(|ctx| ctx.memory.is_some());
-                        if settled {
-                            spawn_flywheel_echo(
-                                mode_manager,
-                                &mut state,
-                                &pool,
-                                &event.turn_id,
-                                &event.reason,
-                            )
-                            .await;
-                        } else {
-                            pending_settle.insert(
-                                event.turn_id.clone(),
-                                std::time::Instant::now() + SETTLE_TIMEOUT,
-                            );
-                        }
-                    }
-
-                    (MemoryMode::Mixed, "memory_complete", _) => {
-                        if pending_settle.remove(&event.turn_id).is_some() {
-                            spawn_flywheel_echo(
-                                mode_manager,
-                                &mut state,
-                                &pool,
-                                &event.turn_id,
-                                &event.reason,
-                            )
-                            .await;
-                        }
-                    }
-                    _ => {
-                        tracing::debug!(
-                            "streaming_loop: trigger ignored (mem_mode={mem_mode:?}, reason={}, flywheel={flywheel})",
-                            event.reason
-                        );
-                    }
-                }
-            }
-
-
-            _ = settle_tick.tick() => {
-                if pending_settle.is_empty() {
-                    continue;
-                }
-
-
-
-                if !matches!(
-                    state.current_mode,
-                    crate::mode_runtime::ModeKind::Loop
-                        | crate::mode_runtime::ModeKind::Keep
-                        | crate::mode_runtime::ModeKind::Unni
-                ) {
-                    if !pending_settle.is_empty() {
-                        tracing::info!(
-                            "streaming_loop: dropped {} pending settle(s) — not in KEEP/LOOP flywheel",
-                            pending_settle.len()
-                        );
-                        pending_settle.clear();
-                    }
-                    continue;
-                }
-                let now = std::time::Instant::now();
-                let due: Vec<String> = pending_settle
-                    .iter()
-                    .filter(|(_, deadline)| **deadline <= now)
-                    .map(|(id, _)| id.clone())
-                    .collect();
-                for id in due {
-                    pending_settle.remove(&id);
-                    tracing::info!(
-                        "streaming_loop: mixed-mode settle timeout for thought_id={id}, spawning with settled portion"
+                let platform = match event.reason.as_str() {
+                    "execution_complete" => Some(TriggerNode::Execution),
+                    "insight_complete" => Some(TriggerNode::Insight),
+                    "memory_complete" => Some(TriggerNode::Memory),
+                    _ => None,
+                };
+                let Some(platform) = platform else {
+                    tracing::debug!(
+                        "streaming_loop: trigger ignored (unknown reason={})",
+                        event.reason
                     );
-                    spawn_flywheel_echo(mode_manager, &mut state, &pool, &id, "settle_timeout").await;
+                    continue;
+                };
+
+                // LOOP + 融合思考（Mix Thinking）on：三阶段流水线并行 + 拼接合并。
+                //
+                // 轮结构（每个执行实例 = 一轮 think_0 及其后继）：
+                //   execution_complete(T) → 实例1 (ReflectOnly, 执行反思)
+                //   insight_complete(T)   → 实例2 (ReflectOnly, 洞察反思, 拼接实例1)
+                //   memory_complete(T)    → 实例3 (PlatformEcho, 记忆综合, 拼接实例1+2) = 下一轮 think_0
+                //
+                // 并行：实例1 spawn 时洞察中台已被 ExecutionDone 并行驱动；实例2 同理。
+                // join：事件到达时对应中台结果已写入 ctx；实例1/2 的 think 从 store 读取。
+                // 反思实例（ReflectOnly）think 后不执行、不驱动中台，故不会产生新完成事件。
+                let mix_on = mode_name == "loop"
+                    && styles.r#loop.mix_thinking
+                    && style.node == TriggerNode::Memory;
+                if mix_on {
+                    match platform {
+                        TriggerNode::Execution => {
+                            // 新一轮开始（执行实例完成）
+                            mix_state.begin_round(&event.turn_id);
+                            // 防御：上一轮 final 尚未 spawn 时不会到达这里（顺序保证），
+                            // 若异常残留则清空 pending，避免跨轮错配。
+                            mix_join = None;
+                            final_wanted = false;
+                            let summary = mix_summary(&pool, &event.turn_id, None, None, &event.reason).await;
+                            let new_id = spawn_mix_reflect(
+                                mode_manager, &mut state, &summary,
+                            )
+                            .await;
+                            if let Some(id1) = &new_id {
+                                mix_state.set_reflect1(Some(id1.clone()), &event.turn_id);
+                                mix_registry.register(id1.clone());
+                            }
+                        }
+                        TriggerNode::Insight => {
+                            if mix_state.is_current_round(&event.turn_id) {
+                                // join：等实例1 就绪后 spawn 实例2（事件驱动，不阻塞）
+                                if let Some(r1) = mix_state.reflect1() {
+                                    mix_join = Some(PendingMix::AwaitReflect1 {
+                                        base: event.turn_id.clone(),
+                                        reflect1: r1.to_string(),
+                                    });
+                                }
+                                try_progress_mix(
+                                    mode_manager, &mut state, &pool, &mut mix_state,
+                                    &mix_registry, &mut mix_join, &mut final_wanted,
+                                )
+                                .await;
+                            } else {
+                                tracing::debug!(
+                                    "streaming_loop: mix insight_complete for non-current round ({}) ignored",
+                                    event.turn_id
+                                );
+                            }
+                        }
+                        TriggerNode::Memory => {
+                            if mix_state.is_current_round(&event.turn_id) {
+                                // join：base 记忆完成，等实例1+2 就绪后 spawn final（事件驱动，不阻塞）
+                                final_wanted = true;
+                                try_progress_mix(
+                                    mode_manager, &mut state, &pool, &mut mix_state,
+                                    &mix_registry, &mut mix_join, &mut final_wanted,
+                                )
+                                .await;
+                            } else {
+                                tracing::debug!(
+                                    "streaming_loop: mix memory_complete for non-current round ({}) ignored",
+                                    event.turn_id
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                if platform == style.node {
+                    // 协同节点完成 → 按协同方式处理
+                    match style.style {
+                        CollaborationStyle::Autonomous => {
+                            // KEEP 预算检查：预算耗尽则暂停（不 spawn）
+                            if mode_name == "keep" {
+                                let mut tracker = keep_budget_tracker.lock().unwrap();
+                                if !keep_budget_allows(&mut tracker, &mut state, &event.turn_id) {
+                                    continue;
+                                }
+                                tracker.record_instance();
+                            }
+                            spawn_flywheel_echo(
+                                mode_manager,
+                                &mut state,
+                                &pool,
+                                &event.turn_id,
+                                &event.reason,
+                            )
+                            .await;
+                        }
+                        CollaborationStyle::Follow => {
+                            // 跟随：暂存为 pending context，等用户下次输入合并
+                            let ctx = pool.get_turn_context(&event.turn_id).await;
+                            let summary = match &ctx {
+                                Some(c) => build_echo_summary(c, &event.turn_id, &event.reason),
+                                None => summary_closing(&event.turn_id, &event.reason),
+                            };
+                            state.stash_pending_context(&event.turn_id, &summary);
+                        }
+                    }
+                } else if style.node.async_after().contains(&platform) {
+                    // 协同节点后的异步中台：只沉淀记忆，不触发新实例
+                    tracing::info!(
+                        "streaming_loop: async platform {platform:?} after trigger node {:?} — \
+                         only sinking memory, not triggering (thought_id={})",
+                        style.node, event.turn_id
+                    );
+                } else {
+                    // 协同节点前的中台：忽略
+                    tracing::debug!(
+                        "streaming_loop: trigger ignored (platform {platform:?} before trigger node {:?})",
+                        style.node
+                    );
                 }
             }
 
@@ -1211,8 +1356,6 @@ pub async fn run_streaming_loop(
     }
     Ok(())
 }
-
-const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 构造 echo 轮注入摘要（纯函数, 便于单测）:
 /// 执行结果段逐节点带 summary（失败附 error）, 记忆沉淀段带注意力 content（200 截断）, 整体 4000 兜底。
@@ -1267,10 +1410,24 @@ fn build_echo_summary(
             parts.push(format!("记忆沉淀: 新增经验 {} 条", mem.experience.len()));
         }
     }
-    parts.push(format!(
-        "记忆中台已整理上一轮 (thought_id={turn_id}, reason={reason}). 请基于此继续推进目标."
-    ));
+    parts.push(summary_closing(turn_id, reason));
     crate::common::json_util::truncate_head_tail(&parts.join("\n"), 4000)
+}
+
+/// 摘要结尾文案，按触发原因动态生成（兼容 Mix Thinking 各阶段）。
+fn summary_closing(turn_id: &str, reason: &str) -> String {
+    match reason {
+        "execution_complete" => {
+            format!("执行已完成 (thought_id={turn_id}). 请基于执行结果做一轮反思，不重复执行.")
+        }
+        "insight_complete" => {
+            format!("洞察已完成 (thought_id={turn_id}). 请结合执行+洞察结果做一轮反思，不重复执行.")
+        }
+        "memory_complete" => {
+            format!("记忆中台已整理上一轮 (thought_id={turn_id}). 请基于此继续推进目标.")
+        }
+        _ => format!("上一轮已整理 (thought_id={turn_id}, reason={reason}). 请基于此继续推进目标."),
+    }
 }
 
 /// KEEP 周期是否应停止飞轮续跑。
@@ -1290,6 +1447,392 @@ fn should_stop_keep_flywheel(
         d != crate::agent::communication::ThinkDecision::Execute
             && d != crate::agent::communication::ThinkDecision::Failure
     })
+}
+
+/// KEEP 预算追踪器：Token 累计（按每实例估值）+ 时间累计。
+///
+/// - `token_budget`：KEEP 周期内累计输出 token 上限（默认 100K）
+/// - `time_budget_secs`：KEEP 周期内累计执行时间上限（默认 5min）
+/// - 每实例 token 估值 `ESTIMATED_TOKENS_PER_INSTANCE`（8K），因为 provider usage
+///   未贯通到调度层；时间按周期起点精确计时。
+/// - 周期起点由 KEEP 首次触发时置为 now；`token_exceeded`/`time_exceeded` 任一为真
+///   表示预算耗尽（暂停 + 提示）。
+#[derive(Debug, Clone)]
+pub struct KeepBudgetTracker {
+    token_budget: u64,
+    time_budget_secs: u64,
+    tokens_used: u64,
+    period_started_at: Option<std::time::Instant>,
+}
+
+/// 每实例输出 token 估值（KEEP 飞轮轮次的近似值）。
+const ESTIMATED_TOKENS_PER_INSTANCE: u64 = 8_000;
+
+/// F1: invalid_json 自动修复轮上限（按用户输入原文计数，防无限循环）。
+const MAX_AUTO_REPAIRS: u32 = 2;
+
+impl KeepBudgetTracker {
+    pub fn new(token_budget: u64, time_budget_secs: u64) -> Self {
+        Self {
+            token_budget,
+            time_budget_secs,
+            tokens_used: 0,
+            period_started_at: None,
+        }
+    }
+
+    /// 开始一个 KEEP 周期（首次飞轮触发时调用）。
+    pub fn start_period(&mut self) {
+        if self.period_started_at.is_none() {
+            self.period_started_at = Some(std::time::Instant::now());
+        }
+    }
+
+    /// 记录一实例的 token 消耗。
+    pub fn record_instance(&mut self) {
+        self.start_period();
+        self.tokens_used = self
+            .tokens_used
+            .saturating_add(ESTIMATED_TOKENS_PER_INSTANCE);
+    }
+
+    /// Token 预算是否耗尽。
+    pub fn token_exceeded(&self) -> bool {
+        self.tokens_used >= self.token_budget
+    }
+
+    /// 时间预算是否耗尽。
+    pub fn time_exceeded(&self) -> bool {
+        self.period_started_at
+            .map(|t| t.elapsed().as_secs() >= self.time_budget_secs)
+            .unwrap_or(false)
+    }
+
+    /// 预算是否耗尽（任一维度）。
+    pub fn exceeded(&self) -> bool {
+        self.token_exceeded() || self.time_exceeded()
+    }
+
+    /// 状态摘要（供 UI 提示）。
+    pub fn status(&self) -> String {
+        let time = self
+            .period_started_at
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        format!(
+            "KEEP 预算: token {}/{}K, 时间 {}s/{}s",
+            self.tokens_used / 1000,
+            self.token_budget / 1000,
+            time,
+            self.time_budget_secs
+        )
+    }
+}
+
+/// 通过 KEEP 预算检查？预算耗尽则暂停（不 spawn）+ 提示。
+fn keep_budget_allows(
+    tracker: &mut KeepBudgetTracker,
+    state: &mut TuiState,
+    turn_id: &str,
+) -> bool {
+    if tracker.exceeded() {
+        tracing::info!(
+            "streaming_loop: KEEP budget exhausted, pausing flywheel for thought_id={turn_id} ({})",
+            tracker.status()
+        );
+        state.set_error(format!("KEEP 预算已耗尽, 周期暂停. {}", tracker.status()));
+        return false;
+    }
+    true
+}
+
+/// 融合思考（Mix Thinking）轮状态机：
+/// 当前轮由执行实例（base_turn）驱动，记录其反思实例（实例1/2）的 turn_id，
+/// 供下一阶段拼接读取 think 输出。
+#[derive(Debug, Default)]
+struct MixThinkingState {
+    base_turn: Option<String>,
+    reflect1: Option<String>,
+    reflect2: Option<String>,
+}
+
+impl MixThinkingState {
+    /// 执行实例完成 → 新一轮开始（若 turn 不同）。
+    fn begin_round(&mut self, turn_id: &str) {
+        if self.base_turn.as_deref() != Some(turn_id) {
+            self.base_turn = Some(turn_id.to_string());
+            self.reflect1 = None;
+            self.reflect2 = None;
+        }
+    }
+
+    fn is_current_round(&self, turn_id: &str) -> bool {
+        self.base_turn.as_deref() == Some(turn_id)
+    }
+
+    fn set_reflect1(&mut self, id: Option<String>, turn_id: &str) {
+        if self.is_current_round(turn_id) {
+            self.reflect1 = id;
+        }
+    }
+
+    fn set_reflect2(&mut self, id: Option<String>, turn_id: &str) {
+        if self.is_current_round(turn_id) {
+            self.reflect2 = id;
+        }
+    }
+
+    fn reflect1(&self) -> Option<&str> {
+        self.reflect1.as_deref()
+    }
+
+    #[allow(dead_code)] // 仅测试使用（生产路径由 PendingMix 持有实例2 id）
+    fn reflect2(&self) -> Option<&str> {
+        self.reflect2.as_deref()
+    }
+
+    /// 实例3 = 下一轮 think_0：成为新的 base_turn，反思位清空。
+    fn advance_round(&mut self, new_base: Option<String>) {
+        self.base_turn = new_base;
+        self.reflect1 = None;
+        self.reflect2 = None;
+    }
+}
+
+/// Mix 依赖实例（实例1/2）状态。
+#[derive(Debug, Clone)]
+enum MixDepState {
+    /// 已 spawn，等待结果（含实例内部指数退避重试中）
+    Running,
+    /// think 已落库（可从 pool 读取）
+    Ready,
+    /// 永久失败（错误已暴露，摘要缺段继续，不中断）
+    Permanent(String),
+}
+
+/// Mix 依赖注册表：turn_id → 状态，配合 Notify 做事件驱动唤醒（替代轮询）。
+#[derive(Default)]
+struct MixDepRegistry {
+    inner: std::sync::Mutex<std::collections::HashMap<String, MixDepState>>,
+    notify: tokio::sync::Notify,
+}
+
+impl MixDepRegistry {
+    fn register(&self, id: String) {
+        self.inner
+            .lock()
+            .unwrap()
+            .insert(id, MixDepState::Running);
+    }
+
+    fn state(&self, id: &str) -> MixDepState {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .unwrap_or(MixDepState::Permanent(format!("未注册的依赖实例 {id}")))
+    }
+
+    /// 主循环处理完一个实例结果后调用；仅更新已注册的 mix 依赖并唤醒等待者。
+    fn on_outcome(&self, id: &str, ok: bool, err: Option<String>) {
+        let mut m = self.inner.lock().unwrap();
+        if !m.contains_key(id) {
+            return;
+        }
+        m.insert(
+            id.to_string(),
+            if ok {
+                MixDepState::Ready
+            } else {
+                MixDepState::Permanent(err.unwrap_or_else(|| "未知错误".to_string()))
+            },
+        );
+        drop(m);
+        self.notify.notify_waiters();
+    }
+}
+
+/// Mix join 待推进状态：事件驱动、不阻塞主循环。
+///
+/// - `AwaitReflect1`：实例2 尚未 spawn，等实例1 就绪（或永久失败）后 spawn 实例2；
+/// - `AwaitFinal`：实例2 已 spawn，等实例1+2 就绪（或永久失败）后 spawn final。
+#[derive(Debug, Clone)]
+enum PendingMix {
+    AwaitReflect1 { base: String, reflect1: String },
+    AwaitFinal { base: String, reflect1: String, reflect2: String },
+}
+
+/// 推进 Mix join：依赖就绪/永久失败即前进（spawn 实例2 / spawn final）。
+///
+/// 事件驱动：每次实例结果到达或阶段触发后调用；依赖仍在跑（含退避重试）时立即返回，
+/// 不阻塞主循环——依赖的结果到达后会再次进入本函数。
+#[allow(clippy::too_many_arguments)]
+async fn try_progress_mix(
+    mode_manager: &mut ModeManager,
+    state: &mut TuiState,
+    pool: &std::sync::Arc<crate::agent::agent_pool::AgentPool>,
+    mix_state: &mut MixThinkingState,
+    registry: &MixDepRegistry,
+    mix_join: &mut Option<PendingMix>,
+    final_wanted: &mut bool,
+) {
+    loop {
+        let Some(pending) = mix_join.clone() else {
+            return;
+        };
+        tracing::debug!(
+            "try_progress_mix: pending={pending:?} final_wanted={final_wanted}"
+        );
+        match pending {
+            PendingMix::AwaitReflect1 { base, reflect1 } => {
+                let s1 = registry.state(&reflect1);
+                match &s1 {
+                    MixDepState::Running => return, // 等实例1（含退避重试中）的结果
+                    MixDepState::Permanent(err) => {
+                        tracing::warn!(
+                            "streaming_loop: mix dep reflect1 ({reflect1}) permanent failed: {err}"
+                        );
+                        state.set_error(format!("反思实例1 永久失败（{err}），实例2 将缺该段继续"));
+                    }
+                    MixDepState::Ready => {}
+                }
+                let r1_for_summary = matches!(s1, MixDepState::Ready).then(|| reflect1.clone());
+                let summary = mix_summary(pool, &base, r1_for_summary.as_deref(), None, "insight_complete")
+                    .await;
+                let new_id = spawn_mix_reflect(mode_manager, state, &summary).await;
+                if let Some(id2) = &new_id {
+                    mix_state.set_reflect2(Some(id2.clone()), &base);
+                    registry.register(id2.clone());
+                }
+                *mix_join = Some(PendingMix::AwaitFinal {
+                    base,
+                    reflect1,
+                    reflect2: new_id.unwrap_or_default(),
+                });
+                // 继续循环：若 reflect2 已就绪，则顺势推进 final
+            }
+            PendingMix::AwaitFinal {
+                base,
+                reflect1,
+                reflect2,
+            } => {
+                // final 的输入含 base 轮的记忆摘要 → 必须等 memory_complete 到达后再拼
+                if !*final_wanted {
+                    return;
+                }
+                let s1 = registry.state(&reflect1);
+                let s2 = registry.state(&reflect2);
+                if matches!(s1, MixDepState::Running) || matches!(s2, MixDepState::Running) {
+                    return; // 还有依赖在跑（含退避重试中）
+                }
+                if let MixDepState::Permanent(err) = &s1 {
+                    tracing::warn!(
+                        "streaming_loop: mix dep reflect1 ({reflect1}) permanent failed: {err}"
+                    );
+                    state.set_error(format!("反思实例1 永久失败（{err}），final 将缺该段继续"));
+                }
+                if let MixDepState::Permanent(err) = &s2 {
+                    tracing::warn!(
+                        "streaming_loop: mix dep reflect2 ({reflect2}) permanent failed: {err}"
+                    );
+                    state.set_error(format!("反思实例2 永久失败（{err}），final 将缺该段继续"));
+                }
+                let r1 = matches!(s1, MixDepState::Ready).then(|| reflect1.clone());
+                let r2 = matches!(s2, MixDepState::Ready).then(|| reflect2.clone());
+                let summary = mix_summary(pool, &base, r1.as_deref(), r2.as_deref(), "memory_complete")
+                    .await;
+                let new_id = spawn_mix_final(mode_manager, state, &summary).await;
+                // 实例3 = 下一轮 think_0：成为新的 base_turn，反思位清空
+                mix_state.advance_round(new_id);
+                *mix_join = None;
+                *final_wanted = false;
+                return;
+            }
+        }
+    }
+}
+
+/// 融合思考拼接：把当前轮中台结果 + 实例1/2 的 think 输出拼进下一实例输入。
+async fn mix_summary(
+    pool: &std::sync::Arc<crate::agent::agent_pool::AgentPool>,
+    turn_id: &str,
+    reflect1: Option<&str>,
+    reflect2: Option<&str>,
+    reason: &str,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(ctx) = pool.get_turn_context(turn_id).await {
+        parts.push(build_echo_summary(&ctx, turn_id, reason));
+    }
+    for (label, id) in [("实例1 反思", reflect1), ("实例2 反思", reflect2)] {
+        if let Some(id) = id {
+            if let Some(ctx) = pool.get_turn_context(id).await {
+                let think = ctx.thinking.message.clone();
+                if !think.trim().is_empty() {
+                    parts.push(format!("[{label} (thought_id={id})]\n{think}"));
+                }
+            }
+        }
+    }
+    if parts.is_empty() {
+        parts.push(summary_closing(turn_id, reason));
+    }
+    crate::common::json_util::truncate_head_tail(&parts.join("\n\n"), 4000)
+}
+
+/// spawn 融合思考中间反思实例（ReflectOnly：think 后不执行）。
+async fn spawn_mix_reflect(
+    mode_manager: &mut ModeManager,
+    state: &mut TuiState,
+    summary: &str,
+) -> Option<String> {
+    match mode_manager
+        .spawn_with_override(
+            summary.to_string(),
+            Some(crate::agent::thought::ThinkingInput::ReflectOnly {
+                summary: summary.to_string(),
+            }),
+        )
+        .await
+    {
+        Ok(id) => {
+            state.push_streaming(id.clone());
+            Some(id)
+        }
+        Err(e) => {
+            state.set_error(e.to_string());
+            None
+        }
+    }
+}
+
+/// spawn 融合思考最终实例（PlatformEcho：think 后执行 = 下一轮 think_0）。
+async fn spawn_mix_final(
+    mode_manager: &mut ModeManager,
+    state: &mut TuiState,
+    summary: &str,
+) -> Option<String> {
+    match mode_manager
+        .spawn_with_override(
+            summary.to_string(),
+            Some(crate::agent::thought::ThinkingInput::PlatformEcho {
+                platform: crate::agent::thought::InternalPlatform::Memory,
+                summary: summary.to_string(),
+                artifact_refs: vec![],
+            }),
+        )
+        .await
+    {
+        Ok(id) => {
+            state.push_streaming(id.clone());
+            Some(id)
+        }
+        Err(e) => {
+            state.set_error(e.to_string());
+            None
+        }
+    }
 }
 
 async fn spawn_flywheel_echo(
@@ -1334,9 +1877,7 @@ async fn spawn_flywheel_echo(
     let echo_ctx = pool.get_turn_context(turn_id).await;
     let summary = match &echo_ctx {
         Some(ctx) => build_echo_summary(ctx, turn_id, reason),
-        None => format!(
-            "记忆中台已整理上一轮 (thought_id={turn_id}, reason={reason}). 请基于此继续推进目标."
-        ),
+        None => summary_closing(turn_id, reason),
     };
 
     match mode_manager
@@ -1546,6 +2087,45 @@ mod prompt_install_tests {
             "say 未消耗 → 不停止"
         );
     }
+
+    #[test]
+    fn mix_state_tracks_rounds_and_reflect_ids() {
+        let mut st = MixThinkingState::default();
+        assert!(!st.is_current_round("t0"));
+
+        st.begin_round("t0");
+        assert!(st.is_current_round("t0"));
+
+        st.set_reflect1(Some("r1".into()), "t0");
+        assert_eq!(st.reflect1(), Some("r1"));
+
+        st.set_reflect2(Some("r2".into()), "t0");
+        assert_eq!(st.reflect2(), Some("r2"));
+
+        // 新一轮开始（不同 base_turn）→ 反思位清空
+        st.begin_round("t1");
+        assert!(st.is_current_round("t1"));
+        assert_eq!(st.reflect1(), None);
+        assert_eq!(st.reflect2(), None);
+
+        // advance_round：实例3 成为新 base_turn
+        st.set_reflect1(Some("r1".into()), "t1");
+        st.advance_round(Some("final1".into()));
+        assert!(st.is_current_round("final1"));
+        assert_eq!(st.reflect1(), None);
+        assert_eq!(st.reflect2(), None);
+    }
+
+    #[test]
+    fn mix_state_ignores_stale_round_writes() {
+        let mut st = MixThinkingState::default();
+        st.begin_round("t0");
+        st.set_reflect1(Some("r1".into()), "t0");
+        // 旧轮 turn 写入被忽略
+        st.set_reflect2(Some("stale".into()), "old");
+        assert_eq!(st.reflect2(), None);
+        assert!(!st.is_current_round("old"));
+    }
 }
 
 #[cfg(test)]
@@ -1661,13 +2241,28 @@ mod echo_summary_tests {
     #[test]
     fn echo_summary_empty_context_does_not_panic() {
         let ctx = turn_context(None, None);
-        let summary = build_echo_summary(&ctx, "t1", "echo");
+        let summary = build_echo_summary(&ctx, "t1", "memory_complete");
         assert!(summary.contains("既定目标: 统计 ERROR 总数"), "{summary}");
         assert!(
-            summary.contains("记忆中台已整理上一轮 (thought_id=t1, reason=echo)"),
+            summary.contains("记忆中台已整理上一轮 (thought_id=t1)"),
             "{summary}"
         );
         assert!(!summary.contains("节点明细"), "{summary}");
+    }
+
+    #[test]
+    fn summary_closing_adapts_to_reason() {
+        let exec = summary_closing("t1", "execution_complete");
+        assert!(exec.contains("执行已完成"), "{exec}");
+        assert!(exec.contains("不重复执行"), "{exec}");
+
+        let insight = summary_closing("t1", "insight_complete");
+        assert!(insight.contains("洞察已完成"), "{insight}");
+        assert!(insight.contains("执行+洞察"), "{insight}");
+
+        let mem = summary_closing("t1", "memory_complete");
+        assert!(mem.contains("记忆中台已整理上一轮"), "{mem}");
+        assert!(mem.contains("继续推进目标"), "{mem}");
     }
 
     #[test]
@@ -1695,5 +2290,33 @@ mod echo_summary_tests {
             "summary must stay near 4000-char budget, got {}",
             summary.chars().count()
         );
+    }
+
+    #[test]
+    fn keep_budget_defaults_allow_start() {
+        let mut t = KeepBudgetTracker::new(100_000, 300);
+        assert!(!t.exceeded());
+        assert!(keep_budget_allows(&mut t, &mut TuiState::new(), "t1"));
+    }
+
+    #[test]
+    fn keep_budget_token_exhausts_after_instances() {
+        // 每实例估值 8K, 预算 24K → 第 3 次 record 后耗尽
+        let mut t = KeepBudgetTracker::new(24_000, 300);
+        t.record_instance(); // 8K
+        t.record_instance(); // 16K
+        assert!(!t.token_exceeded());
+        t.record_instance(); // 24K ≥ 24K
+        assert!(t.token_exceeded());
+        assert!(t.exceeded());
+    }
+
+    #[test]
+    fn keep_budget_status_reports_usage() {
+        let mut t = KeepBudgetTracker::new(100_000, 300);
+        t.record_instance();
+        let s = t.status();
+        assert!(s.contains("token 8/100K"), "got: {s}");
+        assert!(s.contains("300s"), "time budget visible: {s}");
     }
 }
