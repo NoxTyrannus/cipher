@@ -853,6 +853,35 @@ impl ThinkingInstance {
                     );
                 }
                 tracing::info!("spawn_streaming: turn_id={}, Execute DM sent", id2);
+            } else {
+                tracing::debug!(
+                    "spawn_streaming: turn_id={}, say-only output, routing to insight+memory chain (no execution)",
+                    id2
+                );
+                let ctx = TurnContext {
+                    turn_id: id2.clone(),
+                    thinking: ThinkingOutput {
+                        decision: ThinkDecision::Reply,
+                        goal: output.say.clone().unwrap_or_default(),
+                        constraints: vec![],
+                        message: output.say.clone().unwrap_or_default(),
+                    },
+                    execution: None,
+                    insight: None,
+                    memory: None,
+                    status: TurnStatus::Insighting,
+                    user_message,
+                    input_kind: input_kind2.clone(),
+                    say_published: say_published2,
+                };
+                pool.create_turn_context(ctx).await;
+                if let Err(send_err) = pool.send_execution_done(&id2).await {
+                    tracing::warn!(
+                        "spawn_streaming: say-only send_execution_done (insight) failed turn_id={}: {}",
+                        id2,
+                        send_err
+                    );
+                }
             }
 
             if let Some(say) = output.say {
@@ -1148,8 +1177,33 @@ impl ThinkingFactory {
                         );
                     } else {
                         tracing::debug!(
-                            "ThinkingFactory::run_with_dm: turn_id={turn_id}, say-only output has no Execute DM"
+                            "ThinkingFactory::run_with_dm: turn_id={turn_id}, say-only output, \
+                             routing to insight+memory chain (no execution)"
                         );
+                        let ctx = TurnContext {
+                            turn_id: turn_id.clone(),
+                            thinking: ThinkingOutput {
+                                decision: ThinkDecision::Reply,
+                                goal: output.say.clone().unwrap_or_default(),
+                                constraints: vec![],
+                                message: output.say.clone().unwrap_or_default(),
+                            },
+                            execution: None,
+                            insight: None,
+                            memory: None,
+                            status: TurnStatus::Insighting,
+                            user_message: input.to_string(),
+                            input_kind: "user".into(),
+                            say_published: false,
+                        };
+                        pool.create_turn_context(ctx).await;
+                        if let Err(send_err) = pool.send_execution_done(&turn_id).await {
+                            tracing::warn!(
+                                "spawn_streaming: say-only send_execution_done (insight) failed turn_id={}: {}",
+                                turn_id,
+                                send_err
+                            );
+                        }
                     }
 
                     return Ok(output);

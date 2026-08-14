@@ -44,6 +44,19 @@ const PREFILLED_MAX_BYTES: usize = 8192;
 /// subagent 循环最大轮数 (模型不可配置)。
 const SUBAGENT_MAX_TURNS: u32 = 6;
 
+/// 从注册表默认 agent 的 config.max_turns 读取 subagent 轮数默认值。
+/// 未配置或非数字时返回 None (调用方回退 SUBAGENT_MAX_TURNS)。
+fn agent_max_turns_from_registry(registry: &crate::data::duckdb::loader::Registry) -> Option<u32> {
+    let agent = registry
+        .agents
+        .values()
+        .find(|a| a.is_default)
+        .or_else(|| registry.agents.get("agent"))?;
+    let config = agent.config.as_ref()?;
+    let max_turns = config.get("max_turns")?;
+    max_turns.as_u64().and_then(|v| u32::try_from(v).ok())
+}
+
 /// 设计解析失败后的重试提示: 原错误信息原样保留, 并附加具体修复指引。
 fn design_retry_prompt(base_prompt: &str, first_error: &str) -> String {
     format!(
@@ -1027,7 +1040,14 @@ impl NodeRunner {
                 text: "开始执行任务。只输出 JSON。".to_string(),
             },
         ];
-        let max_turns = SUBAGENT_MAX_TURNS;
+        let max_turns = self
+            .registry
+            .as_ref()
+            .and_then(agent_max_turns_from_registry)
+            .unwrap_or(SUBAGENT_MAX_TURNS);
+        if max_turns != SUBAGENT_MAX_TURNS {
+            logs.push(format!("max_turns: {} (agent.config 覆盖)", max_turns));
+        }
         let mut tool_call_count = 0u32;
         for turn in 0..max_turns {
             let req = match LlmRequest::from_model_row(
@@ -2656,7 +2676,19 @@ fn build_execution_prompt(
             .iter()
             .map(
                 |c| match registry.and_then(|r| r.base_capabilities.get(c)) {
-                    Some(row) => format!("- {c}: 参数 schema {}", row.schema_in),
+                    Some(row) => {
+                        let desc = if row.description.is_empty() {
+                            String::new()
+                        } else {
+                            format!("描述: {}", row.description)
+                        };
+                        let meta = row
+                            .metadata
+                            .as_ref()
+                            .map(|m| format!(" 元数据: {}", m))
+                            .unwrap_or_default();
+                        format!("- {c}: {desc}{meta}\n  参数 schema {}", row.schema_in)
+                    }
                     None => format!("- {c}"),
                 },
             )
@@ -2755,6 +2787,82 @@ fn thought_id_from_turn(turn_id: &str) -> ThoughtId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_max_turns_reads_config_with_default_fallback() {
+        use crate::data::duckdb::loader::Registry;
+
+        let mut reg = Registry::new();
+        assert_eq!(agent_max_turns_from_registry(&reg), None, "空注册表 → None");
+
+        reg.agents.insert(
+            "agent".to_string(),
+            crate::data::duckdb::loader::AgentRow {
+                id: "agent".to_string(),
+                name: "Agent".to_string(),
+                mode: "unni".to_string(),
+                prompt: None,
+                tool_caps: vec![],
+                config: None,
+                display_name: None,
+                is_default: true,
+            },
+        );
+        assert_eq!(
+            agent_max_turns_from_registry(&reg),
+            None,
+            "无 config → None"
+        );
+
+        reg.agents.get_mut("agent").unwrap().config = Some(serde_json::json!({"max_turns": 8}));
+        assert_eq!(
+            agent_max_turns_from_registry(&reg),
+            Some(8),
+            "config.max_turns → 8"
+        );
+
+        reg.agents.get_mut("agent").unwrap().config =
+            Some(serde_json::json!({"max_turns": "not-a-number"}));
+        assert_eq!(agent_max_turns_from_registry(&reg), None, "非数字 → None");
+    }
+
+    #[test]
+    fn agent_max_turns_prefers_default_agent_over_id_lookup() {
+        use crate::data::duckdb::loader::Registry;
+
+        let mut reg = Registry::new();
+        reg.agents.insert(
+            "other".to_string(),
+            crate::data::duckdb::loader::AgentRow {
+                id: "other".to_string(),
+                name: "Other".to_string(),
+                mode: "keep".to_string(),
+                prompt: None,
+                tool_caps: vec![],
+                config: Some(serde_json::json!({"max_turns": 12})),
+                display_name: None,
+                is_default: true,
+            },
+        );
+        reg.agents.insert(
+            "agent".to_string(),
+            crate::data::duckdb::loader::AgentRow {
+                id: "agent".to_string(),
+                name: "Agent".to_string(),
+                mode: "unni".to_string(),
+                prompt: None,
+                tool_caps: vec![],
+                config: Some(serde_json::json!({"max_turns": 6})),
+                display_name: None,
+                is_default: false,
+            },
+        );
+        assert_eq!(
+            agent_max_turns_from_registry(&reg),
+            Some(12),
+            "应优先 is_default agent 的配置"
+        );
+    }
 
     #[test]
     fn prefilled_small_arguments_stay_prefilled() {
@@ -4147,9 +4255,10 @@ mod tests {
             &["db.query".to_string()],
             Some(&reg),
         );
+        assert!(prompt.contains("db.query"), "prompt 应含能力 id: {prompt}");
         assert!(
-            prompt.contains("db.query: 参数 schema"),
-            "prompt 应含 schema: {prompt}"
+            prompt.contains("参数 schema"),
+            "prompt 应含 schema 标注: {prompt}"
         );
         assert!(prompt.contains("table"), "schema 内容应上 prompt: {prompt}");
     }

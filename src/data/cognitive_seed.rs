@@ -289,6 +289,12 @@ pub fn import_factory_defaults(conn: &duckdb::Connection, data_dir: &Path) -> Re
         duckdb::params![caps_json],
     )
     .map_err(|e| AgentError::Bootstrap(format!("update agent tool_caps: {e}")))?;
+    conn.execute(
+        "UPDATE agent SET config = '{\"max_turns\": 6}' \
+         WHERE id = 'agent' AND (config IS NULL OR config = 'null')",
+        [],
+    )
+    .map_err(|e| AgentError::Bootstrap(format!("seed agent config: {e}")))?;
 
     tracing::info!(
         "import_factory_defaults: {} base + agent tool_caps={}",
