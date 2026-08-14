@@ -159,22 +159,20 @@ impl InsightPlatform {
             }
         };
 
-        let execution = match &ctx.execution {
-            Some(exec) => exec,
-            None => {
-                tracing::warn!(
-                    "insight_platform: no execution output for turn_id={turn_id}, skipping"
-                );
-                return;
-            }
-        };
+        let execution = ctx.execution.as_ref();
+
+        if execution.is_none() {
+            tracing::debug!(
+                "insight_platform: no execution output for turn_id={turn_id} (say-only round), \
+                 proceeding with fallback insight"
+            );
+        }
 
         let pool_snapshot = self.pool.snapshot().await;
 
         tracing::debug!(
-            "insight_platform: analyzing turn_id={turn_id}, execution_status={:?}, {} nodes, pool_agents={}",
-            execution.status,
-            execution.node_results.len(),
+            "insight_platform: analyzing turn_id={turn_id}, has_execution={}, pool_agents={}",
+            execution.is_some(),
             pool_snapshot.len()
         );
 
@@ -287,7 +285,7 @@ fn build_insight_prompt(
     turn_id: &str,
     goal: &str,
     constraints: &[String],
-    execution: &ExecutionOutput,
+    execution: Option<&ExecutionOutput>,
     pool_snapshot: &[AgentEntry],
     prompts_dir: Option<&std::path::Path>,
 ) -> String {
@@ -307,37 +305,51 @@ fn build_insight_prompt(
             .join("\n")
     };
 
-    let nodes_summary = execution
-        .node_results
-        .iter()
-        .map(format_node_result)
-        .collect::<Vec<_>>()
-        .join("\n---\n");
+    let execution_section = match execution {
+        Some(exec) => {
+            let nodes_summary = exec
+                .node_results
+                .iter()
+                .map(format_node_result)
+                .collect::<Vec<_>>()
+                .join("\n---\n");
 
-    let failed_nodes: Vec<&NodeResult> = execution
-        .node_results
-        .iter()
-        .filter(|nr| nr.status == NodeStatus::Failed)
-        .collect();
+            let failed_nodes: Vec<&NodeResult> = exec
+                .node_results
+                .iter()
+                .filter(|nr| nr.status == NodeStatus::Failed)
+                .collect();
 
-    let failure_summary = if failed_nodes.is_empty() {
-        "No failures detected.".to_string()
-    } else {
-        let mut lines = vec![format!("{} node(s) failed:", failed_nodes.len())];
-        for nr in &failed_nodes {
-            lines.push(format!(
-                "  - node_id={}, error={}",
-                nr.node_id,
-                nr.error.as_deref().unwrap_or("unknown")
-            ));
+            let failure_summary = if failed_nodes.is_empty() {
+                "No failures detected.".to_string()
+            } else {
+                let mut lines = vec![format!("{} node(s) failed:", failed_nodes.len())];
+                for nr in &failed_nodes {
+                    lines.push(format!(
+                        "  - node_id={}, error={}",
+                        nr.node_id,
+                        nr.error.as_deref().unwrap_or("unknown")
+                    ));
+                }
+                lines.join("\n")
+            };
+
+            let dag_design = serde_json::to_string_pretty(&exec.dag)
+                .unwrap_or_else(|_| format!("{:?}", exec.dag));
+
+            format!(
+                "## Execution Design (DAG)\n\n{}\n\n## Execution Results\n\n**Overall Status:** {:?}\n\n**Node Results:**\n{}\n\n## Failure Summary\n\n{}",
+                dag_design,
+                exec.status,
+                nodes_summary,
+                failure_summary,
+            )
         }
-        lines.join("\n")
+        None => {
+            "## Execution\n\n(本轮无执行——say-only 轮，无工具调用。请基于 Goal 与对话内容做三问自检。)"
+                .to_string()
+        }
     };
-
-    let pool_summary = build_pool_snapshot_summary(pool_snapshot);
-
-    let dag_design = serde_json::to_string_pretty(&execution.dag)
-        .unwrap_or_else(|_| format!("{:?}", execution.dag));
 
     let trace_hint = format!(
         "## Trace Access\n\n\
@@ -347,15 +359,14 @@ fn build_insight_prompt(
          - 需要核对某个节点的细节（原始参数/输出/错误堆栈）时，先按节点 id 查证，再作判断\n"
     );
 
+    let pool_summary = build_pool_snapshot_summary(pool_snapshot);
+
     format!(
-        "{}\n\n## Task Input\n\n**Goal:** {}\n\n**Constraints:**\n{}\n\n## Execution Design (DAG)\n\n{}\n\n## Execution Results\n\n**Overall Status:** {:?}\n\n**Node Results:**\n{}\n\n## Failure Summary\n\n{}\n\n{}\n\n## Agent Pool Status\n\n{}",
+        "{}\n\n## Task Input\n\n**Goal:** {}\n\n**Constraints:**\n{}\n\n{}\n\n{}\n\n## Agent Pool Status\n\n{}",
         base,
         goal,
         constraints_str,
-        dag_design,
-        execution.status,
-        nodes_summary,
-        failure_summary,
+        execution_section,
         trace_hint,
         pool_summary,
     )
@@ -464,7 +475,28 @@ fn format_node_result(nr: &NodeResult) -> String {
     lines.join("\n")
 }
 
-fn fallback_insight(execution: &ExecutionOutput) -> InsightResult {
+fn fallback_insight(execution: Option<&ExecutionOutput>) -> InsightResult {
+    let Some(execution) = execution else {
+        return InsightResult {
+            boundary_check: BoundaryCheck {
+                crossed: false,
+                violations: vec![],
+                analysis: "say-only round, no execution to check".into(),
+            },
+            goal_alignment: GoalAlignment {
+                aligned: true,
+                deviation: None,
+                analysis: "no execution, goal alignment n/a (conversation round)".into(),
+            },
+            growth_check: GrowthCheck {
+                growth_detected: false,
+                growth_type: None,
+                analysis: "no execution, no growth signal".into(),
+            },
+            needs_followup: false,
+            followup_hint: None,
+        };
+    };
     let has_failures = execution
         .node_results
         .iter()
@@ -677,7 +709,7 @@ mod tests {
             status: ExecutionStatus::Failure,
         };
 
-        let prompt = build_insight_prompt("turn-1", "test goal", &[], &execution, &[], None);
+        let prompt = build_insight_prompt("turn-1", "test goal", &[], Some(&execution), &[], None);
         assert!(prompt.contains("test goal"));
         assert!(prompt.contains("Failure"));
         assert!(prompt.contains("n1"));
@@ -727,7 +759,14 @@ mod tests {
             ),
         ];
 
-        let prompt = build_insight_prompt("turn-1", "test goal", &[], &execution, &snapshot, None);
+        let prompt = build_insight_prompt(
+            "turn-1",
+            "test goal",
+            &[],
+            Some(&execution),
+            &snapshot,
+            None,
+        );
         assert!(prompt.contains("Agent Pool Status"));
         assert!(prompt.contains("Total agents in pool: 3"));
         assert!(prompt.contains("execution=1"));
@@ -781,7 +820,7 @@ mod tests {
             status: ExecutionStatus::Failure,
         };
 
-        let result = fallback_insight(&execution);
+        let result = fallback_insight(Some(&execution));
         assert!(result.boundary_check.crossed);
         assert!(!result.goal_alignment.aligned);
         assert!(result.growth_check.growth_detected);
@@ -807,7 +846,7 @@ mod tests {
             status: ExecutionStatus::Success,
         };
 
-        let result = fallback_insight(&execution);
+        let result = fallback_insight(Some(&execution));
         assert!(!result.boundary_check.crossed);
         assert!(result.goal_alignment.aligned);
         assert!(!result.growth_check.growth_detected);
@@ -843,11 +882,26 @@ mod tests {
             status: ExecutionStatus::PartialFailure,
         };
 
-        let result = fallback_insight(&execution);
+        let result = fallback_insight(Some(&execution));
 
         assert!(!result.boundary_check.crossed);
         assert!(result.goal_alignment.aligned);
         assert!(result.growth_check.growth_detected);
         assert!(result.needs_followup);
+    }
+
+    #[test]
+    fn fallback_insight_none_execution_say_only() {
+        let result = fallback_insight(None);
+        assert!(!result.boundary_check.crossed);
+        assert!(result.goal_alignment.aligned);
+        assert!(!result.growth_check.growth_detected);
+    }
+
+    #[test]
+    fn build_insight_prompt_none_execution_marks_say_only() {
+        let prompt = build_insight_prompt("turn-1", "用户说你好", &[], None, &[], None);
+        assert!(prompt.contains("say-only"), "应标注无执行轮: {prompt}");
+        assert!(prompt.contains("用户说你好"), "goal 应包含 say 内容");
     }
 }

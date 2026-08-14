@@ -341,6 +341,14 @@ pub async fn run_normal(
                 [],
             )
             .ok();
+        app_state
+            .duckdb
+            .execute(
+                "UPDATE agent SET config = '{\"max_turns\": 6}' \
+                 WHERE id = 'agent' AND (config IS NULL OR config = 'null')",
+                [],
+            )
+            .ok();
         tracing::info!("factory: seeded 7 base capabilities + agent tool_caps (shell={shell_id})");
     }
 
@@ -1306,13 +1314,17 @@ async fn spawn_flywheel_echo(
         }
     }
     if state.current_mode == crate::mode_runtime::ModeKind::Unni {
-        let period_done = pool
-            .get_turn_context(turn_id)
-            .await
-            .is_some_and(|ctx| ctx.input_kind == "echo" && ctx.say_published);
-        if period_done {
+        let ctx = pool.get_turn_context(turn_id).await;
+        let period_done = ctx
+            .as_ref()
+            .is_some_and(|c| c.input_kind == "echo" && c.say_published);
+        let say_only_user_round = ctx.as_ref().is_some_and(|c| {
+            c.thinking.decision == crate::agent::communication::ThinkDecision::Reply
+                && c.input_kind == "user"
+        });
+        if period_done || say_only_user_round {
             tracing::info!(
-                "streaming_loop: UNNI period finished (echo round reported via say), \
+                "streaming_loop: UNNI period finished (say-only user round or echo reported), \
                  flywheel stops for thought_id={turn_id}"
             );
             return;
