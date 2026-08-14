@@ -1530,6 +1530,9 @@ impl ExecutionPlatform {
         if let Err(e) = self.pool.send_execution_done(turn_id).await {
             tracing::warn!("execution_platform: send_execution_done failed: {e}");
         }
+        if let Err(e) = self.pool.send_trigger(turn_id, "execution_complete").await {
+            tracing::warn!("execution_platform: send_trigger execution_complete failed: {e}");
+        }
 
         tracing::debug!("execution_platform: turn_id={turn_id} done, ExecutionDone DM sent");
     }
@@ -2534,6 +2537,9 @@ impl ExecutionPlatform {
         if let Err(e) = self.pool.send_execution_done(turn_id).await {
             tracing::warn!("execution_platform: send_execution_done failed: {e}");
         }
+        if let Err(e) = self.pool.send_trigger(turn_id, "execution_complete").await {
+            tracing::warn!("execution_platform: send_trigger execution_complete failed: {e}");
+        }
 
         let occurred_at = UtcTimestamp::now();
         let thought_id = thought_id_from_turn(turn_id);
@@ -2595,6 +2601,9 @@ impl ExecutionPlatform {
         self.pool.set_execution(turn_id, output).await;
         if let Err(e) = self.pool.send_execution_done(turn_id).await {
             tracing::warn!("execution_platform: send_execution_done failed: {e}");
+        }
+        if let Err(e) = self.pool.send_trigger(turn_id, "execution_complete").await {
+            tracing::warn!("execution_platform: send_trigger execution_complete failed: {e}");
         }
     }
 }

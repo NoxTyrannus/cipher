@@ -1,4 +1,5 @@
 use crate::data::duckdb::loader::ModelRow;
+use crate::startup::config::{CollaborationStyle, TriggerNode};
 use crossterm::event::KeyCode;
 use ratatui::layout::Rect;
 use ratatui::Frame;
@@ -23,9 +24,48 @@ const MENU_ITEMS: &[(&str, bool)] = &[
     ("工作区管理", false),
     ("Agent 改名", true),
     ("默认设置", false),
-    ("记忆中台模式", true),
+    ("协同模式风格 (Mode Style)", true),
     ("上下文编辑", false),
 ];
+
+/// 协同模式风格子菜单项（与 /config CLI 的 manage_mode_styles 保持一致）。
+const MODE_STYLE_SUBMENU_LEN: usize = 5;
+
+fn mode_style_options_len(target: usize) -> usize {
+    match target {
+        0 => 2, // UNNI 协同方式
+        1 => 3, // UNNI 协同节点
+        2 => 1, // KEEP Token 预算（占位，暂不可交互）
+        3 => 1, // KEEP 时间预算（占位）
+        4 => 2, // LOOP 融合思考
+        _ => 1,
+    }
+}
+
+/// 由目标项 + 光标位置生成待保存的值。
+fn mode_style_option(target: usize, cursor: usize) -> String {
+    match target {
+        0 => match cursor {
+            0 => CollaborationStyle::Autonomous.as_str().to_string(),
+            _ => CollaborationStyle::Follow.as_str().to_string(),
+        },
+        1 => match cursor {
+            0 => TriggerNode::Execution.as_str().to_string(),
+            1 => TriggerNode::Insight.as_str().to_string(),
+            _ => TriggerNode::Memory.as_str().to_string(),
+        },
+        2 => (100_000u64 + cursor as u64 * 50_000).to_string(),
+        3 => (300u64 + cursor as u64 * 300).to_string(),
+        4 => {
+            if cursor == 0 {
+                "off".to_string()
+            } else {
+                "on".to_string()
+            }
+        }
+        _ => String::new(),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum ActionResult {
@@ -100,7 +140,15 @@ pub enum ConfigView {
 
     SetDefault(SetDefaultSelect),
 
-    MemoryModeSelect {
+    /// 协同模式风格：子菜单（UNNI 协同方式 / UNNI 协同节点 / KEEP 预算 / LOOP 融合思考）。
+    ModeStyleSubMenu {
+        cursor: usize,
+    },
+
+    /// 选择器：统一承载"选中选项 → 提交"。
+    ModeStyleSelect {
+        /// 子菜单中的目标项索引（0=UNNI 协同方式, 1=UNNI 协同节点, 2=KEEP Token, 3=KEEP 时间, 4=LOOP 融合思考）。
+        target: usize,
         cursor: usize,
         submitted: bool,
     },
@@ -155,8 +203,9 @@ pub enum DbRequest {
         model_id: String,
     },
 
-    SaveMemoryMode {
-        mode: String,
+    SaveModeStyle {
+        target: usize,
+        value: String,
     },
 
     SubmitRenameAgent {
@@ -225,14 +274,15 @@ impl ConfigPanel {
                     .unwrap_or_default();
                 DbRequest::SubmitSetDefault { model_id }
             }
-            ConfigView::MemoryModeSelect { cursor, submitted } if *submitted => {
-                let mode = match cursor {
-                    0 => "sync",
-                    1 => "mixed",
-                    _ => "async",
-                };
-                DbRequest::SaveMemoryMode {
-                    mode: mode.to_string(),
+            ConfigView::ModeStyleSelect {
+                target,
+                cursor,
+                submitted,
+            } if *submitted => {
+                let value = mode_style_option(*target, *cursor);
+                DbRequest::SaveModeStyle {
+                    target: *target,
+                    value,
                 }
             }
             ConfigView::RenameAgent(form) if form.submitted => DbRequest::SubmitRenameAgent {
@@ -248,7 +298,7 @@ impl ConfigPanel {
             ConfigView::QuickAdd(f) => f.submitted = false,
             ConfigView::ChangeKey(f) => f.submitted = false,
             ConfigView::SetDefault(s) => s.submitted = false,
-            ConfigView::MemoryModeSelect { submitted, .. } => *submitted = false,
+            ConfigView::ModeStyleSelect { submitted, .. } => *submitted = false,
             ConfigView::RenameAgent(f) => f.submitted = false,
             _ => {}
         }
@@ -318,14 +368,27 @@ impl ConfigPanel {
                 }
                 r
             }
-            ConfigView::MemoryModeSelect {
+            ConfigView::ModeStyleSubMenu { mut cursor } => {
+                let r = self.handle_mode_style_submenu_key(key, &mut cursor);
+
+                if matches!(self.view, ConfigView::Menu) && self.expanded.is_some() {
+                    self.view = ConfigView::ModeStyleSubMenu { cursor };
+                }
+                r
+            }
+            ConfigView::ModeStyleSelect {
+                target,
                 mut cursor,
                 mut submitted,
             } => {
-                let r = self.handle_memory_mode_key(key, &mut cursor, &mut submitted);
+                let r = self.handle_mode_style_select_key(key, &mut cursor, &mut submitted);
 
                 if matches!(self.view, ConfigView::Menu) && self.expanded.is_some() {
-                    self.view = ConfigView::MemoryModeSelect { cursor, submitted };
+                    self.view = ConfigView::ModeStyleSelect {
+                        target,
+                        cursor,
+                        submitted,
+                    };
                 }
                 r
             }
@@ -359,10 +422,7 @@ impl ConfigPanel {
                 if enabled {
                     self.expanded = Some(idx);
                     if idx == 4 {
-                        self.view = ConfigView::MemoryModeSelect {
-                            cursor: 1,
-                            submitted: false,
-                        };
+                        self.view = ConfigView::ModeStyleSubMenu { cursor: 0 };
                     } else if idx == 2 {
                         self.view = ConfigView::RenameAgent(RenameAgentForm::default());
                     } else {
@@ -641,7 +701,40 @@ impl ConfigPanel {
         }
     }
 
-    fn handle_memory_mode_key(
+    fn handle_mode_style_submenu_key(&mut self, key: KeyCode, cursor: &mut usize) -> ActionResult {
+        match key {
+            KeyCode::Up => {
+                if *cursor > 0 {
+                    *cursor -= 1;
+                }
+                ActionResult::Navigate
+            }
+            KeyCode::Down => {
+                if *cursor < MODE_STYLE_SUBMENU_LEN - 1 {
+                    *cursor += 1;
+                }
+                ActionResult::Navigate
+            }
+            KeyCode::Left => {
+                self.view = ConfigView::Menu;
+                self.expanded = None;
+                ActionResult::Navigate
+            }
+            KeyCode::Esc => ActionResult::Exit,
+            KeyCode::Right | KeyCode::Enter => {
+                let target = *cursor;
+                self.view = ConfigView::ModeStyleSelect {
+                    target,
+                    cursor: 0,
+                    submitted: false,
+                };
+                ActionResult::Navigate
+            }
+            _ => ActionResult::Navigate,
+        }
+    }
+
+    fn handle_mode_style_select_key(
         &mut self,
         key: KeyCode,
         cursor: &mut usize,
@@ -655,14 +748,13 @@ impl ConfigPanel {
                 ActionResult::Navigate
             }
             KeyCode::Down => {
-                if *cursor < 2 {
+                if *cursor < mode_style_options_len(self.view_target()) - 1 {
                     *cursor += 1;
                 }
                 ActionResult::Navigate
             }
             KeyCode::Left => {
-                self.view = ConfigView::Menu;
-                self.expanded = None;
+                self.view = ConfigView::ModeStyleSubMenu { cursor: 0 };
                 ActionResult::Navigate
             }
             KeyCode::Esc => ActionResult::Exit,
@@ -671,6 +763,13 @@ impl ConfigPanel {
                 ActionResult::Navigate
             }
             _ => ActionResult::Navigate,
+        }
+    }
+
+    fn view_target(&self) -> usize {
+        match &self.view {
+            ConfigView::ModeStyleSelect { target, .. } => *target,
+            _ => 0,
         }
     }
 
@@ -712,7 +811,8 @@ impl ConfigPanel {
             ConfigView::AddModelSelectTemplate { .. }
             | ConfigView::QuickAddSelectProvider { .. }
             | ConfigView::SetDefault(_)
-            | ConfigView::MemoryModeSelect { .. } => {
+            | ConfigView::ModeStyleSubMenu { .. }
+            | ConfigView::ModeStyleSelect { .. } => {
                 "← 返回上级    ↑↓ 选择    → 确认    Esc 退出设置"
             }
             ConfigView::AddModel(_) | ConfigView::QuickAdd(_) | ConfigView::ChangeKey(_) => {
@@ -772,8 +872,16 @@ pub fn render(panel: &ConfigPanel, frame: &mut Frame, area: Rect) {
             render_form(panel, frame, content_area, &form.fields, form.field_cursor);
         }
         ConfigView::SetDefault(sel) => render_set_default(panel, frame, content_area, sel),
-        ConfigView::MemoryModeSelect { cursor, .. } => {
-            render_memory_mode_select(panel, frame, content_area, *cursor);
+        ConfigView::ModeStyleSubMenu { cursor } => {
+            render_mode_style_submenu(panel, frame, content_area, *cursor);
+        }
+        ConfigView::ModeStyleSelect {
+            target,
+            cursor,
+            submitted,
+        } => {
+            let _ = submitted;
+            render_mode_style_select(panel, frame, content_area, *target, *cursor);
         }
         ConfigView::RenameAgent(form) => {
             render_rename_agent(panel, frame, content_area, form);
@@ -1075,26 +1183,28 @@ fn render_set_default(_panel: &ConfigPanel, frame: &mut Frame, area: Rect, sel: 
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_memory_mode_select(_panel: &ConfigPanel, frame: &mut Frame, area: Rect, cursor: usize) {
+fn render_mode_style_submenu(_panel: &ConfigPanel, frame: &mut Frame, area: Rect, cursor: usize) {
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::Paragraph;
 
-    let options: [(&str, &str); 3] = [
-        ("sync", "同步 — 记忆回音触发续跑 (settle 完成后新实例)"),
-        ("mixed", "混合 — 洞察回音触发 + 有界等待 settle (默认)"),
-        ("async", "异步 — 洞察回音触发, 记忆异步落库按时间戳替换"),
+    let items: [(&str, &str); MODE_STYLE_SUBMENU_LEN] = [
+        ("UNNI 协同方式", "自主 / 跟随"),
+        ("UNNI 协同节点", "执行 / 洞察 / 记忆"),
+        ("KEEP Token 预算", "默认 100K"),
+        ("KEEP 时间预算", "默认 5min"),
+        ("LOOP 融合思考", "开 / 关 (Mix Thinking)"),
     ];
 
     let mut lines: Vec<Line> = vec![
         Line::from(""),
         Line::from(vec![Span::styled(
-            "记忆中台模式 (切换需无飞行消息: UNNI/KEEP 下无实例运行):",
+            "协同模式风格 (UNNI 可配置, KEEP/LOOP 协同方式/节点固定不可设置):",
             Style::default().fg(Color::Gray),
         )]),
         Line::from(""),
     ];
-    for (i, (name, desc)) in options.iter().enumerate() {
+    for (i, (name, desc)) in items.iter().enumerate() {
         let is_sel = cursor == i;
         let style = if is_sel {
             Style::default()
@@ -1109,6 +1219,68 @@ fn render_memory_mode_select(_panel: &ConfigPanel, frame: &mut Frame, area: Rect
             Span::styled(*name, style),
             Span::styled("  ", Style::default()),
             Span::styled(*desc, Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_mode_style_select(
+    _panel: &ConfigPanel,
+    frame: &mut Frame,
+    area: Rect,
+    target: usize,
+    cursor: usize,
+) {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+
+    let (title, options): (&str, Vec<&str>) = match target {
+        0 => (
+            "UNNI 协同方式",
+            vec![
+                CollaborationStyle::Autonomous.label(),
+                CollaborationStyle::Follow.label(),
+            ],
+        ),
+        1 => (
+            "UNNI 协同节点",
+            vec![
+                TriggerNode::Execution.label(),
+                TriggerNode::Insight.label(),
+                TriggerNode::Memory.label(),
+            ],
+        ),
+        2 => ("KEEP Token 预算", vec!["默认 100K (100,000 token)"]),
+        3 => ("KEEP 时间预算", vec!["默认 5min (300 秒)"]),
+        4 => (
+            "LOOP 融合思考 (Mix Thinking)",
+            vec!["关 (顺序触发, 默认)", "开 (流水线并行 + 拼接合并)"],
+        ),
+        _ => ("", vec![]),
+    };
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            format!("{title}:"),
+            Style::default().fg(Color::Gray),
+        )]),
+        Line::from(""),
+    ];
+    for (i, desc) in options.iter().enumerate() {
+        let is_sel = cursor == i;
+        let style = if is_sel {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let marker = if is_sel { "▶" } else { " " };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {} ", marker), style),
+            Span::styled(*desc, style),
         ]));
     }
     frame.render_widget(Paragraph::new(lines), area);
@@ -1184,9 +1356,35 @@ mod tests {
 
         let pending_count = text.matches('(').count();
         assert_eq!(
-            pending_count, 3,
-            "3 disabled items show (待后续), got: {text}"
+            pending_count, 4,
+            "3 disabled items show (待后续) + 1 item title has parens, got: {text}"
         );
+    }
+
+    #[test]
+    fn mode_style_submenu_renders_without_panic() {
+        let mut panel = ConfigPanel::new();
+        panel.expanded = Some(4);
+        panel.view = ConfigView::ModeStyleSubMenu { cursor: 1 };
+        let text = render_to_text(&panel).replace(' ', "");
+        assert!(text.contains("协同模式风格"), "submenu title: {text}");
+        assert!(text.contains("UNNI协同方式"), "item 1: {text}");
+        assert!(text.contains("KEEPToken"), "item 3: {text}");
+        assert!(text.contains("LOOP融合思考"), "item 5: {text}");
+    }
+
+    #[test]
+    fn mode_style_select_renders_without_panic() {
+        let mut panel = ConfigPanel::new();
+        panel.expanded = Some(4);
+        panel.view = ConfigView::ModeStyleSelect {
+            target: 1,
+            cursor: 1,
+            submitted: false,
+        };
+        let text = render_to_text(&panel).replace(' ', "");
+        assert!(text.contains("UNNI协同节点"), "select title: {text}");
+        assert!(text.contains("执行中台"), "option 0: {text}");
     }
 
     #[test]
@@ -1250,7 +1448,7 @@ mod tests {
     }
 
     #[test]
-    fn menu_right_on_memory_mode_enters_select() {
+    fn menu_right_on_mode_style_enters_submenu() {
         let mut p = ConfigPanel::new();
 
         for _ in 0..4 {
@@ -1258,37 +1456,95 @@ mod tests {
         }
         assert_eq!(p.menu_cursor, 4);
         p.handle_key(KeyCode::Right);
-        assert!(matches!(p.view, ConfigView::MemoryModeSelect { .. }));
+        assert!(matches!(p.view, ConfigView::ModeStyleSubMenu { .. }));
         assert_eq!(p.expanded, Some(4));
     }
 
     #[test]
-    fn memory_mode_select_navigates_and_submits() {
+    fn mode_style_submenu_navigates_and_enters_select() {
         let mut p = ConfigPanel::new();
         for _ in 0..4 {
             p.handle_key(KeyCode::Down);
         }
         p.handle_key(KeyCode::Right);
 
+        // 子菜单默认光标 0 → 进入 UNNI 协同方式选择
+        p.handle_key(KeyCode::Enter);
         assert!(matches!(
-            p.pending_db_request(),
-            DbRequest::None | DbRequest::LoadModels
+            p.view,
+            ConfigView::ModeStyleSelect { target: 0, .. }
         ));
+    }
 
-        p.handle_key(KeyCode::Up);
+    #[test]
+    fn mode_style_select_unni_style_submits_autonomous_follow() {
+        let mut p = ConfigPanel::new();
+        p.expanded = Some(4);
+        p.view = ConfigView::ModeStyleSelect {
+            target: 0,
+            cursor: 1,
+            submitted: false,
+        };
         p.handle_key(KeyCode::Enter);
         assert_eq!(
             p.pending_db_request(),
-            DbRequest::SaveMemoryMode {
-                mode: "sync".to_string()
+            DbRequest::SaveModeStyle {
+                target: 0,
+                value: "follow".to_string()
             }
         );
-
         p.clear_db_request();
         assert_eq!(p.pending_db_request(), DbRequest::None);
+    }
 
+    #[test]
+    fn mode_style_select_unni_node_submits() {
+        let mut p = ConfigPanel::new();
+        p.expanded = Some(4);
+        p.view = ConfigView::ModeStyleSelect {
+            target: 1,
+            cursor: 2,
+            submitted: false,
+        };
+        p.handle_key(KeyCode::Enter);
+        assert_eq!(
+            p.pending_db_request(),
+            DbRequest::SaveModeStyle {
+                target: 1,
+                value: "memory".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn mode_style_select_loop_mix_submits() {
+        let mut p = ConfigPanel::new();
+        p.expanded = Some(4);
+        p.view = ConfigView::ModeStyleSelect {
+            target: 4,
+            cursor: 1,
+            submitted: false,
+        };
+        p.handle_key(KeyCode::Enter);
+        assert_eq!(
+            p.pending_db_request(),
+            DbRequest::SaveModeStyle {
+                target: 4,
+                value: "on".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn mode_style_select_left_returns_submenu() {
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::ModeStyleSelect {
+            target: 1,
+            cursor: 0,
+            submitted: false,
+        };
         p.handle_key(KeyCode::Left);
-        assert!(matches!(p.view, ConfigView::Menu));
+        assert!(matches!(p.view, ConfigView::ModeStyleSubMenu { .. }));
     }
 
     #[test]

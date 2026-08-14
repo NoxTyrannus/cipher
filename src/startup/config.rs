@@ -24,7 +24,7 @@ pub struct Config {
     pub default_mode: String,
 
     #[serde(default)]
-    pub memory_mode: MemoryMode,
+    pub mode_styles: ModeStyles,
 
     #[serde(default)]
     pub default_model: Option<String>,
@@ -44,21 +44,224 @@ fn default_mode() -> String {
     "unni".to_string()
 }
 
+/// 协同方式：中台完成触发思考引擎后的行为。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum MemoryMode {
-    Sync,
+pub enum CollaborationStyle {
+    /// 自主：协同节点完成 → 立即触发思考引擎新实例。
     #[default]
-    Mixed,
-    Async,
+    Autonomous,
+    /// 跟随：协同节点完成 → 存为 pending context，等用户下次输入时合并。
+    Follow,
 }
 
-impl MemoryMode {
+impl CollaborationStyle {
     pub fn as_str(self) -> &'static str {
         match self {
-            MemoryMode::Sync => "sync",
-            MemoryMode::Mixed => "mixed",
-            MemoryMode::Async => "async",
+            CollaborationStyle::Autonomous => "autonomous",
+            CollaborationStyle::Follow => "follow",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CollaborationStyle::Autonomous => "自主（立即触发新实例）",
+            CollaborationStyle::Follow => "跟随（存为 pending，等用户下次输入合并）",
+        }
+    }
+}
+
+/// 协同节点：哪个中台完成时触发思考引擎。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TriggerNode {
+    /// 执行中台。
+    #[default]
+    Execution,
+    /// 洞察中台。
+    Insight,
+    /// 记忆中台。
+    Memory,
+}
+
+impl TriggerNode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TriggerNode::Execution => "execution",
+            TriggerNode::Insight => "insight",
+            TriggerNode::Memory => "memory",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TriggerNode::Execution => "执行中台（执行完成即触发，最快）",
+            TriggerNode::Insight => "洞察中台（洞察完成即触发，含执行分析）",
+            TriggerNode::Memory => "记忆中台（记忆完成即触发，洞察+记忆完整沉淀）",
+        }
+    }
+
+    /// 协同节点之后的中台（异步执行，只沉淀记忆不触发）。
+    pub fn async_after(self) -> &'static [TriggerNode] {
+        match self {
+            TriggerNode::Execution => &[TriggerNode::Insight, TriggerNode::Memory],
+            TriggerNode::Insight => &[TriggerNode::Memory],
+            TriggerNode::Memory => &[],
+        }
+    }
+}
+
+/// 单模式协同风格：协同方式 + 协同节点。
+/// 实现形态：形态 B（struct + 每模式默认常量，非 trait）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModeStyle {
+    pub style: CollaborationStyle,
+    pub node: TriggerNode,
+}
+
+impl Default for ModeStyle {
+    fn default() -> Self {
+        Self::UNNI_DEFAULT
+    }
+}
+
+impl ModeStyle {
+    /// UNNI 默认：自主 + 执行中台（用户可配置）。
+    pub const UNNI_DEFAULT: Self = Self {
+        style: CollaborationStyle::Autonomous,
+        node: TriggerNode::Execution,
+    };
+    /// KEEP 固定：自主 + 洞察中台（不存 config，由常量表达）。
+    pub const KEEP_DEFAULT: Self = Self {
+        style: CollaborationStyle::Autonomous,
+        node: TriggerNode::Insight,
+    };
+    /// LOOP 固定：自主 + 记忆中台（不存 config，由常量表达）。
+    pub const LOOP_DEFAULT: Self = Self {
+        style: CollaborationStyle::Autonomous,
+        node: TriggerNode::Memory,
+    };
+}
+
+/// UNNI 协同风格（用户可配置）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnniStyle {
+    #[serde(default = "default_unni_collaboration_style")]
+    pub style: CollaborationStyle,
+    #[serde(default = "default_unni_trigger_node")]
+    pub node: TriggerNode,
+}
+
+fn default_unni_collaboration_style() -> CollaborationStyle {
+    ModeStyle::UNNI_DEFAULT.style
+}
+fn default_unni_trigger_node() -> TriggerNode {
+    ModeStyle::UNNI_DEFAULT.node
+}
+
+impl Default for UnniStyle {
+    fn default() -> Self {
+        Self {
+            style: ModeStyle::UNNI_DEFAULT.style,
+            node: ModeStyle::UNNI_DEFAULT.node,
+        }
+    }
+}
+
+impl From<UnniStyle> for ModeStyle {
+    fn from(u: UnniStyle) -> Self {
+        Self {
+            style: u.style,
+            node: u.node,
+        }
+    }
+}
+
+/// KEEP 附加设置：成本护栏（协同方式/节点固定为 KEEP_DEFAULT）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeepStyle {
+    /// Token 预算：100K ~ ∞（默认 100K）。
+    #[serde(default = "default_keep_token_budget")]
+    pub token_budget: u64,
+    /// 时间预算（秒）：300s ~ ∞（默认 5min）。
+    #[serde(default = "default_keep_time_budget_secs")]
+    pub time_budget_secs: u64,
+}
+
+fn default_keep_token_budget() -> u64 {
+    100_000
+}
+fn default_keep_time_budget_secs() -> u64 {
+    300
+}
+
+impl Default for KeepStyle {
+    fn default() -> Self {
+        Self {
+            token_budget: default_keep_token_budget(),
+            time_budget_secs: default_keep_time_budget_secs(),
+        }
+    }
+}
+
+/// LOOP 附加设置：融合思考开关（协同方式/节点固定为 LOOP_DEFAULT）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopStyle {
+    /// 融合思考（Mix Thinking）开关，默认 off。
+    #[serde(default = "default_loop_mix_thinking")]
+    pub mix_thinking: bool,
+}
+
+fn default_loop_mix_thinking() -> bool {
+    false
+}
+
+impl Default for LoopStyle {
+    fn default() -> Self {
+        Self {
+            mix_thinking: default_loop_mix_thinking(),
+        }
+    }
+}
+
+/// 三模式协同风格配置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModeStyles {
+    #[serde(default = "default_unni_style")]
+    pub unni: UnniStyle,
+    #[serde(default = "default_keep_style")]
+    pub keep: KeepStyle,
+    #[serde(default = "default_loop_style")]
+    pub r#loop: LoopStyle,
+}
+
+fn default_unni_style() -> UnniStyle {
+    UnniStyle::default()
+}
+fn default_keep_style() -> KeepStyle {
+    KeepStyle::default()
+}
+fn default_loop_style() -> LoopStyle {
+    LoopStyle::default()
+}
+
+impl Default for ModeStyles {
+    fn default() -> Self {
+        Self {
+            unni: default_unni_style(),
+            keep: default_keep_style(),
+            r#loop: default_loop_style(),
+        }
+    }
+}
+
+impl ModeStyles {
+    /// 取某模式的协同风格（KEEP/LOOP 返回固定常量，UNNI 返回用户配置）。
+    pub fn style_for(&self, mode: &str) -> ModeStyle {
+        match mode {
+            "keep" => ModeStyle::KEEP_DEFAULT,
+            "loop" => ModeStyle::LOOP_DEFAULT,
+            _ => self.unni.into(),
         }
     }
 }
@@ -141,7 +344,7 @@ impl Config {
             api_key: String::new(),
             data_dir: default_data_dir(),
             default_mode: default_mode(),
-            memory_mode: MemoryMode::default(),
+            mode_styles: ModeStyles::default(),
             default_model: None,
             context: ContextSection::default(),
         }
@@ -349,33 +552,140 @@ mod tests {
     }
 
     #[test]
-    fn memory_mode_defaults_to_mixed() {
-        assert_eq!(MemoryMode::default(), MemoryMode::Mixed);
-        assert_eq!(MemoryMode::Mixed.as_str(), "mixed");
-        assert_eq!(MemoryMode::Sync.as_str(), "sync");
-        assert_eq!(MemoryMode::Async.as_str(), "async");
+    fn mode_styles_defaults() {
+        let m = ModeStyles::default();
+        assert_eq!(m.unni.style, CollaborationStyle::Autonomous);
+        assert_eq!(m.unni.node, TriggerNode::Execution);
+        assert_eq!(m.keep.token_budget, 100_000);
+        assert_eq!(m.keep.time_budget_secs, 300);
+        assert!(!m.r#loop.mix_thinking);
     }
 
     #[test]
-    fn memory_mode_serde_roundtrip_lowercase() {
-        for (mode, text) in [
-            (MemoryMode::Sync, "sync"),
-            (MemoryMode::Mixed, "mixed"),
-            (MemoryMode::Async, "async"),
+    fn mode_style_default_constants() {
+        assert_eq!(ModeStyle::UNNI_DEFAULT.node, TriggerNode::Execution);
+        assert_eq!(ModeStyle::KEEP_DEFAULT.node, TriggerNode::Insight);
+        assert_eq!(ModeStyle::LOOP_DEFAULT.node, TriggerNode::Memory);
+        // 三模式协同方式均为自主
+        assert_eq!(
+            ModeStyle::UNNI_DEFAULT.style,
+            CollaborationStyle::Autonomous
+        );
+        assert_eq!(
+            ModeStyle::KEEP_DEFAULT.style,
+            CollaborationStyle::Autonomous
+        );
+        assert_eq!(
+            ModeStyle::LOOP_DEFAULT.style,
+            CollaborationStyle::Autonomous
+        );
+    }
+
+    #[test]
+    fn style_for_returns_fixed_constants_for_keep_loop() {
+        let m = ModeStyles {
+            unni: UnniStyle {
+                style: CollaborationStyle::Follow,
+                node: TriggerNode::Insight,
+            },
+            ..ModeStyles::default()
+        };
+        // UNNI 用用户配置
+        assert_eq!(m.style_for("unni"), m.unni.into());
+        // KEEP/LOOP 用固定常量，忽略任何配置
+        assert_eq!(m.style_for("keep"), ModeStyle::KEEP_DEFAULT);
+        assert_eq!(m.style_for("loop"), ModeStyle::LOOP_DEFAULT);
+    }
+
+    #[test]
+    fn collaboration_style_serde_roundtrip_lowercase() {
+        for (style, text) in [
+            (CollaborationStyle::Autonomous, "autonomous"),
+            (CollaborationStyle::Follow, "follow"),
         ] {
-            let encoded = serde_json::to_string(&mode).unwrap();
+            let encoded = serde_json::to_string(&style).unwrap();
             assert_eq!(encoded, format!("\"{text}\""), "encode {text}");
-            let decoded: MemoryMode = serde_json::from_str(&format!("\"{text}\"")).unwrap();
-            assert_eq!(decoded, mode, "decode {text}");
+            let decoded: CollaborationStyle = serde_json::from_str(&format!("\"{text}\"")).unwrap();
+            assert_eq!(decoded, style, "decode {text}");
         }
-
-        let cfg: Config = toml::from_str("memory_mode = \"async\"\n").unwrap();
-        assert_eq!(cfg.memory_mode, MemoryMode::Async);
+        assert!(serde_json::from_str::<CollaborationStyle>("\"quantum\"").is_err());
     }
 
     #[test]
-    fn memory_mode_unknown_value_fails_parse() {
-        assert!(toml::from_str::<MemoryMode>("quantum").is_err());
+    fn trigger_node_serde_roundtrip_lowercase() {
+        for (node, text) in [
+            (TriggerNode::Execution, "execution"),
+            (TriggerNode::Insight, "insight"),
+            (TriggerNode::Memory, "memory"),
+        ] {
+            let encoded = serde_json::to_string(&node).unwrap();
+            assert_eq!(encoded, format!("\"{text}\""), "encode {text}");
+            let decoded: TriggerNode = serde_json::from_str(&format!("\"{text}\"")).unwrap();
+            assert_eq!(decoded, node, "decode {text}");
+        }
+        assert!(serde_json::from_str::<TriggerNode>("\"quantum\"").is_err());
+    }
+
+    #[test]
+    fn trigger_node_async_after_semantics() {
+        // 协同节点后的中台异步执行，只沉淀记忆不触发
+        assert_eq!(
+            TriggerNode::Execution.async_after(),
+            &[TriggerNode::Insight, TriggerNode::Memory]
+        );
+        assert_eq!(TriggerNode::Insight.async_after(), &[TriggerNode::Memory]);
+        assert_eq!(TriggerNode::Memory.async_after(), &[]);
+    }
+
+    #[test]
+    fn mode_styles_toml_roundtrip() {
+        // 默认值在 config.toml 中可省略
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.mode_styles.unni.style, CollaborationStyle::Autonomous);
+        assert_eq!(cfg.mode_styles.unni.node, TriggerNode::Execution);
+        assert_eq!(cfg.mode_styles.keep.token_budget, 100_000);
+        assert!(!cfg.mode_styles.r#loop.mix_thinking);
+
+        // 显式配置 roundtrip
+        let explicit = r#"
+            [mode_styles.unni]
+            style = "follow"
+            node = "insight"
+            [mode_styles.keep]
+            token_budget = 200000
+            time_budget_secs = 600
+            [mode_styles.loop]
+            mix_thinking = true
+        "#;
+        let cfg: Config = toml::from_str(explicit).unwrap();
+        assert_eq!(cfg.mode_styles.unni.style, CollaborationStyle::Follow);
+        assert_eq!(cfg.mode_styles.unni.node, TriggerNode::Insight);
+        assert_eq!(cfg.mode_styles.keep.token_budget, 200_000);
+        assert_eq!(cfg.mode_styles.keep.time_budget_secs, 600);
+        assert!(cfg.mode_styles.r#loop.mix_thinking);
+
+        let serialized = toml::to_string(&cfg.mode_styles).unwrap();
+        let decoded: ModeStyles = toml::from_str(&serialized).unwrap();
+        assert_eq!(decoded, cfg.mode_styles);
+    }
+
+    #[test]
+    fn keep_style_defaults() {
+        let b = KeepStyle::default();
+        assert_eq!(b.token_budget, 100_000);
+        assert_eq!(b.time_budget_secs, 300);
+    }
+
+    #[test]
+    fn loop_style_defaults() {
+        assert!(!LoopStyle::default().mix_thinking);
+    }
+
+    #[test]
+    fn mode_styles_unknown_value_fails_parse() {
+        assert!(toml::from_str::<ModeStyles>("unni = { style = \"quantum\" }").is_err());
+        assert!(toml::from_str::<ModeStyles>("unni = { node = \"quantum\" }").is_err());
+        assert!(toml::from_str::<ModeStyles>("keep = { token_budget = -1 }").is_err());
     }
 
     #[test]
@@ -406,7 +716,13 @@ mod tests {
             api_key: "sk-test-roundtrip".into(),
             data_dir: PathBuf::from("/tmp/data"),
             default_mode: "keep".into(),
-            memory_mode: MemoryMode::Mixed,
+            mode_styles: ModeStyles {
+                unni: UnniStyle {
+                    style: CollaborationStyle::Follow,
+                    node: TriggerNode::Insight,
+                },
+                ..ModeStyles::default()
+            },
             default_model: None,
             context: ContextSection::default(),
         };
@@ -417,6 +733,9 @@ mod tests {
         assert_eq!(loaded.api_key, "sk-test-roundtrip");
         assert_eq!(loaded.data_dir, PathBuf::from("/tmp/data"));
         assert_eq!(loaded.default_mode, "keep");
+        assert_eq!(loaded.mode_styles.unni.style, CollaborationStyle::Follow);
+        assert_eq!(loaded.mode_styles.unni.node, TriggerNode::Insight);
+        assert_eq!(loaded.mode_styles.keep, KeepStyle::default());
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -439,7 +758,7 @@ mod tests {
             api_key: "z".into(),
             data_dir: PathBuf::from("."),
             default_mode: "unni".into(),
-            memory_mode: MemoryMode::default(),
+            mode_styles: ModeStyles::default(),
             default_model: None,
             context: ContextSection::default(),
         };

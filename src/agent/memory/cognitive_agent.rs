@@ -254,6 +254,9 @@ impl CognitiveAgent {
                     crate::agent::thought::ThinkingInput::ModeTrigger { reason, .. } => {
                         truncate_text(reason, 60)
                     }
+                    crate::agent::thought::ThinkingInput::ReflectOnly { summary } => {
+                        truncate_text(summary, 60)
+                    }
                 };
                 let output = ctx
                     .output

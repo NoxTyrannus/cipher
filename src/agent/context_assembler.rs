@@ -470,6 +470,9 @@ fn parsed_thinking_input(input: ThinkingInput) -> ParsedMessage {
         ThinkingInput::ModeTrigger { mode, reason } => {
             parsed_message("system", format!("[mode trigger: {mode}]\n{reason}"))
         }
+        ThinkingInput::ReflectOnly { summary } => {
+            parsed_message("system", format!("[融合思考反思]\n{summary}"))
+        }
         ThinkingInput::CapabilityResult {
             capability_id,
             capability_name,

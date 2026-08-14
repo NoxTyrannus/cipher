@@ -85,6 +85,11 @@ pub enum ThinkingInput {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         artifact_refs: Vec<String>,
     },
+    /// 融合思考（Mix Thinking）的中间反思实例：think 后不触发执行/洞察/记忆链，
+    /// 只产出 think 文本，供下一阶段拼接（同一思考引擎，上下文逐步累积）。
+    ReflectOnly {
+        summary: String,
+    },
     ModeTrigger {
         mode: String,
         reason: String,
