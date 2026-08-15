@@ -1,4 +1,4 @@
-use crate::agent::thought::ThoughtId;
+use crate::common::types::ThoughtId;
 use crate::common::{AgentError, Result, UtcTimestamp};
 use serde::Serialize;
 use std::fs;
