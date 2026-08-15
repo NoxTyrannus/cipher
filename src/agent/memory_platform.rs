@@ -37,7 +37,7 @@ pub struct MemoryPlatform {
 
     triviumdb_path: Option<PathBuf>,
 
-    shared_trivium: Option<Arc<tokio::sync::Mutex<TriviumDb>>>,
+    shared_trivium: Option<Arc<std::sync::Mutex<TriviumDb>>>,
 
     memory_db: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
 
@@ -63,7 +63,7 @@ impl MemoryPlatform {
         model_row: ModelRow,
         api_key: SecretString,
         triviumdb_path: Option<PathBuf>,
-        shared_trivium: Option<Arc<tokio::sync::Mutex<TriviumDb>>>,
+        shared_trivium: Option<Arc<std::sync::Mutex<TriviumDb>>>,
         memory_db: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
         prompts_dir: Option<PathBuf>,
         registry: Option<Registry>,
@@ -419,13 +419,19 @@ fn retired_focus_from_trace(
 }
 
 async fn rag_retrieve(
-    shared_trivium: Option<&Arc<tokio::sync::Mutex<TriviumDb>>>,
+    shared_trivium: Option<&Arc<std::sync::Mutex<TriviumDb>>>,
     triviumdb_path: Option<&Path>,
     memory_type: &str,
     limit: usize,
 ) -> String {
     if let Some(shared) = shared_trivium {
-        let db = shared.lock().await;
+        let db = match shared.lock() {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::warn!("memory_platform: triviumdb lock poisoned: {e}");
+                return String::new();
+            }
+        };
         return rag_retrieve_with_db(&db, memory_type, limit);
     }
     let db_path = match triviumdb_path {
@@ -517,13 +523,19 @@ fn format_memory_entry(memory_type: &str, payload: &serde_json::Value) -> String
 
 #[cfg(test)]
 async fn write_to_triviumdb<T: serde::Serialize>(
-    shared_trivium: Option<&Arc<tokio::sync::Mutex<TriviumDb>>>,
+    shared_trivium: Option<&Arc<std::sync::Mutex<TriviumDb>>>,
     triviumdb_path: Option<&Path>,
     memory_type: &str,
     fragments: &[T],
 ) {
     if let Some(shared) = shared_trivium {
-        let mut db = shared.lock().await;
+        let mut db = match shared.lock() {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::warn!("memory_platform: triviumdb lock poisoned: {e}");
+                return;
+            }
+        };
         write_to_triviumdb_with_db(&mut db, memory_type, fragments);
         return;
     }
@@ -723,7 +735,7 @@ pub async fn run(
     model_row: ModelRow,
     api_key: SecretString,
     triviumdb_path: Option<PathBuf>,
-    shared_trivium: Option<Arc<tokio::sync::Mutex<TriviumDb>>>,
+    shared_trivium: Option<Arc<std::sync::Mutex<TriviumDb>>>,
     memory_db: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
     prompts_dir: Option<PathBuf>,
     registry: Option<Registry>,

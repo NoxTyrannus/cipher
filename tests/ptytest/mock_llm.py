@@ -103,6 +103,11 @@ class MockState:
         self.upstream = None
         self.cursor = 0  # 当前脚本条目
         self.used_in_entry = 0  # 当前条目已消费次数
+        self.platform_script = [
+            e for e in self.scenario if e.get("match", {}).get("kind") == "platform"
+        ]
+        self.platform_cursor = 0
+        self.platform_used_in_entry = 0
         self.lock = threading.Lock()
         self.latency_ms = 0
         if isinstance(raw, dict):
@@ -125,6 +130,29 @@ class MockState:
         if "content_contains" in m and m["content_contains"] not in full_text:
             return False
         return True
+
+    def next_platform_response(self, full_text):
+        """按 scenario 中 kind=platform 的条目顺序消费（支持 content_contains 和 respond 列表）。
+
+        只消费与当前平台请求匹配的条目；不匹配时返回 None，调用方使用默认垃圾响应。
+        """
+        with self.lock:
+            while self.platform_cursor < len(self.platform_script):
+                entry = self.platform_script[self.platform_cursor]
+                match = entry.get("match", {})
+                if "content_contains" in match and match["content_contains"] not in full_text:
+                    return "platform", None
+                self.platform_used_in_entry += 1
+                count = entry.get("count", 1)
+                used = self.platform_used_in_entry
+                if used >= count:
+                    self.platform_cursor += 1
+                    self.platform_used_in_entry = 0
+                respond = entry.get("respond")
+                if isinstance(respond, list):
+                    respond = respond[min(used - 1, len(respond) - 1)]
+                return entry.get("kind_label", "platform"), respond
+            return "platform", None
 
     def next_response(self, kind, mode, full_text):
         """返回 (kind_label, respond_dict or None)。None 表示用默认。
@@ -320,14 +348,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if kind == "platform":
-            # 平台调用：返回垃圾（各中台 fallback 后仍会触发完成事件）
-            respond = None
-            # 若脚本想指定平台响应，也可支持
-            if self.state.scenario:
-                for entry in self.state.scenario:
-                    if entry.get("match", {}).get("kind") == "platform":
-                        respond = entry.get("respond")
-                        break
+            # 平台调用：默认返回垃圾（各中台 fallback 后仍会触发完成事件）；
+            # 若 scenario 配置了 kind=platform 条目，则按顺序消费。
+            _, respond = self.state.next_platform_response(text)
             if respond:
                 if respond.get("type") == "http_error":
                     status = int(respond.get("status", 500))

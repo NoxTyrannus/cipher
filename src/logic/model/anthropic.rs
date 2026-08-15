@@ -279,7 +279,7 @@ impl LlmProvider for AnthropicProvider {
     async fn call(&self, req: &LlmRequest) -> Result<LlmResponse> {
         if req.api_url.is_empty() {
             return Err(crate::common::AgentError::Llm(
-                "anthropic: req.api_url is empty (model.api_url required, per ADR-131)".to_string(),
+                "anthropic: req.api_url is empty (model.api_url required)".to_string(),
             ));
         }
         let base_url = req.api_url.clone();
@@ -289,8 +289,7 @@ impl LlmProvider for AnthropicProvider {
             .map(|s| s.expose_secret().to_string())
             .ok_or_else(|| {
                 crate::common::AgentError::Llm(
-                    "anthropic: req.api_key is None (model.api_key required, per ADR-131)"
-                        .to_string(),
+                    "anthropic: req.api_key is None (model.api_key required)".to_string(),
                 )
             })?;
         let url = format!("{}/v1/messages", base_url);
@@ -373,7 +372,7 @@ impl LlmProvider for AnthropicProvider {
     ) -> Result<LlmResponse> {
         if req.api_url.is_empty() {
             return Err(crate::common::AgentError::Llm(
-                "anthropic: req.api_url is empty (model.api_url required, per ADR-131)".to_string(),
+                "anthropic: req.api_url is empty (model.api_url required)".to_string(),
             ));
         }
         let base_url = req.api_url.clone();
@@ -383,8 +382,7 @@ impl LlmProvider for AnthropicProvider {
             .map(|s| s.expose_secret().to_string())
             .ok_or_else(|| {
                 crate::common::AgentError::Llm(
-                    "anthropic: req.api_key is None (model.api_key required, per ADR-131)"
-                        .to_string(),
+                    "anthropic: req.api_key is None (model.api_key required)".to_string(),
                 )
             })?;
         let url = format!("{}/v1/messages", base_url);

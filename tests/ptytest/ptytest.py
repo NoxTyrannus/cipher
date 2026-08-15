@@ -57,6 +57,7 @@ REAL_INPUTS = {
     "V5": "在当前工作目录创建文件 cipher_real_v5.txt，写入一行内容 real-ok-v5，然后执行完成即可",
     "V6": "在当前工作目录创建文件 cipher_real_v6.txt，写入一行内容 real-ok-v6，然后执行完成即可",
     "V7": "在当前工作目录创建文件 cipher_real_v7.txt，写入一行内容 real-ok-v7，然后执行完成即可",
+    "V12": "在当前工作目录创建文件 cipher_real_v12.txt，写入一行内容 real-ok-v12，然后执行完成即可",
     "V2b": "继续：在当前工作目录创建文件 cipher_real_v2b.txt，写入一行内容 real-ok-v2b，然后执行完成即可",
 }
 
@@ -769,6 +770,47 @@ def v9_compat_tab(root):
     return finalize("V9", results, mock, sess, extra=log1 + log2)
 
 
+def v12_memory_tool_chain(root):
+    """注意力 agent 服务层能力调用链：memory.list → attention.write → done。
+
+    mock 模式下由 platform 脚本确定性驱动；真实 API 模式由 MiniMax-M3 实际调用能力。
+    """
+    mock = Mock(root, {
+        "script": [
+            {"match": {"kind": "user"}, "respond": {"type": "output", "think": "V12 记忆工具链任务", "say": None}},
+            {"match": {"kind": "echo"}, "respond": {"type": "output", "think": None, "say": "V12 记忆工具链完成。"}},
+            {"match": {"kind": "platform", "content_contains": "你是注意力记忆 agent"}, "respond": {"type": "output", "content": "{\"tool_call\":{\"name\":\"memory.list\",\"arguments\":{\"memory_type\":\"attention\"}}}"}},
+            {"match": {"kind": "platform", "content_contains": "你是注意力记忆 agent"}, "respond": {"type": "output", "content": "{\"tool_call\":{\"name\":\"memory.attention.write\",\"arguments\":{\"entries\":[{\"focus\":\"V12注意\",\"content\":\"记忆工具链已写入\",\"source_refs\":[\"mock-turn-v12\"]}]}}}"}},
+            {"match": {"kind": "platform", "content_contains": "你是注意力记忆 agent"}, "respond": {"type": "output", "content": "{\"done\":true,\"summary\":\"v12 memory tool chain done\"}"}},
+        ],
+        "default": {"type": "output", "think": None, "say": "（默认）本轮完成。"},
+    })
+    sess = Session(root, cfg_toml(mock.port, root))
+    insert_model(root, mock.port)
+    sess.launch()
+    ok, log = sess.wait_startup()
+    if not ok:
+        return report_fail("V12", "启动失败", mock, sess, log)
+
+    sess.type_text(real_in("V12", "V12 记忆工具链任务"))
+    sess.enter()
+    if not wait_request_count(mock, "user", 1):
+        return report_fail("V12", "未收到用户请求", mock, sess, "")
+    if not wait_request_count(mock, "echo", 1, 60):
+        return report_fail("V12", "记忆完成后未触发 echo", mock, sess, "")
+    ok_list, log1 = sess.wait_log(r"memory_platform attention-agent: OK memory\.list", 30)
+    ok_write, log2 = sess.wait_log(r"memory_platform attention-agent: OK memory\.attention\.write", 30)
+    ok_done, log3 = sess.wait_log(r"memory_platform attention-agent: DONE:", 30)
+    results = {
+        "memory_list_tool_call": PASS if ok_list else FAIL,
+        "attention_write_tool_call": PASS if ok_write else FAIL,
+        "attention_agent_done": PASS if ok_done else FAIL,
+    }
+    sess.quit()
+    mock.stop()
+    return finalize("V12", results, mock, sess, extra=log1 + log2 + log3)
+
+
 def v10_retry_backoff(root):
     """缺陷2 配套：思考实例限流（429）→ 指数退避重试 → 成功落库 → final 拼接完整。"""
     mock = Mock(root, {
@@ -937,6 +979,7 @@ def main():
         ("V9", v9_compat_tab),
         ("V10", v10_retry_backoff),
         ("V11", v11_permanent_error_degrade),
+        ("V12", v12_memory_tool_chain),
     ]
     if only:
         scenarios = [s for s in scenarios if s[0] in only]

@@ -23,7 +23,7 @@ pub struct CapabilityExecutor {
     registry: HashMap<String, Arc<dyn BaseCapability>>,
     host_context: HostContext,
     duckdb: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
-    triviumdb: Option<Arc<tokio::sync::Mutex<TriviumDb>>>,
+    triviumdb: Option<Arc<std::sync::Mutex<TriviumDb>>>,
     thought_store: Option<Arc<ThoughtStore>>,
     reload_tx: Option<mpsc::Sender<ReloadEvent>>,
 }
@@ -95,7 +95,7 @@ impl CapabilityExecutor {
         self.duckdb = Some(db);
     }
 
-    pub fn set_triviumdb(&mut self, db: Arc<tokio::sync::Mutex<TriviumDb>>) {
+    pub fn set_triviumdb(&mut self, db: Arc<std::sync::Mutex<TriviumDb>>) {
         self.triviumdb = Some(db);
     }
 
@@ -140,7 +140,11 @@ impl CapabilityExecutor {
         let db = self.triviumdb.as_ref().ok_or_else(|| {
             AgentError::NotFound("memory capability: triviumdb not configured".into())
         })?;
-        let mut guard = db.blocking_lock();
+        let mut guard = db.lock().map_err(|e| {
+            AgentError::Script(format!(
+                "builtin {builtin_name}: triviumdb lock poisoned: {e}"
+            ))
+        })?;
         let raw = match builtin_name {
             "memory.list" => super::memory::memory_list(&guard, input),
             "memory.retrieve" => super::memory::memory_retrieve(&guard, input),

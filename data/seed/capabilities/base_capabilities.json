@@ -996,6 +996,9 @@
           "items": {
             "type": "object"
           }
+        },
+        "grant_to_agent": {
+          "type": "string"
         }
       }
     },
@@ -1010,6 +1013,12 @@
         },
         "error": {
           "type": "string"
+        },
+        "granted_to_agent": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },

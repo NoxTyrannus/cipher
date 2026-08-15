@@ -10,8 +10,7 @@ pub fn resolve_api_key(model_row: &ModelRow) -> Result<SecretString, AgentError>
     }
 
     Err(AgentError::StartupFailed(
-        "model.api_key is empty or None (per ADR-130 设计点 16 整体落盘; \
-         iter64+ NOVA_AGENT_ARK_API_KEY env fallback 已作废 — 请通过 init_flow 首启引导或 /config slash 填入)"
+        "model.api_key is empty or None — 请通过首次启动引导或 /config 填入有效 API key"
             .to_string(),
     ))
 }

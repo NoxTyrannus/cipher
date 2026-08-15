@@ -48,13 +48,10 @@ fn string_field<'a>(row: &'a Value, field: &str) -> Result<&'a str, String> {
 }
 
 fn validate_schema_json(value: &Value, field: &str) -> Result<(), String> {
-    let Ok(schema) = serde_json::from_value::<serde_json::Value>(value.clone()) else {
-        return Err(format!("capability.import: {field} is not valid JSON"));
-    };
-    if !schema.is_object() {
+    if !value.is_object() {
         return Err(format!("capability.import: {field} must be an object"));
     }
-    jsonschema::validator_for(&schema)
+    jsonschema::validator_for(value)
         .map_err(|_| format!("capability.import: {field} is not a valid JSON Schema"))?;
     Ok(())
 }
@@ -177,6 +174,36 @@ pub fn capability_import(
         insert_usage(conn, row).map_err(|e| e.to_string())?;
     }
 
+    // 3) 可选授权：导入的能力同时授予指定 agent（自迭代闭环）。
+    let grant_to_agent = args.get("grant_to_agent").and_then(|v| v.as_str());
+    if let Some(agent_id) = grant_to_agent.filter(|s| !s.trim().is_empty()) {
+        let mut caps: Vec<String> = imported_base
+            .iter()
+            .filter_map(|row| {
+                row.get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .chain(imported_comp.iter().filter_map(|(row, _)| {
+                row.get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            }))
+            .collect();
+        for cap in load_agent_tool_caps(conn, agent_id)? {
+            if !caps.iter().any(|c| c == &cap) {
+                caps.push(cap);
+            }
+        }
+        let caps_json = serde_json::to_string(&caps)
+            .map_err(|e| format!("capability.import: serialize grants: {e}"))?;
+        conn.execute(
+            "UPDATE agent SET tool_caps = CAST(? AS JSON) WHERE id = ?",
+            duckdb::params![caps_json, agent_id],
+        )
+        .map_err(|e| format!("capability.import: grant to {agent_id}: {e}"))?;
+    }
+
     if let Some(tx) = reload_tx {
         let _ = tx.try_send(
             crate::logic::capability::executor::ReloadEvent::CapabilityTable(
@@ -188,10 +215,14 @@ pub fn capability_import(
                 "composite_capability".to_string(),
             ),
         );
+        if grant_to_agent.is_some() {
+            let _ = tx.try_send(crate::logic::capability::executor::ReloadEvent::Agent);
+        }
     }
 
     Ok(serde_json::json!({
         "success": true,
+        "granted_to_agent": grant_to_agent,
         "imported": {
             "base_capabilities": imported_base.len(),
             "composite_capabilities": imported_comp.len(),
@@ -215,6 +246,21 @@ fn existing_executable_ids(conn: &duckdb::Connection) -> Result<HashSet<String>,
         }
     }
     Ok(ids)
+}
+
+fn load_agent_tool_caps(conn: &duckdb::Connection, agent_id: &str) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT CAST(tool_caps AS VARCHAR) FROM agent WHERE id = ?")
+        .map_err(|e| format!("capability.import prepare agent caps: {e}"))?;
+    let mut rows = stmt
+        .query_map([agent_id], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("capability.import query agent caps: {e}"))?;
+    let Some(row) = rows.next() else {
+        return Ok(Vec::new());
+    };
+    let text = row.map_err(|e| format!("capability.import read agent caps: {e}"))?;
+    serde_json::from_str::<Vec<String>>(&text)
+        .map_err(|e| format!("capability.import parse agent caps: {e}"))
 }
 
 fn insert_base(conn: &duckdb::Connection, row: &Value) -> Result<(), AgentError> {
@@ -393,5 +439,35 @@ mod tests {
         .unwrap();
         assert_eq!(out["success"], true);
         assert_eq!(out["imported"]["composite_capabilities"], 1);
+    }
+
+    #[test]
+    fn import_grants_to_agent() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        crate::data::duckdb::schema::create_all_tables(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO agent (id,name,mode,tool_caps,is_default) VALUES ('agent','Agent','unni','[]',true);",
+        )
+        .unwrap();
+        let out = capability_import(
+            &conn,
+            &None,
+            &serde_json::json!({
+                "grant_to_agent": "agent",
+                "base_capabilities": [{
+                    "id": "echo.test",
+                    "name": "Echo Test",
+                    "description": "echo",
+                    "schema_in": {"type":"object"},
+                    "schema_out": {"type":"object"},
+                    "executor": "builtin:shell.exec",
+                    "version": "1.0.0"
+                }]
+            }),
+        )
+        .unwrap();
+        assert_eq!(out["success"], true);
+        let caps = load_agent_tool_caps(&conn, "agent").unwrap();
+        assert!(caps.contains(&"echo.test".to_string()));
     }
 }

@@ -41,7 +41,7 @@ fn init_tracing() {
         .try_init();
 }
 
-const LEGACY_DEFAULT_PROMPT_SHA256: [(&str, &str); 4] = [
+const LEGACY_DEFAULT_PROMPT_SHA256: [(&str, &str); 14] = [
     (
         "system.md",
         "a3e6f5e733ad55b953092b7f2b980d28540e2c18970615cd2fe6eac23ff3ebd4",
@@ -57,6 +57,47 @@ const LEGACY_DEFAULT_PROMPT_SHA256: [(&str, &str); 4] = [
     (
         "mode_loop.md",
         "8df327d53f1cb7c672ee25667d8b4f4cfd1e42463d1ca578fae50c2828722afd",
+    ),
+    // v0.2.6 出厂版本（本轮 v0.3.0 提示词重构前的旧默认值）
+    (
+        "system.md",
+        "0b58bb08ab4401da0dc577cd56c357ffc81bf1d3c3406c5eb112111d4230ebf3",
+    ),
+    (
+        "mode_unni.md",
+        "225b9b8f80749d27296664df11eeee2dbf9b17179c00d812f1d5b4c0b38b5e0a",
+    ),
+    (
+        "mode_keep.md",
+        "8f109418b5bf46df6fa5b851386a6a68411137c0a0e93a83cb50b67de66631b6",
+    ),
+    (
+        "mode_loop.md",
+        "32e5818ede42ea5fff031a9d2f27ddb2fb4fd4aad818c02882a4de70e4c6c2c8",
+    ),
+    (
+        "execution_platform.md",
+        "b823ae4de996af91ff4e3ea3cadbcf62574a53c2677f1e3282788c15da08cb7f",
+    ),
+    (
+        "insight_platform.md",
+        "12f80b0dbd7af353874a781235ed018d7f595dd943ca12210d2bddaf7f556ca8",
+    ),
+    (
+        "memory_attention.md",
+        "6ad9bb4811b7c859b620daf515f64434e8aa9d63fea3084cd93474d30f0d5148",
+    ),
+    (
+        "memory_experience.md",
+        "ba41710538354e05e791034907c14e0b851a8cab6412bb57b5e90e4e1dcdd264",
+    ),
+    (
+        "memory_preference.md",
+        "fc6b7fca92ba9da97847d367275fe869a15809da0197718ac8dbb01afdfe7e81",
+    ),
+    (
+        "memory_cognitive.md",
+        "61a00a1086ae32931b54b5b14c952c303dc2a7effd9f6cc9f200b30961524e74",
     ),
 ];
 
@@ -247,7 +288,7 @@ pub async fn run_normal(
     let triviumdb_dir = app_state.paths.triviumdb_dir();
     crate::data::permissions::ensure_private_directory(&triviumdb_dir)?;
     let triviumdb_path = app_state.paths.triviumdb();
-    let trivium_db = std::sync::Arc::new(tokio::sync::Mutex::new(
+    let trivium_db = std::sync::Arc::new(std::sync::Mutex::new(
         crate::data::triviumdb::TriviumDb::open(
             &triviumdb_path,
             crate::data::triviumdb::DEFAULT_DIM,
@@ -256,7 +297,9 @@ pub async fn run_normal(
     ));
 
     {
-        let mut db_guard = trivium_db.lock().await;
+        let mut db_guard = trivium_db.lock().map_err(|e| {
+            AgentError::Bootstrap(format!("TriviumDB lock for cognitive seed: {e}"))
+        })?;
         crate::data::cognitive_seed::seed_cognitive_memory(&config.data_dir, &mut db_guard)
             .map_err(|e| AgentError::Bootstrap(format!("cognitive seed: {e}")))?;
     }

@@ -19,7 +19,7 @@ pub struct CognitiveAgent {
     provider: Arc<dyn LlmProvider>,
     model_row: ModelRow,
     api_key: Option<SecretString>,
-    triviumdb: Option<Arc<tokio::sync::Mutex<TriviumDb>>>,
+    triviumdb: Option<Arc<std::sync::Mutex<TriviumDb>>>,
     prompts_dir: Option<PathBuf>,
     instance_counter: u64,
     inbox_rx: tokio::sync::mpsc::Receiver<()>,
@@ -39,7 +39,7 @@ impl CognitiveAgent {
         provider: Arc<dyn LlmProvider>,
         model_row: ModelRow,
         api_key: Option<SecretString>,
-        triviumdb: Option<Arc<tokio::sync::Mutex<TriviumDb>>>,
+        triviumdb: Option<Arc<std::sync::Mutex<TriviumDb>>>,
         prompts_dir: Option<PathBuf>,
         inbox_rx: tokio::sync::mpsc::Receiver<()>,
         memory_db: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
@@ -177,7 +177,13 @@ impl CognitiveAgent {
         let Some(db) = &self.triviumdb else {
             return String::new();
         };
-        let db = db.lock().await;
+        let db = match db.lock() {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::warn!("cognitive agent: triviumdb lock poisoned: {e}");
+                return String::new();
+            }
+        };
         let mut lines = Vec::new();
         for id in db.db().get_all_ids() {
             let Some(payload) = db.db().get_payload(id) else {

@@ -24,7 +24,7 @@ impl Mode for LoopMode {
     }
 
     fn description(&self) -> &'static str {
-        "LOOP 模式: 自主目标 + 飞轮迭代, 无硬截断 (per ADR-053)"
+        "LOOP 模式: 自主目标 + 飞轮迭代, 无硬截断"
     }
 
     async fn enter(&mut self, ctx: &mut ModeContext) -> Result<(), AgentError> {
