@@ -52,10 +52,6 @@ futures = "0.3"                                                                 
 # Logic + agent (iter53 2026-06-12, per spec 4 + ADR-059/060/061)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }   # LLM HTTP (stream feature for SSE bytes_stream)
 
-# Script sandbox (iter58 mini-plan 3, per spec 2026-06-12-wasmtime-sandbox)
-wasmtime = "28"                                               # Wasmtime 28 运行时 + JIT + 沙箱 (Plan 3 T1)
-
 [dev-dependencies]
 httptest = "0.15"                                             # mock LLM HTTP 端点 (Plan 1 T2+ reqwest 测试)
 tempfile = "3"                                                # 测试用临时目录 (Config/Init/SelfCheck 集成测试)
-wat = "1"                                                     # WAT 文本 → .wasm 字节, Wasm 沙箱测试 fixture (Plan 3 T1)

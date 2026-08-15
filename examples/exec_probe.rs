@@ -215,7 +215,7 @@ async fn main() -> ExitCode {
     };
 
     let mut executor = cipher::logic::capability::executor::CapabilityExecutor::new();
-    executor.set_wasm(&config.data_dir.join("wasm"), &ws_root);
+    executor.set_workspace_root(&ws_root);
     match duckdb::Connection::open(app_state.paths.duckdb()) {
         Ok(conn) => executor.set_duckdb(Arc::new(std::sync::Mutex::new(conn))),
         Err(e) => {

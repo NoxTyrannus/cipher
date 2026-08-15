@@ -718,11 +718,24 @@ impl ThinkingInstance {
                         persist_error
                     }
                 };
-                if let Err(send_e) = stream_tx2.try_send((id2.clone(), StreamChunk::Error(signal_error.to_string()))) {
-                    tracing::warn!("spawn_streaming: stream_tx2 send error turn_id={}, error={}", id2, send_e);
+                if let Err(send_e) =
+                    stream_tx2.try_send((id2.clone(), StreamChunk::Error(signal_error.to_string())))
+                {
+                    tracing::warn!(
+                        "spawn_streaming: stream_tx2 send error turn_id={}, error={}",
+                        id2,
+                        send_e
+                    );
                 }
-                if let Err(send_e) = pool_tx2.try_send(InstanceOutcome { id: id2.clone(), result: Err(signal_error) }) {
-                    tracing::warn!("spawn_streaming: pool_tx2 send error turn_id={}, error={}", id2, send_e);
+                if let Err(send_e) = pool_tx2.try_send(InstanceOutcome {
+                    id: id2.clone(),
+                    result: Err(signal_error),
+                }) {
+                    tracing::warn!(
+                        "spawn_streaming: pool_tx2 send error turn_id={}, error={}",
+                        id2,
+                        send_e
+                    );
                 }
                 return;
             };

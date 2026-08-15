@@ -443,7 +443,25 @@ fn resolve_node_arguments(
             );
     };
     let mut resolved = arguments.clone();
+    if let Some(input_obj) = input.as_object() {
+        if let Some(object) = resolved.as_object_mut() {
+            let mut merged = input_obj.clone();
+            merged.append(object);
+            *object = merged;
+        }
+    }
+    let snapshot = resolved.clone();
     if let Some(object) = resolved.as_object_mut() {
+        let mut object_value = Value::Object(object.clone());
+        resolve_nested_value(snapshot, input, results, &mut object_value);
+        *object = match object_value {
+            Value::Object(map) => map,
+            other => {
+                let mut map = serde_json::Map::new();
+                map.insert("value".to_string(), other);
+                map
+            }
+        };
         if object.remove("$input").is_some() {
             object.insert("input".to_string(), input.clone());
         }
@@ -454,6 +472,119 @@ fn resolve_node_arguments(
         }
     }
     resolved
+}
+
+fn resolve_nested_value(
+    value: Value,
+    input: &Value,
+    results: &HashMap<&str, Value>,
+    out: &mut Value,
+) {
+    let target_was_string = out.is_string();
+    match value {
+        Value::String(reference) => {
+            if reference.starts_with("$input.") || reference.starts_with("${") {
+                let resolved = if let Some(path) = reference.strip_prefix("$input.") {
+                    json_pointer(input, path)
+                } else if let Some(rest) = reference.strip_prefix("${") {
+                    let Some((node_id, path)) = rest.split_once('}') else {
+                        return;
+                    };
+                    let node_id = node_id.trim();
+                    let Some(output) = results.get(node_id) else {
+                        return;
+                    };
+                    if path.is_empty() {
+                        Some(output.clone())
+                    } else {
+                        json_pointer(output, path.trim_start_matches('.'))
+                    }
+                } else {
+                    None
+                };
+                if let Some(value) = resolved {
+                    if target_was_string && !value.is_string() {
+                        *out = Value::String(value.to_string());
+                    } else {
+                        *out = value;
+                    }
+                }
+            } else if reference.contains("$input.") || reference.contains("${") {
+                *out = Value::String(interpolate_string(&reference, input, results));
+            }
+        }
+        Value::Array(items) => {
+            if let Some(out_items) = out.as_array_mut() {
+                for (idx, item) in items.into_iter().enumerate() {
+                    if let Some(out_item) = out_items.get_mut(idx) {
+                        resolve_nested_value(item, input, results, out_item);
+                    }
+                }
+            }
+        }
+        Value::Object(map) => {
+            if let Some(out_map) = out.as_object_mut() {
+                for (key, item) in map {
+                    if let Some(out_item) = out_map.get_mut(&key) {
+                        resolve_nested_value(item, input, results, out_item);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn interpolate_string(template: &str, input: &Value, results: &HashMap<&str, Value>) -> String {
+    let mut out = template.to_string();
+    for (marker, value) in input_markers(input) {
+        out = out.replace(&marker, &value);
+    }
+    for (node_id, output) in results {
+        for (marker, value) in dependency_markers(node_id, output) {
+            out = out.replace(&marker, &value);
+        }
+    }
+    out
+}
+
+fn input_markers(input: &Value) -> Vec<(String, String)> {
+    let mut markers = Vec::new();
+    if let Some(obj) = input.as_object() {
+        for (key, value) in obj {
+            if let Some(str_value) = value.as_str() {
+                markers.push((format!("$input.{key}"), str_value.to_string()));
+            } else {
+                markers.push((format!("$input.{key}"), value.to_string()));
+            }
+        }
+    }
+    markers
+}
+
+fn dependency_markers(node_id: &str, output: &Value) -> Vec<(String, String)> {
+    let mut markers = Vec::new();
+    if let Some(obj) = output.as_object() {
+        for (key, value) in obj {
+            if let Some(str_value) = value.as_str() {
+                markers.push((format!("${{{node_id}.{key}}}"), str_value.to_string()));
+            } else {
+                markers.push((format!("${{{node_id}.{key}}}"), value.to_string()));
+            }
+        }
+    }
+    markers
+}
+
+fn json_pointer(root: &Value, path: &str) -> Option<Value> {
+    let mut current = root;
+    for part in path.trim_start_matches('.').split('.') {
+        if part.is_empty() {
+            continue;
+        }
+        current = current.get(part)?;
+    }
+    Some(current.clone())
 }
 
 #[cfg(test)]

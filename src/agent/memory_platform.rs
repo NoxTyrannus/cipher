@@ -1,8 +1,9 @@
+use crate::data::duckdb::Registry;
 use crate::data::triviumdb::TriviumDb;
 use crate::data::ModelRow;
-use crate::logic::model::message::{ChatMessage, SystemKind};
+use crate::logic::capability::executor::CapabilityExecutor;
 use crate::logic::model::prompts::read_platform_prompt;
-use crate::logic::model::provider::{LlmProvider, LlmRequest};
+use crate::logic::model::provider::LlmProvider;
 use secrecy::SecretString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,7 +14,9 @@ use super::communication::{
     AgentMessage, AttentionFragment, AttentionRetireBatch, ExecutionOutput, ExperienceFragment,
     InsightOutput, MemoryOutput, NodeStatus,
 };
+use super::memory::tool_agent::{run_tool_loop, ToolLoopRequest};
 
+#[cfg(test)]
 fn extract_json_block(text: &str) -> Option<String> {
     let start = text.find("```json")?;
     let after_start = &text[start + 7..];
@@ -40,6 +43,10 @@ pub struct MemoryPlatform {
 
     prompts_dir: Option<PathBuf>,
 
+    registry: Option<Registry>,
+
+    executor: Option<Arc<CapabilityExecutor>>,
+
     experience_tx: Option<mpsc::Sender<AttentionRetireBatch>>,
 
     preference_tx: Option<mpsc::Sender<AttentionRetireBatch>>,
@@ -59,6 +66,8 @@ impl MemoryPlatform {
         shared_trivium: Option<Arc<tokio::sync::Mutex<TriviumDb>>>,
         memory_db: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
         prompts_dir: Option<PathBuf>,
+        registry: Option<Registry>,
+        executor: Option<Arc<CapabilityExecutor>>,
         experience_tx: Option<mpsc::Sender<AttentionRetireBatch>>,
         preference_tx: Option<mpsc::Sender<AttentionRetireBatch>>,
         cognitive_tx: Option<mpsc::Sender<()>>,
@@ -73,6 +82,8 @@ impl MemoryPlatform {
             shared_trivium,
             memory_db,
             prompts_dir,
+            registry,
+            executor,
             experience_tx,
             preference_tx,
             cognitive_tx,
@@ -167,11 +178,11 @@ impl MemoryPlatform {
             self.shared_trivium.as_ref(),
             self.triviumdb_path.as_deref(),
             "attention",
-            10,
+            100,
         )
         .await;
 
-        let prompt = build_attention_prompt(
+        let attention_prompt = build_attention_prompt(
             &base_prompt,
             &ctx.thinking.goal,
             insight,
@@ -179,105 +190,72 @@ impl MemoryPlatform {
             &existing_attention,
         );
 
-        let messages = vec![
-            ChatMessage::System {
-                text: prompt,
-                kind: SystemKind::Primary,
+        let (Some(registry), Some(executor)) = (&self.registry, &self.executor) else {
+            tracing::warn!(
+                "memory_platform: capability runtime not configured, attention fallback"
+            );
+            let output = fallback_memory(execution);
+            self.finish_turn(turn_id, output).await;
+            return;
+        };
+
+        let tool_catalog = memory_tool_catalog(registry, executor, "attention-agent");
+        let system_prompt = format!(
+            "{attention_prompt}\n\n## 可用能力（服务层能力调用）\n{tool_catalog}\n\n## 输出协议\n             你通过工具调用完成记忆处理。每轮只输出一个 JSON：\n             - 调用能力: {{\"tool_call\":{{\"name\":\"<能力id>\",\"arguments\":{{...}}}}}}\n             - 全部处理完成: {{\"done\":true,\"summary\":\"<本轮处理摘要>\"}}\n\n             规则:\n- 先 memory.list 或 memory.retrieve 查看现有注意力，再决定 write/retire/delete\n             - memory.attention.write 的 source_refs 使用本轮的 thought_id 证据引用\n             - 完成所有记忆操作后必须输出 done\n- 只输出 JSON，不输出解释"
+        );
+
+        let outcome = run_tool_loop(
+            &self.provider,
+            &self.model_row,
+            &self.api_key,
+            registry,
+            executor,
+            ToolLoopRequest {
+                actor_id: "attention-agent".to_string(),
+                system_prompt,
+                user_prompt: format!(
+                    "提取并维护注意力记忆。当前轮 thought_id = {turn_id}，作为 source_refs 证据索引。开始执行。"
+                ),
             },
-            ChatMessage::User {
-                text: "Extract attention memories now. Output ONLY the JSON.".to_string(),
-            },
-        ];
+        )
+        .await;
 
-        let req = match LlmRequest::from_model_row(&self.model_row, messages, self.api_key.clone())
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!(
-                    "memory_platform: failed to build LLM request for turn_id={turn_id}: {e}"
-                );
-                let output = fallback_memory(execution);
-                self.pool.set_memory(turn_id, output).await;
-                self.pool.mark_done(turn_id).await;
-                if let Err(e) = self.pool.send_trigger(turn_id, "memory_complete").await {
-                    tracing::warn!("memory_platform: send_trigger failed: {e}");
+        let (output, retired) = match &outcome {
+            Ok(trace) => {
+                for line in &trace.logs {
+                    tracing::info!("memory_platform attention-agent: {line}");
                 }
-                self.pool
-                    .publish_event("memory_complete", turn_id.to_string());
-                return;
-            }
-        };
-
-        let result = match self.provider.call(&req).await {
-            Ok(resp) => {
-                let output = parse_memory_agent_output(&resp.content);
-                Some(output)
+                if !trace.completed {
+                    tracing::warn!(
+                        "memory_platform: attention-agent did not finish within max_turns ({} calls)",
+                        trace.calls.len()
+                    );
+                }
+                (
+                    attention_output_from_trace(trace),
+                    retired_focus_from_trace(trace),
+                )
             }
             Err(e) => {
-                tracing::error!("memory_platform: LLM call failed for turn_id={turn_id}: {e}");
-                None
+                tracing::warn!("memory_platform: attention-agent loop failed, using fallback: {e}");
+                (fallback_memory(execution), (Vec::new(), Vec::new()))
             }
         };
 
-        let output = match result {
-            Some(agent_output) => {
-                if !agent_output.settle.new_attention.is_empty() {
-                    let attention_count = count_memories(
-                        self.shared_trivium.as_ref(),
-                        self.triviumdb_path.as_deref(),
-                        "attention",
-                    )
-                    .await;
-                    if attention_count >= MAX_ATTENTION_ENTRIES {
-                        tracing::warn!(
-                            "memory_platform: attention 已达上限 {} 条, 拒绝本轮 {} 条新注意力 \
-                             (依赖 retired_focus 淘汰释放; 若持续满需检查淘汰链)",
-                            MAX_ATTENTION_ENTRIES,
-                            agent_output.settle.new_attention.len()
-                        );
-                    } else {
-                        write_to_triviumdb(
-                            self.shared_trivium.as_ref(),
-                            self.triviumdb_path.as_deref(),
-                            "attention",
-                            &agent_output.settle.new_attention,
-                        )
-                        .await;
-                    }
-                }
-
-                self.publish_attention_version(turn_id);
-
-                if !agent_output.settle.retired_focus.is_empty() {
-                    remove_attention_by_focus(
-                        self.shared_trivium.as_ref(),
-                        self.triviumdb_path.as_deref(),
-                        &agent_output.settle.retired_focus,
-                    )
-                    .await;
-                    let batch = AttentionRetireBatch {
-                        retired_focus: agent_output.settle.retired_focus.clone(),
-                    };
-                    if let Some(ref tx) = self.experience_tx {
-                        let _ = tx.try_send(batch.clone());
-                    }
-                    if let Some(ref tx) = self.preference_tx {
-                        let _ = tx.try_send(batch);
-                    }
-                }
-
-                MemoryOutput {
-                    attention: agent_output.settle.new_attention,
-                    experience: vec![],
-                    preference: vec![],
-                    cognitive: vec![],
-                }
+        if !retired.0.is_empty() {
+            let batch = AttentionRetireBatch {
+                retired_focus: retired.0,
+                source_refs: retired.1,
+            };
+            if let Some(ref tx) = self.experience_tx {
+                let _ = tx.try_send(batch.clone());
             }
-            None => {
-                tracing::warn!("memory_platform: LLM failed, using fallback for turn_id={turn_id}");
-                fallback_memory(execution)
+            if let Some(ref tx) = self.preference_tx {
+                let _ = tx.try_send(batch);
             }
-        };
+        }
+
+        self.publish_attention_version(turn_id);
 
         if let Some(ref tx) = self.cognitive_tx {
             let _ = tx.try_send(());
@@ -297,6 +275,16 @@ impl MemoryPlatform {
 }
 
 impl MemoryPlatform {
+    async fn finish_turn(&self, turn_id: &str, output: MemoryOutput) {
+        self.pool.set_memory(turn_id, output).await;
+        self.pool.mark_done(turn_id).await;
+        if let Err(e) = self.pool.send_trigger(turn_id, "memory_complete").await {
+            tracing::warn!("memory_platform: send_trigger failed: {e}");
+        }
+        self.pool
+            .publish_event("memory_complete", turn_id.to_string());
+    }
+
     fn publish_attention_version(&self, turn_id: &str) {
         use crate::agent::memory::memory_version as mv;
         let Some(db) = &self.memory_db else {
@@ -331,6 +319,103 @@ impl MemoryPlatform {
             }
         }
     }
+}
+
+fn memory_tool_catalog(
+    registry: &Registry,
+    executor: &Arc<CapabilityExecutor>,
+    actor_id: &str,
+) -> String {
+    let Ok(service) = crate::logic::capability::service::CapabilityService::new(registry, executor)
+    else {
+        return "No capability catalog available.".to_string();
+    };
+    let Ok(defs) = service.definitions_for_agent(actor_id) else {
+        return "No capability catalog available.".to_string();
+    };
+    defs.iter()
+        .map(|d| {
+            format!(
+                "- id: {}\n  name: {}\n  description: {}\n  schema_in: {}",
+                d.capability_id, d.capability_name, d.description, d.input_schema
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn attention_output_from_trace(
+    trace: &crate::agent::memory::tool_agent::ToolLoopOutcome,
+) -> MemoryOutput {
+    let mut attention = Vec::new();
+    for call in &trace.calls {
+        if call.capability_id != "memory.attention.write" || !call.ok {
+            continue;
+        }
+        if let Some(entries) = call.arguments.get("entries").and_then(|v| v.as_array()) {
+            for entry in entries {
+                let focus = entry.get("focus").and_then(|v| v.as_str()).unwrap_or("");
+                let content = entry.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                if focus.is_empty() || content.is_empty() {
+                    continue;
+                }
+                let source_refs = entry
+                    .get("source_refs")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                attention.push(AttentionFragment {
+                    focus: focus.to_string(),
+                    content: content.to_string(),
+                    source_refs,
+                });
+            }
+        }
+    }
+    MemoryOutput {
+        attention,
+        experience: vec![],
+        preference: vec![],
+        cognitive: vec![],
+    }
+}
+
+fn retired_focus_from_trace(
+    trace: &crate::agent::memory::tool_agent::ToolLoopOutcome,
+) -> (Vec<String>, Vec<Vec<String>>) {
+    let mut focus = Vec::new();
+    let mut source_refs = Vec::new();
+    for call in &trace.calls {
+        if call.capability_id != "memory.attention.retire" || !call.ok {
+            continue;
+        }
+        if let Some(items) = call.output.get("retired").and_then(|v| v.as_array()) {
+            for item in items {
+                let Some(f) = item.get("focus").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if focus.iter().any(|existing: &String| existing == f) {
+                    continue;
+                }
+                let refs = item
+                    .get("source_refs")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                focus.push(f.to_string());
+                source_refs.push(refs);
+            }
+        }
+    }
+    (focus, source_refs)
 }
 
 async fn rag_retrieve(
@@ -430,80 +515,7 @@ fn format_memory_entry(memory_type: &str, payload: &serde_json::Value) -> String
     }
 }
 
-const MAX_ATTENTION_ENTRIES: usize = 2000;
-
-async fn count_memories(
-    shared_trivium: Option<&Arc<tokio::sync::Mutex<TriviumDb>>>,
-    triviumdb_path: Option<&Path>,
-    memory_type: &str,
-) -> usize {
-    if let Some(shared) = shared_trivium {
-        let db = shared.lock().await;
-        return count_memories_with_db(&db, memory_type);
-    }
-    let Some(path) = triviumdb_path else { return 0 };
-    match TriviumDb::open(path, crate::data::triviumdb::DEFAULT_DIM) {
-        Ok(db) => count_memories_with_db(&db, memory_type),
-        Err(_) => 0,
-    }
-}
-
-fn count_memories_with_db(db: &TriviumDb, memory_type: &str) -> usize {
-    let mut count = 0usize;
-    for id in db.db().get_all_ids() {
-        let mtype = db
-            .db()
-            .get_payload(id)
-            .and_then(|p| p.get("_memory_type").cloned())
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or_default();
-        if mtype == memory_type {
-            count += 1;
-        }
-    }
-    count
-}
-
-async fn remove_attention_by_focus(
-    shared_trivium: Option<&Arc<tokio::sync::Mutex<TriviumDb>>>,
-    triviumdb_path: Option<&Path>,
-    retired_focus: &[String],
-) {
-    if retired_focus.is_empty() {
-        return;
-    }
-    if let Some(shared) = shared_trivium {
-        let mut db = shared.lock().await;
-        remove_attention_by_focus_with_db(&mut db, retired_focus);
-        return;
-    }
-    let Some(path) = triviumdb_path else { return };
-    match TriviumDb::open(path, crate::data::triviumdb::DEFAULT_DIM) {
-        Ok(mut db) => remove_attention_by_focus_with_db(&mut db, retired_focus),
-        Err(e) => tracing::warn!("memory_platform: open trivium for retire-delete failed: {e}"),
-    }
-}
-
-fn remove_attention_by_focus_with_db(db: &mut TriviumDb, retired_focus: &[String]) {
-    let mut removed = 0usize;
-    for id in db.db().get_all_ids() {
-        let Some(payload) = db.db().get_payload(id) else {
-            continue;
-        };
-        if payload.get("_memory_type").and_then(|v| v.as_str()) != Some("attention") {
-            continue;
-        }
-        let focus = payload.get("focus").and_then(|v| v.as_str()).unwrap_or("");
-        if retired_focus.iter().any(|r| r == focus) {
-            let _ = db.db_mut().delete(id);
-            removed += 1;
-        }
-    }
-    if removed > 0 {
-        tracing::debug!("memory_platform: retired {removed} attention entries (retire-delete)");
-    }
-}
-
+#[cfg(test)]
 async fn write_to_triviumdb<T: serde::Serialize>(
     shared_trivium: Option<&Arc<tokio::sync::Mutex<TriviumDb>>>,
     triviumdb_path: Option<&Path>,
@@ -531,6 +543,7 @@ async fn write_to_triviumdb<T: serde::Serialize>(
     write_to_triviumdb_with_db(&mut db, memory_type, fragments);
 }
 
+#[cfg(test)]
 fn write_to_triviumdb_with_db<T: serde::Serialize>(
     db: &mut TriviumDb,
     memory_type: &str,
@@ -589,7 +602,11 @@ fn fallback_memory(execution: Option<&ExecutionOutput>) -> MemoryOutput {
                     error_reason,
                     nr.tool_call_count
                 );
-                experience.push(ExperienceFragment { title, summary });
+                experience.push(ExperienceFragment {
+                    title,
+                    summary,
+                    source_refs: vec![],
+                });
             }
         }
     }
@@ -603,16 +620,19 @@ fn fallback_memory(execution: Option<&ExecutionOutput>) -> MemoryOutput {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg(test)]
 struct SettleAction {
     new_attention: Vec<AttentionFragment>,
     retired_focus: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg(test)]
 struct MemoryAgentOutput {
     settle: SettleAction,
 }
 
+#[cfg(test)]
 fn parse_memory_agent_output(content: &str) -> MemoryAgentOutput {
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -706,6 +726,8 @@ pub async fn run(
     shared_trivium: Option<Arc<tokio::sync::Mutex<TriviumDb>>>,
     memory_db: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
     prompts_dir: Option<PathBuf>,
+    registry: Option<Registry>,
+    executor: Option<Arc<CapabilityExecutor>>,
     experience_tx: Option<mpsc::Sender<AttentionRetireBatch>>,
     preference_tx: Option<mpsc::Sender<AttentionRetireBatch>>,
     cognitive_tx: Option<mpsc::Sender<()>>,
@@ -720,6 +742,8 @@ pub async fn run(
         shared_trivium,
         memory_db,
         prompts_dir,
+        registry,
+        executor,
         experience_tx,
         preference_tx,
         cognitive_tx,
@@ -909,6 +933,7 @@ mod tests {
         let fragments = vec![AttentionFragment {
             focus: "migration".to_string(),
             content: "keep structured fields".to_string(),
+            source_refs: vec![],
         }];
 
         write_to_triviumdb(None, Some(&path), "attention", &fragments).await;
