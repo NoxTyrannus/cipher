@@ -1,5 +1,6 @@
 use super::{BackupFileEntry, VerifiedBackup};
-use crate::agent::thought::{ThinkingInput, ThinkingOutput, ThoughtContext, ThoughtId};
+use crate::agent::thought::{ThinkingInput, ThinkingOutput, ThoughtContext};
+use crate::common::types::ThoughtId;
 use crate::common::{AgentError, Result, UtcTimestamp};
 use crate::data::thought_store::ThoughtStore;
 use chrono::{DateTime, Utc};

@@ -58,7 +58,7 @@ impl ThoughtStore {
         secure_record_files(&record_dir)?;
         let result = atomic_write_json(&record_dir, INPUT_FILE, &input_record);
         if result.is_ok() {
-            self.invalidate_recover_cache();
+            self.cache_upsert_context(context.clone());
         }
         result
     }
@@ -96,7 +96,7 @@ impl ThoughtStore {
 
         let result = atomic_write_json(&record_dir, OUTPUT_FILE, &output_record);
         if result.is_ok() {
-            self.invalidate_recover_cache();
+            self.cache_upsert_context(context.clone());
         }
         result
     }
@@ -278,6 +278,46 @@ impl ThoughtStore {
         if let Ok(mut cache_guard) = self.recover_cache.lock() {
             *cache_guard = None;
         }
+    }
+
+    /// 写穿透：磁盘写成功后同步更新内存 timeline，避免后续 LLM 调用重新全量扫描。
+    fn cache_upsert_context(&self, context: crate::agent::thought::ThoughtContext) {
+        let Ok(mut cache_guard) = self.recover_cache.lock() else {
+            return;
+        };
+        if cache_guard.is_none() {
+            return;
+        }
+        let Some(cached) = cache_guard.as_mut() else {
+            return;
+        };
+        let timeline = Arc::make_mut(cached);
+        let group = timeline
+            .groups
+            .iter_mut()
+            .find(|group| group.occurred_at == context.occurred_at);
+        if let Some(group) = group {
+            if let Some(existing) = group
+                .contexts
+                .iter_mut()
+                .find(|existing| existing.thought_id == context.thought_id)
+            {
+                *existing = context;
+                return;
+            }
+            group.contexts.push(context);
+            group
+                .contexts
+                .sort_by(|a, b| a.thought_id.cmp(&b.thought_id));
+            return;
+        }
+        let mut groups = std::mem::take(&mut timeline.groups);
+        groups.push(crate::agent::thought::ThoughtTimestampGroup {
+            occurred_at: context.occurred_at.clone(),
+            contexts: vec![context],
+        });
+        groups.sort_by(|a, b| a.occurred_at.cmp(&b.occurred_at));
+        timeline.groups = groups;
     }
 
     fn ensure_record_parent(&self, occurred_at: UtcTimestamp) -> Result<()> {
@@ -1172,7 +1212,7 @@ mod tests {
     }
 
     #[test]
-    fn recover_uses_cache_and_invalidates_on_persist() {
+    fn recover_uses_cache_and_updates_on_persist() {
         let temporary = tempfile::tempdir().unwrap();
         let store = ThoughtStore::open(temporary.path()).unwrap();
 
@@ -1211,6 +1251,6 @@ mod tests {
 
         let third = store.recover().unwrap();
         let total: usize = third.groups.iter().map(|g| g.contexts.len()).sum();
-        assert_eq!(total, 2, "persist 后缓存失效, recover 应重建包含新记录");
+        assert_eq!(total, 2, "persist 后缓存写穿透, recover 应包含新记录");
     }
 }

@@ -1,4 +1,12 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
+
+static PROMPT_CACHE: OnceLock<RwLock<HashMap<PathBuf, String>>> = OnceLock::new();
+
+fn prompt_cache() -> &'static RwLock<HashMap<PathBuf, String>> {
+    PROMPT_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
 
 pub const SOUL_DEFAULT: &str = include_str!("../../../prompts/SOUL.md");
 pub const SYSTEM_DEFAULT: &str = include_str!("../../../prompts/system.md");
@@ -28,7 +36,28 @@ pub const DEFAULT_PROMPTS: [(&str, &str); 11] = [
 
 fn read_prompt(prompts_dir: &Path, name: &str) -> String {
     let path = prompts_dir.join(name);
-    std::fs::read_to_string(&path).unwrap_or_default()
+    if let Ok(cache) = prompt_cache().read() {
+        if let Some(content) = cache.get(&path) {
+            return content.clone();
+        }
+    }
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    if let Ok(mut cache) = prompt_cache().write() {
+        cache.insert(path, content.clone());
+    }
+    content
+}
+
+#[cfg(test)]
+pub fn prompt_cache_len() -> usize {
+    prompt_cache().read().map(|c| c.len()).unwrap_or(0)
+}
+
+#[cfg(test)]
+pub fn clear_prompt_cache() {
+    if let Ok(mut cache) = prompt_cache().write() {
+        cache.clear();
+    }
 }
 
 pub fn read_platform_prompt(prompts_dir: &Path, name: &str) -> String {
