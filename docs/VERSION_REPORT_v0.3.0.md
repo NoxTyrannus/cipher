@@ -55,6 +55,7 @@
 - 新增 `skill.convert` usage method 和 `data/seed/skills/count_errors_skill.md` 示例。
 - **真实模型最终验证通过**：MiniMax-M3 将 SKILL.md 转为 capability.import JSON，`capability_probe` 导入并执行 `user.skill.count-errors`，对 3 条 ERROR 日志统计得到 `3`。
 - 复现脚本：`tests/experiments/skill_absorption_test.py`。
+- **真实外部 skill 实测**：`https://github.com/NoxTyrannus/Glanstia_System-skill` 的 `soul_guide` 组件。首两次模型直出 JSON 存在语法/schema 错误；用严格骨架修复提示后，导入 `user.skill.soul_guide` 并成功执行：2 个 `.soulmd` 被提取标签、写入 `souls.csv`、归档到 `Hades/`；`gno` 依赖未伪装成能力，以 `external_dependency=gno` 明确暴露。此问题已反哺 `skill.convert` usage method 的硬性规则。
 
 ### 6. 提示词职责重构（v0.3.1 前移）
 - `system.md` 纯输出协议；`SOUL.md` 身份/语言/风格；三种 mode 文件补充协同关系与交流原则。
