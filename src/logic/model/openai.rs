@@ -195,7 +195,7 @@ impl LlmProvider for OpenAiProvider {
     async fn call(&self, req: &LlmRequest) -> Result<LlmResponse> {
         if req.api_url.is_empty() {
             return Err(crate::common::AgentError::Llm(
-                "openai: req.api_url is empty (model.api_url required, per ADR-131)".to_string(),
+                "openai: req.api_url is empty (model.api_url required)".to_string(),
             ));
         }
         let base_url = req.api_url.clone();
@@ -205,7 +205,7 @@ impl LlmProvider for OpenAiProvider {
             .map(|s| s.expose_secret().to_string())
             .ok_or_else(|| {
                 crate::common::AgentError::Llm(
-                    "openai: req.api_key is None (model.api_key required, per ADR-131)".to_string(),
+                    "openai: req.api_key is None (model.api_key required)".to_string(),
                 )
             })?;
         let url = format!("{}/chat/completions", base_url);
@@ -299,7 +299,7 @@ impl LlmProvider for OpenAiProvider {
     ) -> Result<LlmResponse> {
         if req.api_url.is_empty() {
             return Err(crate::common::AgentError::Llm(
-                "openai: req.api_url is empty (model.api_url required, per ADR-131)".to_string(),
+                "openai: req.api_url is empty (model.api_url required)".to_string(),
             ));
         }
         let base_url = req.api_url.clone();
@@ -309,7 +309,7 @@ impl LlmProvider for OpenAiProvider {
             .map(|s| s.expose_secret().to_string())
             .ok_or_else(|| {
                 crate::common::AgentError::Llm(
-                    "openai: req.api_key is None (model.api_key required, per ADR-131)".to_string(),
+                    "openai: req.api_key is None (model.api_key required)".to_string(),
                 )
             })?;
         let url = format!("{}/chat/completions", base_url);

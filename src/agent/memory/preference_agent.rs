@@ -17,7 +17,7 @@ pub struct PreferenceMemoryAgent {
     provider: Arc<dyn LlmProvider>,
     model_row: ModelRow,
     api_key: Option<SecretString>,
-    triviumdb: Option<Arc<tokio::sync::Mutex<TriviumDb>>>,
+    triviumdb: Option<Arc<std::sync::Mutex<TriviumDb>>>,
     prompts_dir: Option<PathBuf>,
     inbox_rx: tokio::sync::mpsc::Receiver<AttentionRetireBatch>,
     registry: Option<Registry>,
@@ -30,7 +30,7 @@ impl PreferenceMemoryAgent {
         provider: Arc<dyn LlmProvider>,
         model_row: ModelRow,
         api_key: Option<SecretString>,
-        triviumdb: Option<Arc<tokio::sync::Mutex<TriviumDb>>>,
+        triviumdb: Option<Arc<std::sync::Mutex<TriviumDb>>>,
         prompts_dir: Option<PathBuf>,
         inbox_rx: tokio::sync::mpsc::Receiver<AttentionRetireBatch>,
         registry: Option<Registry>,
@@ -145,7 +145,9 @@ impl PreferenceMemoryAgent {
         }
 
         if let Some(ref db) = self.triviumdb {
-            let mut db = db.lock().await;
+            let mut db = db.lock().map_err(|e| {
+                crate::common::AgentError::Io(format!("preference trivium lock poisoned: {e}"))
+            })?;
             for fragment in &fragments {
                 let mut payload = match serde_json::to_value(fragment) {
                     Ok(serde_json::Value::Object(p)) => p,

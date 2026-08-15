@@ -52,7 +52,7 @@ impl ModeKind {
         match self {
             ModeKind::Unni => "UNNI 模式: 协同思考、执行与自然对话 (默认模式)",
             ModeKind::Keep => "KEEP 模式: AI 主导执行, 单一任务, 完成后回报",
-            ModeKind::Loop => "LOOP 模式: 自主目标 + 飞轮迭代, 无硬截断 (per ADR-053)",
+            ModeKind::Loop => "LOOP 模式: 自主目标 + 飞轮迭代, 无硬截断",
         }
     }
 }

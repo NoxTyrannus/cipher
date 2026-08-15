@@ -299,7 +299,7 @@ pub fn import_factory_defaults(conn: &duckdb::Connection, data_dir: &Path) -> Re
     )
     .map_err(|e| AgentError::Bootstrap(format!("update agent tool_caps: {e}")))?;
     conn.execute(
-        "UPDATE agent SET config = '{\"max_turns\": 6}' \
+        "UPDATE agent SET config = '{\"max_turns\": 8}' \
          WHERE id = 'agent' AND (config IS NULL OR config = 'null')",
         [],
     )

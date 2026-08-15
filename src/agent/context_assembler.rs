@@ -92,7 +92,7 @@ pub struct ContextAssembler {
 
     memory_db: Option<std::sync::Arc<std::sync::Mutex<duckdb::Connection>>>,
 
-    shared_trivium: Option<Arc<tokio::sync::Mutex<crate::data::triviumdb::TriviumDb>>>,
+    shared_trivium: Option<Arc<std::sync::Mutex<crate::data::triviumdb::TriviumDb>>>,
 }
 
 impl ContextAssembler {
@@ -128,7 +128,7 @@ impl ContextAssembler {
 
     pub fn set_shared_trivium(
         &mut self,
-        db: Arc<tokio::sync::Mutex<crate::data::triviumdb::TriviumDb>>,
+        db: Arc<std::sync::Mutex<crate::data::triviumdb::TriviumDb>>,
     ) {
         self.shared_trivium = Some(db);
     }
@@ -249,7 +249,13 @@ impl ContextAssembler {
 
     async fn read_trivium_memories(&self, memory_type: &str, quota: usize) -> Vec<ChatMessage> {
         if let Some(shared) = &self.shared_trivium {
-            let db = shared.lock().await;
+            let db = match shared.lock() {
+                Ok(db) => db,
+                Err(e) => {
+                    tracing::warn!("ContextAssembler: triviumdb lock poisoned: {e}");
+                    return Vec::new();
+                }
+            };
             return self.read_memories_with_db(&db, memory_type, quota);
         }
         let db = match self.open_triviumdb() {

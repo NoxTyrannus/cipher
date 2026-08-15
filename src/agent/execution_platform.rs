@@ -42,7 +42,7 @@ fn select_prompt(kind: &str, prompts_dir: &Path) -> String {
 const PREFILLED_MAX_BYTES: usize = 8192;
 
 /// subagent 循环最大轮数 (模型不可配置)。
-const SUBAGENT_MAX_TURNS: u32 = 6;
+const SUBAGENT_MAX_TURNS: u32 = 8;
 
 /// 从注册表默认 agent 的 config.max_turns 读取 subagent 轮数默认值。
 /// 未配置或非数字时返回 None (调用方回退 SUBAGENT_MAX_TURNS)。
@@ -752,7 +752,7 @@ fn build_dep_summary(
                 .get(&r.node_id)
                 .map(|n| n.capability.as_str())
                 .unwrap_or("?");
-            let summary: String = r.summary.chars().take(200).collect();
+            let summary: String = r.summary.chars().take(2000).collect();
             if summary.is_empty() {
                 format!("[{}] {} 完成 (无输出摘要)", r.node_id, cap)
             } else {
@@ -1215,7 +1215,7 @@ pub struct ExecutionPlatform {
 
     subagent_pool: Arc<SubAgentPool>,
 
-    trivium_db: Option<Arc<tokio::sync::Mutex<TriviumDb>>>,
+    trivium_db: Option<Arc<std::sync::Mutex<TriviumDb>>>,
 
     product_store: Option<Arc<PlatformProductStore>>,
 
@@ -1285,7 +1285,7 @@ impl ExecutionPlatform {
         model_row: ModelRow,
         api_key: SecretString,
         subagent_pool: Arc<SubAgentPool>,
-        trivium_db: Option<Arc<tokio::sync::Mutex<TriviumDb>>>,
+        trivium_db: Option<Arc<std::sync::Mutex<TriviumDb>>>,
         product_store: Option<Arc<PlatformProductStore>>,
         cursor_store: Option<Arc<CursorStore>>,
         prompts_dir: Option<PathBuf>,
@@ -1620,7 +1620,13 @@ impl ExecutionPlatform {
             }
 
             if let Some(ref db_lock) = self.trivium_db {
-                let mut db = db_lock.lock().await;
+                let mut db = match db_lock.lock() {
+                    Ok(db) => db,
+                    Err(e) => {
+                        tracing::warn!("execution_platform: triviumdb lock poisoned: {e}");
+                        continue;
+                    }
+                };
                 let inst = self.subagent_pool.get(subagent_id);
                 if let Some(inst) = inst {
                     let log_content = inst.logs.join("\n");
@@ -1889,8 +1895,8 @@ impl ExecutionPlatform {
             .as_ref()
             .and_then(|_| std::env::current_dir().ok());
         let mut workspace_lines: Vec<String> = Vec::new();
-        if let Some(root) = ws_root {
-            if let Ok(rd) = std::fs::read_dir(&root) {
+        if let Some(ref root) = ws_root {
+            if let Ok(rd) = std::fs::read_dir(root) {
                 for entry in rd.flatten().take(20) {
                     let name = entry.file_name().to_string_lossy().to_string();
                     if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -1914,8 +1920,12 @@ impl ExecutionPlatform {
             workspace_lines.push("(工作区为空)".to_string());
         }
 
+        let root_line = ws_root
+            .as_ref()
+            .map(|root| format!("**工作区绝对路径:** {}\n", root.display()))
+            .unwrap_or_default();
         format!(
-            "{}\n\n## Environment Context\n\n**Agent 池快照:**\n{}\n\n**工作区文件清单:**\n{}",
+            "{}\n\n## Environment Context\n\n**Agent 池快照:**\n{}\n\n{root_line}\n**工作区文件清单:**\n{}",
             prompt,
             agent_lines.join("\n"),
             workspace_lines.join("\n")
@@ -2753,7 +2763,7 @@ pub async fn run(
     model_row: ModelRow,
     api_key: SecretString,
     subagent_pool: Arc<SubAgentPool>,
-    trivium_db: Option<Arc<tokio::sync::Mutex<TriviumDb>>>,
+    trivium_db: Option<Arc<std::sync::Mutex<TriviumDb>>>,
     product_store: Option<Arc<PlatformProductStore>>,
     cursor_store: Option<Arc<CursorStore>>,
     prompts_dir: Option<PathBuf>,
@@ -2861,7 +2871,7 @@ mod tests {
                 mode: "unni".to_string(),
                 prompt: None,
                 tool_caps: vec![],
-                config: Some(serde_json::json!({"max_turns": 6})),
+                config: Some(serde_json::json!({"max_turns": 8})),
                 display_name: None,
                 is_default: false,
             },
