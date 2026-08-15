@@ -8,7 +8,7 @@ Cipher 是一个运行在终端中的 AI 代理：你在终端里输入任务，
 
 - **三种工作模式**：UNNI（协同交互）/ KEEP（持续执行）/ LOOP（迭代循环），Tab 键切换
 - **本地记忆系统**：经验沉淀、认知图、偏好学习、工具使用方式迭代
-- **沙箱执行**：Wasmtime 沙箱运行代码，权限边界可控
+- **安全执行**：builtin host 能力直连，保留路径白名单、预算与危险命令黑名单
 - **多模型支持**：MiniMax M3 / Kimi K3 / SenseNova / DeepSeek / Doubao / GLM 等
 
 ## 安装
