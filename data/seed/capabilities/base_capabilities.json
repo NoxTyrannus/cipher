@@ -1,15 +1,1021 @@
 [
-  {"id":"file.read","name":"Read File","type":"function","description":"读取文件内容","schema_in":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]},"schema_out":{"type":"object","properties":{"content":{"type":"string"},"size":{"type":"integer"}}},"executor":"wasm:file.read","version":"1.0.0","enabled":true,"partition":"system"},
-  {"id":"file.write","name":"Write File","type":"function","description":"写入文件内容","schema_in":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]},"schema_out":{"type":"object","properties":{"success":{"type":"boolean"}}},"executor":"wasm:file.write","version":"1.0.0","enabled":true,"partition":"system"},
-  {"id":"file.list","name":"List Directory","type":"function","description":"列出目录内容","schema_in":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]},"schema_out":{"type":"object","properties":{"entries":{"type":"array","items":{"type":"string"}}}},"executor":"wasm:file.list","version":"1.0.0","enabled":true,"partition":"system"},
-  {"id":"file.delete","name":"Delete File","type":"function","description":"删除文件","schema_in":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]},"schema_out":{"type":"object","properties":{"success":{"type":"boolean"}}},"executor":"wasm:file.delete","version":"1.0.0","enabled":true,"partition":"system"},
-  {"id":"file.move","name":"Move File","type":"function","description":"移动或重命名文件","schema_in":{"type":"object","properties":{"from":{"type":"string"},"to":{"type":"string"}},"required":["from","to"]},"schema_out":{"type":"object","properties":{"success":{"type":"boolean"}}},"executor":"wasm:file.move","version":"1.0.0","enabled":true,"partition":"system"},
-  {"id":"text.grep","name":"Grep Text","type":"function","description":"在文件中搜索文本模式","schema_in":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern","path"]},"schema_out":{"type":"object","properties":{"matches":{"type":"array","items":{"type":"string"}}}},"executor":"wasm:text.grep","version":"1.0.0","enabled":true,"partition":"system"},
-  {"id":"shell.exec","name":"Execute Shell","type":"function","description":"在工作区执行 shell 命令","schema_in":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]},"schema_out":{"type":"object","properties":{"stdout":{"type":"string"},"stderr":{"type":"string"},"exit_code":{"type":"integer"}}},"executor":"wasm:shell.exec","version":"1.0.0","enabled":true,"partition":"system"},
-  {"id":"db.insert","name":"Database Insert","type":"function","description":"向注册表插入数据","schema_in":{"type":"object","properties":{"table":{"type":"string"},"data":{"type":"object"}},"required":["table","data"]},"schema_out":{"type":"object","properties":{"rows_affected":{"type":"integer"}}},"executor":"builtin:db.insert","version":"1.0.0","enabled":true,"partition":"system"},
-  {"id":"db.update","name":"Database Update","type":"function","description":"更新注册表数据","schema_in":{"type":"object","properties":{"table":{"type":"string"},"data":{"type":"object"},"where":{"type":"string"}},"required":["table","data"]},"schema_out":{"type":"object","properties":{"rows_affected":{"type":"integer"}}},"executor":"builtin:db.update","version":"1.0.0","enabled":true,"partition":"system"},
-  {"id":"db.delete","name":"Database Delete","type":"function","description":"删除注册表数据","schema_in":{"type":"object","properties":{"table":{"type":"string"},"where":{"type":"string"}},"required":["table","where"]},"schema_out":{"type":"object","properties":{"rows_affected":{"type":"integer"}}},"executor":"builtin:db.delete","version":"1.0.0","enabled":true,"partition":"system"},
-  {"id":"db.query","name":"Database Query","type":"function","description":"查询注册表数据","schema_in":{"type":"object","properties":{"table":{"type":"string"},"where":{"type":"string"}},"required":["table"]},"schema_out":{"type":"object","properties":{"rows":{"type":"array"}}},"executor":"builtin:db.query","version":"1.0.0","enabled":true,"partition":"system"},
-  {"id":"file.chunk_read","name":"Chunk Read File","type":"function","description":"分块读取大文件，支持 offset/size","schema_in":{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"size":{"type":"integer"}},"required":["path"]},"schema_out":{"type":"object","properties":{"content":{"type":"string"},"bytes_read":{"type":"integer"},"is_eof":{"type":"boolean"}}},"executor":"wasm:file.chunk_read","version":"1.0.0","enabled":true,"partition":"system"},
-  {"id":"code.exec","name":"Execute Code","type":"function","description":"在沙箱内执行代码片段","schema_in":{"type":"object","properties":{"code":{"type":"string"},"language":{"type":"string"}},"required":["code"]},"schema_out":{"type":"object","properties":{"stdout":{"type":"string"},"stderr":{"type":"string"},"exit_code":{"type":"integer"}}},"executor":"wasm:code.exec","version":"1.0.0","enabled":true,"partition":"system"}
+  {
+    "id": "file.read",
+    "name": "Read File",
+    "type": "function",
+    "description": "读取文件内容",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "size": {
+          "type": "integer"
+        }
+      }
+    },
+    "executor": "builtin:file.read",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "file.write",
+    "name": "Write File",
+    "type": "function",
+    "description": "写入文件内容",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "content": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "content"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "success": {
+          "type": "boolean"
+        }
+      }
+    },
+    "executor": "builtin:file.write",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "file.list",
+    "name": "List Directory",
+    "type": "function",
+    "description": "列出目录内容",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "executor": "builtin:file.list",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "file.delete",
+    "name": "Delete File",
+    "type": "function",
+    "description": "删除文件",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "success": {
+          "type": "boolean"
+        }
+      }
+    },
+    "executor": "builtin:file.delete",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "file.move",
+    "name": "Move File",
+    "type": "function",
+    "description": "移动或重命名文件",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "success": {
+          "type": "boolean"
+        }
+      }
+    },
+    "executor": "builtin:file.move",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "text.grep",
+    "name": "Grep Text",
+    "type": "function",
+    "description": "在文件中搜索文本模式",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "pattern": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern",
+        "path"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "matches": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "executor": "builtin:text.grep",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "shell.exec",
+    "name": "Execute Shell",
+    "type": "function",
+    "description": "在工作区执行 shell 命令",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "command"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "stdout": {
+          "type": "string"
+        },
+        "stderr": {
+          "type": "string"
+        },
+        "exit_code": {
+          "type": "integer"
+        }
+      }
+    },
+    "executor": "builtin:shell.exec",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "db.insert",
+    "name": "Database Insert",
+    "type": "function",
+    "description": "向注册表插入数据",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "table": {
+          "type": "string"
+        },
+        "data": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "table",
+        "data"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "rows_affected": {
+          "type": "integer"
+        }
+      }
+    },
+    "executor": "builtin:db.insert",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "db.update",
+    "name": "Database Update",
+    "type": "function",
+    "description": "更新注册表数据",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "table": {
+          "type": "string"
+        },
+        "data": {
+          "type": "object"
+        },
+        "where": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "table",
+        "data"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "rows_affected": {
+          "type": "integer"
+        }
+      }
+    },
+    "executor": "builtin:db.update",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "db.delete",
+    "name": "Database Delete",
+    "type": "function",
+    "description": "删除注册表数据",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "table": {
+          "type": "string"
+        },
+        "where": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "table",
+        "where"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "rows_affected": {
+          "type": "integer"
+        }
+      }
+    },
+    "executor": "builtin:db.delete",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "db.query",
+    "name": "Database Query",
+    "type": "function",
+    "description": "查询注册表数据",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "table": {
+          "type": "string"
+        },
+        "where": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "table"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "rows": {
+          "type": "array"
+        }
+      }
+    },
+    "executor": "builtin:db.query",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "file.chunk_read",
+    "name": "Chunk Read File",
+    "type": "function",
+    "description": "分块读取大文件，支持 offset/size",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "offset": {
+          "type": "integer"
+        },
+        "size": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "bytes_read": {
+          "type": "integer"
+        },
+        "is_eof": {
+          "type": "boolean"
+        }
+      }
+    },
+    "executor": "builtin:file.chunk_read",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "code.exec",
+    "name": "Execute Code",
+    "type": "function",
+    "description": "在沙箱内执行代码片段",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "language": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "stdout": {
+          "type": "string"
+        },
+        "stderr": {
+          "type": "string"
+        },
+        "exit_code": {
+          "type": "integer"
+        }
+      }
+    },
+    "executor": "builtin:code.exec",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "memory.list",
+    "name": "List Memory",
+    "type": "function",
+    "description": "按记忆类型列出记忆条目，最新优先",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "memory_type": {
+          "type": "string",
+          "enum": [
+            "attention",
+            "experience",
+            "preference",
+            "cognitive"
+          ]
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        }
+      },
+      "required": [
+        "memory_type"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "count": {
+          "type": "integer"
+        },
+        "success": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": "string"
+        }
+      }
+    },
+    "executor": "builtin:memory.list",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "memory.retrieve",
+    "name": "Retrieve Memory",
+    "type": "function",
+    "description": "按记忆类型和关键词检索记忆条目",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "memory_type": {
+          "type": "string",
+          "enum": [
+            "attention",
+            "experience",
+            "preference",
+            "cognitive"
+          ]
+        },
+        "query": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        }
+      },
+      "required": [
+        "memory_type"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "count": {
+          "type": "integer"
+        },
+        "success": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": "string"
+        }
+      }
+    },
+    "executor": "builtin:memory.retrieve",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "memory.delete",
+    "name": "Delete Memory",
+    "type": "function",
+    "description": "按类型和 id/focus 删除记忆条目",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "memory_type": {
+          "type": "string",
+          "enum": [
+            "attention",
+            "experience",
+            "preference",
+            "cognitive"
+          ]
+        },
+        "id": {
+          "type": "integer"
+        },
+        "focus": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "memory_type"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "removed": {
+          "type": "integer"
+        },
+        "success": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": "string"
+        }
+      }
+    },
+    "executor": "builtin:memory.delete",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "memory.attention.write",
+    "name": "Write Attention Memory",
+    "type": "function",
+    "description": "写入注意力记忆，可携带原始 thought_id 索引",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "entries": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": {
+            "type": "object",
+            "properties": {
+              "focus": {
+                "type": "string"
+              },
+              "content": {
+                "type": "string"
+              },
+              "source_refs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "focus",
+              "content"
+            ]
+          }
+        }
+      },
+      "required": [
+        "entries"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "written": {
+          "type": "integer"
+        },
+        "ids": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "success": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": "string"
+        }
+      }
+    },
+    "executor": "builtin:memory.attention.write",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "memory.attention.retire",
+    "name": "Retire Attention Memory",
+    "type": "function",
+    "description": "按 focus 淘汰注意力记忆",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "focus": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "focus"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "removed": {
+          "type": "integer"
+        },
+        "retired": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "success": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": "string"
+        }
+      }
+    },
+    "executor": "builtin:memory.attention.retire",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "memory.experience.write",
+    "name": "Write Experience Memory",
+    "type": "function",
+    "description": "写入经验记忆，可携带来源索引",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "entries": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "summary": {
+                "type": "string"
+              },
+              "source_refs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "title",
+              "summary"
+            ]
+          }
+        }
+      },
+      "required": [
+        "entries"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "written": {
+          "type": "integer"
+        },
+        "ids": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "success": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": "string"
+        }
+      }
+    },
+    "executor": "builtin:memory.experience.write",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "memory.preference.write",
+    "name": "Write Preference Memory",
+    "type": "function",
+    "description": "写入偏好记忆，可携带来源索引",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "entries": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": {
+            "type": "object",
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              },
+              "source_refs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "key",
+              "value"
+            ]
+          }
+        }
+      },
+      "required": [
+        "entries"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "written": {
+          "type": "integer"
+        },
+        "ids": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "success": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": "string"
+        }
+      }
+    },
+    "executor": "builtin:memory.preference.write",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "memory.cognitive.update",
+    "name": "Update Cognitive Graph",
+    "type": "function",
+    "description": "原子更新认知图节点和边",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "nodes": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {
+            "type": "object",
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "upsert",
+                  "delete"
+                ]
+              },
+              "node_id": {
+                "type": "string"
+              },
+              "insight": {
+                "type": "string"
+              },
+              "context": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "edges": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {
+            "type": "object",
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "upsert",
+                  "delete"
+                ]
+              },
+              "from": {
+                "type": "string"
+              },
+              "to": {
+                "type": "string"
+              },
+              "relation": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "from",
+              "to",
+              "relation"
+            ]
+          }
+        }
+      },
+      "required": []
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "success": {
+          "type": "boolean"
+        },
+        "node_changes": {
+          "type": "integer"
+        },
+        "edge_changes": {
+          "type": "integer"
+        },
+        "error": {
+          "type": "string"
+        }
+      }
+    },
+    "executor": "builtin:memory.cognitive.update",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "memory.evidence.lookup",
+    "name": "Lookup Memory Evidence",
+    "type": "function",
+    "description": "按 thought_id 索引查找原始对话证据",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "source_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        }
+      },
+      "required": [
+        "source_refs"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "count": {
+          "type": "integer"
+        },
+        "success": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": "string"
+        }
+      }
+    },
+    "executor": "builtin:memory.evidence.lookup",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "capability.import",
+    "name": "Import Capability",
+    "type": "function",
+    "description": "原子化导入用户定义的能力定义（base/composite/usage），用于把 skill/插件描述转化为 cipher 自身能力。executor 仅允许已知 builtin。",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "base_capabilities": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "composite_capabilities": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "usage_methods": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "success": {
+          "type": "boolean"
+        },
+        "imported": {
+          "type": "object"
+        },
+        "error": {
+          "type": "string"
+        }
+      }
+    },
+    "executor": "builtin:capability.import",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  }
 ]

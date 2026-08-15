@@ -177,18 +177,24 @@ pub struct MemoryOutput {
 pub struct AttentionFragment {
     pub focus: String,
     pub content: String,
+    #[serde(default)]
+    pub source_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExperienceFragment {
     pub title: String,
     pub summary: String,
+    #[serde(default)]
+    pub source_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreferenceFragment {
     pub key: String,
     pub value: String,
+    #[serde(default)]
+    pub source_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,6 +207,8 @@ pub struct CognitiveFragment {
 #[derive(Debug, Clone)]
 pub struct AttentionRetireBatch {
     pub retired_focus: Vec<String>,
+    /// 与 retired_focus 一一对应；每个元素是该 focus 被淘汰时的原始记忆索引。
+    pub source_refs: Vec<Vec<String>>,
 }
 
 #[cfg(test)]

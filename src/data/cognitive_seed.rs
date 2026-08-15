@@ -168,7 +168,11 @@ pub fn ensure_default_capabilities(data_dir: &Path) -> Result<()> {
 
     for (name, content) in files {
         let path = seed_root.join(name);
-        if !path.exists() {
+        let should_write = match fs::read_to_string(&path) {
+            Ok(existing) => existing.contains("wasm:"),
+            Err(_) => true,
+        };
+        if should_write {
             fs::write(&path, content)
                 .map_err(|e| AgentError::Io(format!("write capability seed {name}: {e}")))?;
             secure_existing_file(&path)?;
@@ -216,6 +220,11 @@ pub fn import_factory_defaults(conn: &duckdb::Connection, data_dir: &Path) -> Re
             capability_ids.push(id.to_string());
         }
     }
+    let agent_tool_caps: Vec<String> = capability_ids
+        .iter()
+        .filter(|id| !id.starts_with("memory.") && !id.starts_with("db."))
+        .cloned()
+        .collect();
 
     let comp_text = fs::read_to_string(seed_root.join("composite_capabilities.json"))
         .map_err(|e| AgentError::Io(format!("read composite_capabilities.json: {e}")))?;
@@ -275,7 +284,7 @@ pub fn import_factory_defaults(conn: &duckdb::Connection, data_dir: &Path) -> Re
         .map_err(|e| AgentError::Bootstrap(format!("import usage_method {id}: {e}")))?;
     }
 
-    let caps_json = serde_json::to_string(&capability_ids)
+    let caps_json = serde_json::to_string(&agent_tool_caps)
         .map_err(|e| AgentError::Parse(format!("serialize tool_caps: {e}")))?;
     conn.execute(
         "INSERT INTO agent (id, name, mode, tool_caps, is_default) \
@@ -296,11 +305,73 @@ pub fn import_factory_defaults(conn: &duckdb::Connection, data_dir: &Path) -> Re
     )
     .map_err(|e| AgentError::Bootstrap(format!("seed agent config: {e}")))?;
 
+    seed_memory_agents(conn)?;
+
     tracing::info!(
         "import_factory_defaults: {} base + agent tool_caps={}",
         base_rows.len(),
-        capability_ids.len()
+        agent_tool_caps.len()
     );
+    Ok(())
+}
+
+/// 记忆 agent 全部入表：Desktop 阶段用户可以直接查看/改造/创建这些 agent。
+/// 使用 ON CONFLICT DO NOTHING，已有行（含用户手工修改）不被覆盖。
+pub fn seed_memory_agents(conn: &duckdb::Connection) -> Result<()> {
+    let agents: &[(&str, &str, &[&str])] = &[
+        (
+            "attention-agent",
+            "Attention Agent",
+            &[
+                "memory.list",
+                "memory.retrieve",
+                "memory.delete",
+                "memory.attention.write",
+                "memory.attention.retire",
+            ],
+        ),
+        (
+            "experience-agent",
+            "Experience Agent",
+            &[
+                "memory.list",
+                "memory.retrieve",
+                "memory.evidence.lookup",
+                "memory.experience.write",
+            ],
+        ),
+        (
+            "preference-agent",
+            "Preference Agent",
+            &[
+                "memory.list",
+                "memory.retrieve",
+                "memory.evidence.lookup",
+                "memory.preference.write",
+            ],
+        ),
+        (
+            "cognitive-agent",
+            "Cognitive Agent",
+            &[
+                "memory.list",
+                "memory.retrieve",
+                "memory.evidence.lookup",
+                "memory.cognitive.update",
+            ],
+        ),
+    ];
+    for (id, name, caps) in agents {
+        let caps_json = serde_json::to_string(caps)
+            .map_err(|e| AgentError::Parse(format!("serialize tool_caps for {id}: {e}")))?;
+        conn.execute(
+            "INSERT INTO agent (id, name, mode, tool_caps, display_name, is_default) \
+             VALUES (?, ?, 'unni', CAST(? AS JSON), ?, false) \
+             ON CONFLICT (id) DO NOTHING",
+            duckdb::params![id, name, caps_json, name],
+        )
+        .map_err(|e| AgentError::Bootstrap(format!("seed memory agent {id}: {e}")))?;
+    }
     Ok(())
 }
 

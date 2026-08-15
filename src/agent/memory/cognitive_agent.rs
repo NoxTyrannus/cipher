@@ -1,15 +1,15 @@
 use std::path::PathBuf;
-
-const MAX_DYNAMIC_COGNITIVE_NODES: usize = 1000;
 use std::sync::Arc;
 
 use secrecy::SecretString;
 
 use serde_json::Value;
 
-use crate::agent::communication::CognitiveFragment;
+use crate::data::duckdb::Registry;
 use crate::data::triviumdb::TriviumDb;
 use crate::data::ModelRow;
+use crate::logic::capability::executor::CapabilityExecutor;
+use crate::logic::capability::service::{CapabilityCall, CapabilityService};
 use crate::logic::model::message::{ChatMessage, SystemKind};
 use crate::logic::model::prompts::read_platform_prompt;
 use crate::logic::model::provider::{LlmProvider, LlmRequest};
@@ -27,6 +27,10 @@ pub struct CognitiveAgent {
     memory_db: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
 
     thought_store: Option<Arc<crate::data::thought_store::ThoughtStore>>,
+
+    registry: Option<Registry>,
+
+    executor: Option<Arc<CapabilityExecutor>>,
 }
 
 impl CognitiveAgent {
@@ -40,6 +44,8 @@ impl CognitiveAgent {
         inbox_rx: tokio::sync::mpsc::Receiver<()>,
         memory_db: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
         thought_store: Option<Arc<crate::data::thought_store::ThoughtStore>>,
+        registry: Option<Registry>,
+        executor: Option<Arc<CapabilityExecutor>>,
     ) -> Self {
         Self {
             provider,
@@ -51,6 +57,8 @@ impl CognitiveAgent {
             inbox_rx,
             memory_db,
             thought_store,
+            registry,
+            executor,
         }
     }
 
@@ -85,19 +93,21 @@ impl CognitiveAgent {
         };
 
         let prompt = format!(
-            "{}\n\n## Task\nUpdate the cognitive graph. Output a JSON array of cognitive entries, each with \"entity\", \"relation\", and \"target\" fields.\n\nRespond with ONLY the JSON array.",
+            "{}\n\n## Task\nUpdate the cognitive graph through the capability protocol.\n\n             Output ONLY one JSON object:\n             {{\n  \"nodes\": [{{\"action\": \"upsert|delete\", \"node_id\": \"可选\", \"insight\": \"概念/规则\", \"context\": \"背景\"}}],\n             \"edges\": [{{\"action\": \"upsert|delete\", \"from\": \"节点A\", \"to\": \"节点B\", \"relation\": \"关系\"}}]\n}}\n\n             节点不超过100字，边关系不超过30字。",
             base,
         );
 
         let summaries = self.recent_thought_summaries(29);
-        let user_content = if summaries.is_empty() {
-            "Update cognitive graph now. Output ONLY the JSON.".to_string()
-        } else {
-            format!(
-                "## Recent Thought Summaries\n{}\n\nUpdate cognitive graph based on these. Output ONLY the JSON.",
-                summaries
-            )
-        };
+        let current_graph = self.current_cognitive_graph().await;
+        let mut user_parts = Vec::new();
+        if !summaries.is_empty() {
+            user_parts.push(format!("## Recent Thought Summaries\n{summaries}"));
+        }
+        if !current_graph.is_empty() {
+            user_parts.push(format!("## Current Cognitive Graph\n{current_graph}"));
+        }
+        user_parts.push("Update cognitive graph now. Output ONLY the JSON.".to_string());
+        let user_content = user_parts.join("\n\n");
 
         let messages = vec![
             ChatMessage::System {
@@ -110,120 +120,104 @@ impl CognitiveAgent {
         let req = LlmRequest::from_model_row(&self.model_row, messages, api_key)?;
         let resp = self.provider.call(&req).await?;
 
-        let output: serde_json::Value =
-            serde_json::from_str(&resp.content).unwrap_or(serde_json::Value::Null);
+        let output: serde_json::Value = serde_json::from_str(&resp.content).unwrap_or(Value::Null);
+        let (node_updates, edge_updates) = cognitive_updates_from_output(output);
+        if node_updates.is_empty() && edge_updates.is_empty() {
+            return Ok(());
+        }
 
-        let (nodes, edges) = match &output {
-            Value::Array(_arr) => {
-                let fragments: Vec<CognitiveFragment> =
-                    serde_json::from_value(output.clone()).unwrap_or_default();
-                (fragments, Vec::new())
-            }
-            Value::Object(obj) => {
-                let nodes = obj
-                    .get("nodes")
-                    .and_then(|v| serde_json::from_value::<Vec<CognitiveFragment>>(v.clone()).ok())
-                    .unwrap_or_default();
-                let edges = obj
-                    .get("edges")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|e| {
-                                Some((
-                                    e.get("from")?.as_str()?.to_string(),
-                                    e.get("to")?.as_str()?.to_string(),
-                                    e.get("relation")?.as_str()?.to_string(),
-                                ))
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                (nodes, edges)
-            }
-            _ => (Vec::new(), Vec::new()),
+        let (Some(registry), Some(executor)) = (&self.registry, &self.executor) else {
+            tracing::warn!("cognitive agent: capability runtime not configured; update skipped");
+            return Ok(());
         };
 
-        if !nodes.is_empty() || !edges.is_empty() {
-            if let Some(ref db) = self.triviumdb {
-                let mut db = db.lock().await;
-                let zero_vec = vec![0.0_f32; db.db().dim()];
+        let args = serde_json::json!({
+            "nodes": node_updates,
+            "edges": edge_updates,
+        });
+        let call = CapabilityCall {
+            capability_id: "memory.cognitive.update".to_string(),
+            capability_name: "Update Cognitive Graph".to_string(),
+            arguments: args,
+        };
+        CapabilityService::new(registry, executor)?.execute_for_agent("cognitive-agent", &call)?;
+        tracing::debug!(
+            "cognitive agent: capability update committed (nodes={}, edges={})",
+            node_updates.len(),
+            edge_updates.len()
+        );
 
-                let dynamic_count = {
-                    let mut count = 0usize;
-                    for id in db.db().get_all_ids() {
-                        let Some(payload) = db.db().get_payload(id) else {
-                            continue;
-                        };
-                        if payload.get("_memory_type").and_then(|v| v.as_str()) != Some("cognitive")
-                        {
-                            continue;
-                        }
-                        if payload.get("entity").is_some() {
-                            count += 1;
-                        }
+        self.publish_cognitive_version();
+
+        Ok(())
+    }
+
+    fn publish_cognitive_version(&self) {
+        let Some(memory_db) = &self.memory_db else {
+            return;
+        };
+        use crate::agent::memory::memory_version as mv;
+        if let Ok(conn) = memory_db.lock() {
+            let snapshot_ref =
+                format!("trivium://cognitive/{}", crate::common::UtcTimestamp::now());
+            match mv::stage(&conn, mv::MemoryVersionKind::Cognitive, &snapshot_ref, &[]) {
+                Ok(vid) => {
+                    if let Err(e) = mv::publish(&conn, vid) {
+                        tracing::warn!("cognitive agent: publish version {vid} failed: {e}");
                     }
-                    count
-                };
-                let dynamic_budget = MAX_DYNAMIC_COGNITIVE_NODES.saturating_sub(dynamic_count);
-                if dynamic_budget == 0 {
-                    tracing::warn!(
-                        "cognitive_agent: 动态认知节点达上限 {dynamic_count}/{} — 拒绝本轮新增 \
-                         (nodes={}, edges={})",
-                        MAX_DYNAMIC_COGNITIVE_NODES,
-                        nodes.len(),
-                        edges.len()
-                    );
                 }
-
-                for fragment in nodes.iter().take(dynamic_budget) {
-                    let mut payload = match serde_json::to_value(fragment) {
-                        Ok(Value::Object(p)) => p,
-                        _ => continue,
-                    };
-                    payload.insert(
-                        "_memory_type".to_string(),
-                        Value::String("cognitive".to_string()),
-                    );
-                    let _ = db.db_mut().insert(&zero_vec, Value::Object(payload));
-                }
-
-                for (from, to, relation) in &edges {
-                    let edge_payload = serde_json::json!({
-                        "_memory_type": "cognitive_edge",
-                        "from_entity": from,
-                        "to_entity": to,
-                        "relation": relation,
-                    });
-                    let _ = db.db_mut().insert(&zero_vec, edge_payload);
-                }
-
-                let _ = db.flush();
-
-                if let Some(ref memory_db) = self.memory_db {
-                    use crate::agent::memory::memory_version as mv;
-                    if let Ok(conn) = memory_db.lock() {
-                        let snapshot_ref =
-                            format!("trivium://cognitive/{}", crate::common::UtcTimestamp::now());
-                        match mv::stage(&conn, mv::MemoryVersionKind::Cognitive, &snapshot_ref, &[])
-                        {
-                            Ok(vid) => {
-                                if let Err(e) = mv::publish(&conn, vid) {
-                                    tracing::warn!(
-                                        "cognitive agent: publish version {vid} failed: {e}"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("cognitive agent: stage version failed: {e}")
-                            }
-                        }
-                    }
+                Err(e) => {
+                    tracing::warn!("cognitive agent: stage version failed: {e}");
                 }
             }
         }
+    }
 
-        Ok(())
+    async fn current_cognitive_graph(&self) -> String {
+        let Some(db) = &self.triviumdb else {
+            return String::new();
+        };
+        let db = db.lock().await;
+        let mut lines = Vec::new();
+        for id in db.db().get_all_ids() {
+            let Some(payload) = db.db().get_payload(id) else {
+                continue;
+            };
+            match payload.get("_memory_type").and_then(|v| v.as_str()) {
+                Some("cognitive") => {
+                    let insight = payload
+                        .get("insight")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let context = payload
+                        .get("context")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !insight.is_empty() {
+                        lines.push(format!("- node: {insight} (context: {context})"));
+                    }
+                }
+                Some("cognitive_edge") => {
+                    let from = payload
+                        .get("from_entity")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| payload.get("from").and_then(|v| v.as_str()))
+                        .unwrap_or("");
+                    let to = payload
+                        .get("to_entity")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| payload.get("to").and_then(|v| v.as_str()))
+                        .unwrap_or("");
+                    let relation = payload
+                        .get("relation")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    lines.push(format!("- edge: {from} -> {to} ({relation})"));
+                }
+                _ => {}
+            }
+        }
+        lines.join("\n")
     }
 
     fn recent_thought_summaries(&self, limit: usize) -> String {
@@ -280,5 +274,49 @@ fn truncate_text(s: &str, max_chars: usize) -> String {
         format!("{truncated}…")
     } else {
         truncated
+    }
+}
+
+fn cognitive_updates_from_output(output: Value) -> (Vec<Value>, Vec<Value>) {
+    match output {
+        Value::Array(fragments) => {
+            // 兼容旧版 entity/relation/target 三元组：按边导入。
+            let mut edges = Vec::new();
+            for fragment in fragments {
+                let Some(from) = fragment.get("entity").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Some(relation) = fragment.get("relation").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Some(to) = fragment.get("target").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if from.trim().is_empty() || relation.trim().is_empty() || to.trim().is_empty() {
+                    continue;
+                }
+                edges.push(serde_json::json!({
+                    "action": "upsert",
+                    "from": from,
+                    "relation": relation,
+                    "to": to,
+                }));
+            }
+            (Vec::new(), edges)
+        }
+        Value::Object(obj) => {
+            let nodes = obj
+                .get("nodes")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let edges = obj
+                .get("edges")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            (nodes, edges)
+        }
+        _ => (Vec::new(), Vec::new()),
     }
 }

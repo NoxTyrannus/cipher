@@ -10,3 +10,4 @@ pub mod output;
 pub mod subagent;
 pub mod thinking;
 pub mod thought;
+pub mod tool_protocol;

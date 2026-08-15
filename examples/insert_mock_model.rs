@@ -87,7 +87,8 @@ fn run(args: &Args) -> Result<(), AgentError> {
     // 注意与 init_flow 一致：tool_caps 留 NULL（能力行与 tool_caps 由 entry.rs
     // 启动种子在 bootstrap 之后写入并重载注册表，此处填全量会在 bootstrap 校验报
     // "unknown or non-executable capability_id"）。
-    app_state.duckdb
+    app_state
+        .duckdb
         .execute(
             "INSERT INTO agent (id, name, mode, is_default) \
              SELECT 'agent', 'Agent', 'unni', true \

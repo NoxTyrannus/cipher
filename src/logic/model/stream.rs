@@ -19,9 +19,13 @@ pub enum StreamChunk {
 
     Error(String),
 
-    ToolCallStart { iteration: u32 },
+    ToolCallStart {
+        iteration: u32,
+    },
 
-    ToolCallResult { results: Vec<ToolResult> },
+    ToolCallResult {
+        results: Vec<ToolResult>,
+    },
 }
 
 pub(crate) fn find_double_newline(buf: &[u8]) -> Option<usize> {

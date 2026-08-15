@@ -155,7 +155,6 @@ pub async fn run_setup(
     let config = load_config(&config_path, data_dir_override)?;
     let app_state = crate::data::bootstrap(&config.data_dir)?;
     ensure_default_prompts(&config.data_dir)?;
-    crate::data::factory::ensure_default_wasm_modules(&config.data_dir)?;
     crate::data::cognitive_seed::ensure_default_cognitive_seed(&config.data_dir)?;
     tracing::info!(data_dir = ?config.data_dir, "setup: bootstrap ready");
     if has_configured_model(&app_state.duckdb)? {
@@ -164,6 +163,8 @@ pub async fn run_setup(
         print_welcome_and_help();
         crate::startup::init_flow::init_flow(&app_state, &config.data_dir).await?;
     }
+    crate::data::cognitive_seed::ensure_default_capabilities(&config.data_dir)?;
+    crate::data::cognitive_seed::import_factory_defaults(&app_state.duckdb, &config.data_dir)?;
     tracing::info!("setup: 初始化完成");
     Ok(())
 }
@@ -179,7 +180,6 @@ pub async fn run_normal(
     let mut app_state = crate::data::bootstrap(&config.data_dir)?;
     ensure_default_prompts(&config.data_dir)?;
     tracing::info!(data_dir = ?config.data_dir, "normal: bootstrap ready");
-    crate::data::factory::ensure_default_wasm_modules(&config.data_dir)?;
     crate::data::cognitive_seed::ensure_default_cognitive_seed(&config.data_dir)?;
 
     if !has_configured_model(&app_state.duckdb)? {
@@ -261,101 +261,12 @@ pub async fn run_normal(
             .map_err(|e| AgentError::Bootstrap(format!("cognitive seed: {e}")))?;
     }
 
-    {
-        let shell_id = crate::data::factory::default_shell_capability_id();
-        let shell_name = crate::data::factory::default_shell_capability_name();
-        let shell_executor = format!("wasm:{}", shell_id.replace('.', "_"));
+    crate::data::cognitive_seed::ensure_default_capabilities(&config.data_dir)?;
+    crate::data::cognitive_seed::import_factory_defaults(&app_state.duckdb, &config.data_dir)?;
 
-        let seed_sql = [
-            "INSERT OR REPLACE INTO base_capability (id, name, type, description, schema_in, schema_out, executor, version, enabled) VALUES
-             ('file.read', 'Read File', 'function', 'Read file content',
-              '{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}',
-              '{\"type\":\"object\",\"properties\":{\"content\":{\"type\":\"string\"},\"size\":{\"type\":\"integer\"}}}',
-              'wasm:file.read', '1.0.0', true)",
-            "INSERT OR REPLACE INTO base_capability (id, name, type, description, schema_in, schema_out, executor, version, enabled) VALUES
-             ('file.write', 'Write File', 'function', 'Write content to file',
-              '{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}',
-              '{\"type\":\"object\",\"properties\":{\"success\":{\"type\":\"boolean\"}}}',
-              'wasm:file.write', '1.0.0', true)",
-            "INSERT OR REPLACE INTO base_capability (id, name, type, description, schema_in, schema_out, executor, version, enabled) VALUES
-             ('file.list', 'List Directory', 'function', 'List directory entries',
-              '{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}',
-              '{\"type\":\"object\",\"properties\":{\"entries\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}}}',
-              'wasm:file.list', '1.0.0', true)",
-            "INSERT OR REPLACE INTO base_capability (id, name, type, description, schema_in, schema_out, executor, version, enabled) VALUES
-             ('file.delete', 'Delete File', 'function', 'Delete a file',
-              '{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}',
-              '{\"type\":\"object\",\"properties\":{\"success\":{\"type\":\"boolean\"}}}',
-              'wasm:file.delete', '1.0.0', true)",
-            "INSERT OR REPLACE INTO base_capability (id, name, type, description, schema_in, schema_out, executor, version, enabled) VALUES
-             ('file.move', 'Move File', 'function', 'Move or rename a file',
-              '{\"type\":\"object\",\"properties\":{\"from\":{\"type\":\"string\"},\"to\":{\"type\":\"string\"}},\"required\":[\"from\",\"to\"]}',
-              '{\"type\":\"object\",\"properties\":{\"success\":{\"type\":\"boolean\"}}}',
-              'wasm:file.move', '1.0.0', true)",
-            "INSERT OR REPLACE INTO base_capability (id, name, type, description, schema_in, schema_out, executor, version, enabled) VALUES
-             ('text.grep', 'Grep Text', 'function', 'Search text pattern in file',
-              '{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"}},\"required\":[\"pattern\",\"path\"]}',
-              '{\"type\":\"object\",\"properties\":{\"matches\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}}}',
-              'wasm:text.grep', '1.0.0', true)",
-        ];
-        for sql in &seed_sql {
-            app_state
-                .duckdb
-                .execute(sql, [])
-                .map_err(|e| AgentError::Bootstrap(format!("seed base_capability: {e}")))?;
-        }
-
-        app_state
-            .duckdb
-            .execute(
-                &format!(
-                    "INSERT OR REPLACE INTO base_capability (id, name, type, description, schema_in, schema_out, executor, version, enabled) VALUES
-                     ('{}', '{}', 'function', '{} command in workspace',
-                      '{{\"type\":\"object\",\"properties\":{{\"command\":{{\"type\":\"string\"}}}},\"required\":[\"command\"]}}',
-                      '{{\"type\":\"object\",\"properties\":{{\"stdout\":{{\"type\":\"string\"}},\"stderr\":{{\"type\":\"string\"}},\"exit_code\":{{\"type\":\"integer\"}}}}}}',
-                      '{}', '1.0.0', true)",
-                    shell_id, shell_name, shell_name, shell_executor
-                ),
-                [],
-            )
-            .map_err(|e| AgentError::Bootstrap(format!("seed shell capability: {e}")))?;
-
-        let mut caps = vec![
-            "file.read",
-            "file.write",
-            "file.list",
-            "file.delete",
-            "file.move",
-            "text.grep",
-        ];
-        caps.push(shell_id);
-        let caps_json = serde_json::to_string(&caps)
-            .map_err(|e| AgentError::Bootstrap(format!("serialize tool_caps: {e}")))?;
-        app_state
-            .duckdb
-            .execute(
-                &format!(
-                    "UPDATE agent SET tool_caps = '{}' WHERE id = 'agent'",
-                    caps_json
-                ),
-                [],
-            )
-            .ok();
-        app_state
-            .duckdb
-            .execute(
-                "UPDATE agent SET config = '{\"max_turns\": 6}' \
-                 WHERE id = 'agent' AND (config IS NULL OR config = 'null')",
-                [],
-            )
-            .ok();
-        tracing::info!("factory: seeded 7 base capabilities + agent tool_caps (shell={shell_id})");
-    }
-
-    // 关键：能力/agent 种子在上述块中才写入 DuckDB，而 `app_state.registry`
-    // 在 bootstrap() 时已加载（早于种子）。若不在此时重载，执行平台与模式管理器
-    // 拿到的注册表缺 agent 行（新目录）或 tool_caps 为 NULL（setup 后），
-    // 真实能力执行（shell.exec/file.* 等）将全部失败。
+    // 关键：能力/agent 种子在 import_factory_defaults 中才写入 DuckDB，
+    // 而 `app_state.registry` 在 bootstrap() 时已加载（早于种子）。
+    // 必须在此重载，执行平台/记忆 agent 才能拿到最新 tool_caps 与能力行。
     app_state.registry = crate::data::duckdb::loader::load_all_into_memory(&app_state.duckdb)?;
 
     let memory_db = {
@@ -380,13 +291,17 @@ pub async fn run_normal(
     let exec_prompts_dir = prompts_dir.clone();
     let exec_capability_ids = crate::data::factory::default_shell_capability_ids();
 
+    let shared_thought_store = std::sync::Arc::new(
+        crate::data::thought_store::ThoughtStore::open(app_state.paths.thoughts_data_root())
+            .map_err(|e| AgentError::Bootstrap(format!("ThoughtStore open: {e}")))?,
+    );
+
     let exec_registry = Some(app_state.registry.clone());
     let exec_executor = {
         let mut ex = crate::logic::capability::executor::CapabilityExecutor::new();
-        ex.set_wasm(
-            &config.data_dir.join("wasm"),
-            &std::env::current_dir().unwrap_or_default(),
-        );
+        ex.set_workspace_root(&std::env::current_dir().unwrap_or_default());
+        ex.set_triviumdb(std::sync::Arc::clone(&trivium_db));
+        ex.set_thought_store(std::sync::Arc::clone(&shared_thought_store));
         let duckdb_path = app_state.paths.duckdb();
         match duckdb::Connection::open(&duckdb_path) {
             Ok(conn) => {
@@ -400,6 +315,8 @@ pub async fn run_normal(
         }
         Some(std::sync::Arc::new(ex))
     };
+    let memory_executor =
+        std::sync::Arc::clone(exec_executor.as_ref().expect("executor configured"));
     let execution_task = tokio::spawn(async move {
         crate::agent::execution_platform::run(
             pool_exec,
@@ -473,6 +390,7 @@ pub async fn run_normal(
     let memory_triviumdb_path = Some(triviumdb_path.clone());
     let memory_prompts_dir = prompts_dir.clone();
 
+    let memory_registry = Some(app_state.registry.clone());
     let (experience_tx, experience_rx) =
         mpsc::channel::<crate::agent::communication::AttentionRetireBatch>(32);
     let (preference_tx, preference_rx) =
@@ -486,6 +404,8 @@ pub async fn run_normal(
         let exp_prompts = memory_prompts_dir.clone();
 
         let exp_trivium = std::sync::Arc::clone(&trivium_db);
+        let exp_registry = memory_registry.clone();
+        let exp_executor = std::sync::Arc::clone(&memory_executor);
         tokio::spawn(async move {
             let agent = crate::agent::memory::experience_agent::ExperienceMemoryAgent::new(
                 exp_provider,
@@ -494,6 +414,8 @@ pub async fn run_normal(
                 Some(exp_trivium),
                 exp_prompts,
                 experience_rx,
+                exp_registry,
+                Some(exp_executor),
             );
             agent.run().await;
         });
@@ -507,6 +429,8 @@ pub async fn run_normal(
         let pref_prompts = memory_prompts_dir.clone();
 
         let pref_trivium = std::sync::Arc::clone(&trivium_db);
+        let pref_registry = memory_registry.clone();
+        let pref_executor = std::sync::Arc::clone(&memory_executor);
         tokio::spawn(async move {
             let agent = crate::agent::memory::preference_agent::PreferenceMemoryAgent::new(
                 pref_provider,
@@ -515,6 +439,8 @@ pub async fn run_normal(
                 Some(pref_trivium),
                 pref_prompts,
                 preference_rx,
+                pref_registry,
+                Some(pref_executor),
             );
             agent.run().await;
         });
@@ -529,10 +455,9 @@ pub async fn run_normal(
 
         let cog_trivium = std::sync::Arc::clone(&trivium_db);
         let cog_memory_db = std::sync::Arc::clone(&memory_db);
-        let cog_thought_store =
-            crate::data::thought_store::ThoughtStore::open(app_state.paths.thoughts_data_root())
-                .ok()
-                .map(std::sync::Arc::new);
+        let cog_thought_store = std::sync::Arc::clone(&shared_thought_store);
+        let cog_registry = memory_registry.clone();
+        let cog_executor = std::sync::Arc::clone(&memory_executor);
         tokio::spawn(async move {
             let agent = crate::agent::memory::cognitive_agent::CognitiveAgent::new(
                 cog_provider,
@@ -542,7 +467,9 @@ pub async fn run_normal(
                 cog_prompts,
                 cognitive_rx,
                 Some(cog_memory_db),
-                cog_thought_store,
+                Some(cog_thought_store),
+                cog_registry,
+                Some(cog_executor),
             );
             agent.run().await;
         });
@@ -562,6 +489,8 @@ pub async fn run_normal(
             Some(trivium_for_platform),
             Some(memory_db_for_platform),
             memory_prompts_dir,
+            memory_registry,
+            Some(memory_executor),
             Some(experience_tx),
             Some(preference_tx),
             Some(cognitive_tx),
@@ -599,9 +528,7 @@ pub async fn run_normal(
     let ctx = crate::mode_runtime::ModeContext::default();
 
     let assembler_triviumdb_path = Some(triviumdb_path.clone());
-    let thought_store = std::sync::Arc::new(crate::data::thought_store::ThoughtStore::open(
-        app_state.paths.thoughts_data_root(),
-    )?);
+    let thought_store = std::sync::Arc::clone(&shared_thought_store);
     let mut assembler = ContextAssembler::new_with_roots(
         ContextConfig::from(&config.context),
         app_state.paths.storage_root(),
@@ -694,9 +621,10 @@ pub async fn run_config(
     let config = load_config(&config_path, data_dir_override)?;
     let app_state = crate::data::bootstrap(&config.data_dir)?;
     ensure_default_prompts(&config.data_dir)?;
-    crate::data::factory::ensure_default_wasm_modules(&config.data_dir)?;
     tracing::info!(data_dir = ?config.data_dir, "config: bootstrap ready");
     crate::data::cognitive_seed::ensure_default_cognitive_seed(&config.data_dir)?;
+    crate::data::cognitive_seed::ensure_default_capabilities(&config.data_dir)?;
+    crate::data::cognitive_seed::import_factory_defaults(&app_state.duckdb, &config.data_dir)?;
     crate::startup::config_flow::run(&app_state)?;
     tracing::info!("config: 完成");
     Ok(())
@@ -1619,10 +1547,7 @@ struct MixDepRegistry {
 
 impl MixDepRegistry {
     fn register(&self, id: String) {
-        self.inner
-            .lock()
-            .unwrap()
-            .insert(id, MixDepState::Running);
+        self.inner.lock().unwrap().insert(id, MixDepState::Running);
     }
 
     fn state(&self, id: &str) -> MixDepState {
@@ -1659,8 +1584,15 @@ impl MixDepRegistry {
 /// - `AwaitFinal`：实例2 已 spawn，等实例1+2 就绪（或永久失败）后 spawn final。
 #[derive(Debug, Clone)]
 enum PendingMix {
-    AwaitReflect1 { base: String, reflect1: String },
-    AwaitFinal { base: String, reflect1: String, reflect2: String },
+    AwaitReflect1 {
+        base: String,
+        reflect1: String,
+    },
+    AwaitFinal {
+        base: String,
+        reflect1: String,
+        reflect2: String,
+    },
 }
 
 /// 推进 Mix join：依赖就绪/永久失败即前进（spawn 实例2 / spawn final）。
@@ -1681,9 +1613,7 @@ async fn try_progress_mix(
         let Some(pending) = mix_join.clone() else {
             return;
         };
-        tracing::debug!(
-            "try_progress_mix: pending={pending:?} final_wanted={final_wanted}"
-        );
+        tracing::debug!("try_progress_mix: pending={pending:?} final_wanted={final_wanted}");
         match pending {
             PendingMix::AwaitReflect1 { base, reflect1 } => {
                 let s1 = registry.state(&reflect1);
@@ -1698,8 +1628,14 @@ async fn try_progress_mix(
                     MixDepState::Ready => {}
                 }
                 let r1_for_summary = matches!(s1, MixDepState::Ready).then(|| reflect1.clone());
-                let summary = mix_summary(pool, &base, r1_for_summary.as_deref(), None, "insight_complete")
-                    .await;
+                let summary = mix_summary(
+                    pool,
+                    &base,
+                    r1_for_summary.as_deref(),
+                    None,
+                    "insight_complete",
+                )
+                .await;
                 let new_id = spawn_mix_reflect(mode_manager, state, &summary).await;
                 if let Some(id2) = &new_id {
                     mix_state.set_reflect2(Some(id2.clone()), &base);
@@ -1740,8 +1676,8 @@ async fn try_progress_mix(
                 }
                 let r1 = matches!(s1, MixDepState::Ready).then(|| reflect1.clone());
                 let r2 = matches!(s2, MixDepState::Ready).then(|| reflect2.clone());
-                let summary = mix_summary(pool, &base, r1.as_deref(), r2.as_deref(), "memory_complete")
-                    .await;
+                let summary =
+                    mix_summary(pool, &base, r1.as_deref(), r2.as_deref(), "memory_complete").await;
                 let new_id = spawn_mix_final(mode_manager, state, &summary).await;
                 // 实例3 = 下一轮 think_0：成为新的 base_turn，反思位清空
                 mix_state.advance_round(new_id);
@@ -2214,10 +2150,12 @@ mod echo_summary_tests {
                 attention: vec![AttentionFragment {
                     focus: "ERROR统计结果-a.log".into(),
                     content: "logs/a.log 中 ERROR 出现 3 次".into(),
+                    source_refs: vec![],
                 }],
                 experience: vec![ExperienceFragment {
                     title: "经验1".into(),
                     summary: "s".into(),
+                    source_refs: vec![],
                 }],
                 preference: vec![],
                 cognitive: vec![],

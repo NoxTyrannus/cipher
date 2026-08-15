@@ -2,11 +2,13 @@
 use super::base::BaseCapability;
 use super::base::Schema;
 use crate::common::{AgentError, Result};
-use crate::data::duckdb::loader::BaseCapabilityRow;
 use crate::data::duckdb::Registry;
+use crate::data::thought_store::ThoughtStore;
+use crate::data::triviumdb::TriviumDb;
+use crate::logic::builtin::host_context::HostContext;
 #[cfg(test)]
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -19,9 +21,10 @@ pub enum ReloadEvent {
 pub struct CapabilityExecutor {
     #[cfg(test)]
     registry: HashMap<String, Arc<dyn BaseCapability>>,
-    wasm_modules_dir: Option<PathBuf>,
-    workspace_root: Option<PathBuf>,
+    host_context: HostContext,
     duckdb: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
+    triviumdb: Option<Arc<tokio::sync::Mutex<TriviumDb>>>,
+    thought_store: Option<Arc<ThoughtStore>>,
     reload_tx: Option<mpsc::Sender<ReloadEvent>>,
 }
 
@@ -33,34 +36,71 @@ const ALLOWED_TABLES: &[&str] = &[
 ];
 
 impl CapabilityExecutor {
-    pub fn set_wasm(&mut self, wasm_dir: &Path, workspace_root: &Path) {
-        self.wasm_modules_dir = Some(wasm_dir.to_path_buf());
-        self.workspace_root = Some(workspace_root.to_path_buf());
+    pub fn set_workspace_root(&mut self, workspace_root: &Path) {
+        self.host_context = HostContext::for_workspace(workspace_root.to_path_buf());
     }
+
     fn execute_builtin(&self, _id: &str, builtin_name: &str, input: &Schema) -> Result<Schema> {
-        match builtin_name {
-            "db.insert" => self.builtin_db_insert(input),
-            "db.update" => self.builtin_db_update(input),
-            "db.delete" => self.builtin_db_delete(input),
-            "db.query" => self.builtin_db_query(input),
-            _ => Err(AgentError::NotFound(format!(
-                "builtin executor: {builtin_name}"
-            ))),
-        }
+        let host = &self.host_context;
+        let result: std::result::Result<Schema, String> = match builtin_name {
+            "file.read" => crate::logic::builtin::host_functions::host_file_read(host, input),
+            "file.write" => crate::logic::builtin::host_functions::host_file_write(host, input),
+            "file.list" => crate::logic::builtin::host_functions::host_file_list(host, input),
+            "file.delete" => crate::logic::builtin::host_functions::host_file_delete(host, input),
+            "file.move" => crate::logic::builtin::host_functions::host_file_move(host, input),
+            "file.chunk_read" => {
+                crate::logic::builtin::host_functions::host_file_chunk_read(host, input)
+            }
+            "text.grep" => crate::logic::builtin::host_functions::host_text_grep(host, input),
+            "shell.exec" | "powershell.exec" => {
+                crate::logic::builtin::host_functions::host_shell_exec(host, input)
+            }
+            "code.exec" => crate::logic::builtin::host_functions::host_code_exec(host, input),
+            "capability.import" => {
+                let conn = self.duckdb.as_ref().ok_or_else(|| {
+                    AgentError::NotFound("capability.import: duckdb not configured".into())
+                })?;
+                let guard = conn.lock().map_err(|e| {
+                    AgentError::Script(format!("builtin capability.import: lock poisoned: {e}"))
+                })?;
+                return super::import::capability_import(&guard, &self.reload_tx, input)
+                    .map_err(|e| AgentError::Script(format!("builtin capability.import: {e}")));
+            }
+            "db.insert" => return self.builtin_db_insert(input),
+            "db.update" => return self.builtin_db_update(input),
+            "db.delete" => return self.builtin_db_delete(input),
+            "db.query" => return self.builtin_db_query(input),
+            name if name.starts_with("memory.") => return self.execute_memory(name, input),
+            _ => {
+                return Err(AgentError::NotFound(format!(
+                    "builtin executor: {builtin_name}"
+                )))
+            }
+        };
+        result.map_err(|e| AgentError::Script(format!("builtin {builtin_name}: {e}")))
     }
     pub fn new() -> Self {
         Self {
             #[cfg(test)]
             registry: HashMap::new(),
-            wasm_modules_dir: None,
-            workspace_root: None,
+            host_context: HostContext::deny_all(),
             duckdb: None,
+            triviumdb: None,
+            thought_store: None,
             reload_tx: None,
         }
     }
 
     pub fn set_duckdb(&mut self, db: Arc<std::sync::Mutex<duckdb::Connection>>) {
         self.duckdb = Some(db);
+    }
+
+    pub fn set_triviumdb(&mut self, db: Arc<tokio::sync::Mutex<TriviumDb>>) {
+        self.triviumdb = Some(db);
+    }
+
+    pub fn set_thought_store(&mut self, store: Arc<ThoughtStore>) {
+        self.thought_store = Some(store);
     }
 
     pub fn set_reload_tx(&mut self, tx: mpsc::Sender<ReloadEvent>) {
@@ -77,9 +117,7 @@ impl CapabilityExecutor {
             if let Some(builtin_name) = row.executor.strip_prefix("builtin:") {
                 return self.execute_builtin(id, builtin_name, input);
             }
-            if let Some(module_name) = row.executor.strip_prefix("wasm:") {
-                return self.execute_wasm(id, row, input, module_name);
-            }
+
             #[cfg(test)]
             {
                 if let Some(cap) = self.registry.get(&row.executor) {
@@ -96,6 +134,29 @@ impl CapabilityExecutor {
             return cap.execute(input);
         }
         Err(AgentError::NotFound(format!("base capability: {}", id)))
+    }
+
+    fn execute_memory(&self, builtin_name: &str, input: &Schema) -> Result<Schema> {
+        let db = self.triviumdb.as_ref().ok_or_else(|| {
+            AgentError::NotFound("memory capability: triviumdb not configured".into())
+        })?;
+        let mut guard = db.blocking_lock();
+        let raw = match builtin_name {
+            "memory.list" => super::memory::memory_list(&guard, input),
+            "memory.retrieve" => super::memory::memory_retrieve(&guard, input),
+            "memory.delete" => super::memory::memory_delete(&mut guard, input),
+            "memory.attention.write" => super::memory::memory_attention_write(&mut guard, input),
+            "memory.attention.retire" => super::memory::memory_attention_retire(&mut guard, input),
+            "memory.experience.write" => super::memory::memory_experience_write(&mut guard, input),
+            "memory.preference.write" => super::memory::memory_preference_write(&mut guard, input),
+            "memory.cognitive.update" => super::memory::memory_cognitive_update(&mut guard, input),
+            "memory.evidence.lookup" => {
+                return super::memory::memory_evidence_lookup(self.thought_store.as_ref(), input)
+                    .map_err(|e| AgentError::Script(format!("builtin {builtin_name}: {e}")))
+            }
+            other => return Err(AgentError::NotFound(format!("builtin executor: {other}"))),
+        };
+        raw.map_err(|e| AgentError::Script(format!("builtin {builtin_name}: {e}")))
     }
 
     fn builtin_db_insert(&self, input: &Schema) -> Result<Schema> {
@@ -266,47 +327,6 @@ impl CapabilityExecutor {
             let _ = tx.try_send(event);
         }
     }
-
-    fn execute_wasm(
-        &self,
-        _id: &str,
-        _row: &BaseCapabilityRow,
-        input: &Schema,
-        module_name: &str,
-    ) -> Result<Schema> {
-        let wasm_dir = self
-            .wasm_modules_dir
-            .as_ref()
-            .ok_or_else(|| AgentError::NotFound("wasm_modules_dir not configured".into()))?;
-        let ws_root = self.workspace_root.clone().unwrap_or_default();
-        let module_path = wasm_dir.join(format!("{}.wat", module_name.replace('.', "_")));
-        if !module_path.exists() {
-            return Err(AgentError::NotFound(format!(
-                "wasm module not found: {:?}",
-                module_path
-            )));
-        }
-        let runtime = crate::logic::script::WasmRuntime::new()
-            .map_err(|e| AgentError::Script(format!("runtime init: {e}")))?;
-        let host_ctx = crate::logic::script::host_context::HostContext {
-            permission: crate::logic::script::host_context::PermissionSnapshot {
-                file_read_roots: vec![ws_root.clone()],
-                file_write_roots: vec![ws_root.clone()],
-                shell_exec_allowed: true,
-                ..Default::default()
-            },
-            budget: crate::logic::script::host_context::BudgetSnapshot::default(),
-            duckdb: None,
-            triviumdb: None,
-        };
-        let input_str = serde_json::to_string(input)
-            .map_err(|e| AgentError::Script(format!("serialize input: {e}")))?;
-        let output_str = runtime
-            .run_with_host(&module_path, &input_str, host_ctx)
-            .map_err(|e| AgentError::Script(format!("wasm run: {e}")))?;
-        serde_json::from_str(&output_str)
-            .map_err(|e| AgentError::Script(format!("parse output: {e}")))
-    }
 }
 
 impl Default for CapabilityExecutor {
@@ -318,6 +338,7 @@ impl Default for CapabilityExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::duckdb::loader::BaseCapabilityRow;
 
     struct EchoCap;
     impl BaseCapability for EchoCap {
@@ -349,8 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn wasm_file_read_repro() {
-        use crate::data::duckdb::loader::BaseCapabilityRow;
+    fn builtin_file_read_repro() {
         let mut reg = Registry::new();
         reg.base_capabilities.insert(
             "file.read".into(),
@@ -361,7 +381,7 @@ mod tests {
                 description: "read".into(),
                 schema_in: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
                 schema_out: serde_json::json!({}),
-                executor: "wasm:file.read".into(),
+                executor: "builtin:file.read".into(),
                 version: "1.0.0".into(),
                 enabled: true,
                 tombstoned_at: None,
@@ -370,7 +390,7 @@ mod tests {
         );
         let mut ex = CapabilityExecutor::new();
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        ex.set_wasm(&repo_root.join("data/wasm"), repo_root);
+        ex.set_workspace_root(repo_root);
         let out = ex.execute(
             "file.read",
             &reg,

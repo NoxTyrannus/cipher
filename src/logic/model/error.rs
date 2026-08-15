@@ -57,7 +57,7 @@ pub fn is_retryable_llm_error(e: &AgentError) -> bool {
     match e {
         AgentError::Timeout(_) => true,
         AgentError::Io(_) => true,
-        AgentError::Llm(msg) => extract_http_status(msg).map_or(false, is_retryable_status),
+        AgentError::Llm(msg) => extract_http_status(msg).is_some_and(is_retryable_status),
         _ => false,
     }
 }
@@ -79,7 +79,10 @@ mod tests {
 
     #[test]
     fn extract_status_from_messages() {
-        assert_eq!(extract_http_status("openai HTTP 429 at http://x/"), Some(429));
+        assert_eq!(
+            extract_http_status("openai HTTP 429 at http://x/"),
+            Some(429)
+        );
         assert_eq!(extract_http_status("anthropic HTTP 500: boom"), Some(500));
         assert_eq!(extract_http_status("HTTP 404 at ..."), Some(404));
         assert_eq!(extract_http_status("no status here"), None);
@@ -104,7 +107,9 @@ mod tests {
         assert!(is_retryable_llm_error(&AgentError::Io("net".into())));
         assert!(is_retryable_llm_error(&AgentError::Llm("HTTP 429".into())));
         assert!(!is_retryable_llm_error(&AgentError::Llm("HTTP 404".into())));
-        assert!(!is_retryable_llm_error(&AgentError::Llm("parse error: x".into())));
+        assert!(!is_retryable_llm_error(&AgentError::Llm(
+            "parse error: x".into()
+        )));
         assert!(!is_retryable_llm_error(&AgentError::ThinkingOutputInvalid(
             "x".into()
         )));

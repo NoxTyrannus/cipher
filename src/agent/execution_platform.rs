@@ -3614,7 +3614,7 @@ mod tests {
             description: "read file".to_string(),
             schema_in: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
             schema_out: serde_json::json!({}),
-            executor: "wasm:file.read".to_string(),
+            executor: "builtin:file.read".to_string(),
             version: "1.0.0".to_string(),
             enabled: true,
             tombstoned_at: None,
@@ -3629,7 +3629,7 @@ mod tests {
             description: "write file".to_string(),
             schema_in: serde_json::json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}),
             schema_out: serde_json::json!({}),
-            executor: "wasm:file.write".to_string(),
+            executor: "builtin:file.write".to_string(),
             version: "1.0.0".to_string(),
             enabled: true,
             tombstoned_at: None,
@@ -3674,9 +3674,8 @@ mod tests {
     }
 
     fn a1_flow_executor(workspace: &Path) -> CapabilityExecutor {
-        let wasm_dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/data/wasm"));
         let mut ex = CapabilityExecutor::new();
-        ex.set_wasm(wasm_dir, workspace);
+        ex.set_workspace_root(workspace);
         let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
         conn.execute_batch("CREATE TABLE agent (id TEXT); INSERT INTO agent VALUES ('agent');")
             .expect("seed agent table");
