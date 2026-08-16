@@ -41,7 +41,7 @@ fn init_tracing() {
         .try_init();
 }
 
-const LEGACY_DEFAULT_PROMPT_SHA256: [(&str, &str); 14] = [
+const LEGACY_DEFAULT_PROMPT_SHA256: [(&str, &str); 20] = [
     (
         "system.md",
         "a3e6f5e733ad55b953092b7f2b980d28540e2c18970615cd2fe6eac23ff3ebd4",
@@ -74,6 +74,31 @@ const LEGACY_DEFAULT_PROMPT_SHA256: [(&str, &str); 14] = [
     (
         "mode_loop.md",
         "32e5818ede42ea5fff031a9d2f27ddb2fb4fd4aad818c02882a4de70e4c6c2c8",
+    ),
+    // v0.3.0 出厂版本（v0.3.1 上下文工程分层重构前）
+    (
+        "system.md",
+        "706cc23d73b26e3dd3a85c9df036c03f2d238b1953ad0b0e9d3ad69121e5685a",
+    ),
+    (
+        "mode_unni.md",
+        "ffc113372e325745ab307fd31c8588fda21630ce425d6b6b4c2b3c13b3edb1a4",
+    ),
+    (
+        "mode_keep.md",
+        "e0ba5abeef3e0e00f2f35c2fa6f49cf4d7a91171c22e2e7809610a0bf2f35a48",
+    ),
+    (
+        "mode_loop.md",
+        "16d403e3c612cc01cb422ab6a40972bdcaebfba5ee17fa3ce73e98a3705bf4a1",
+    ),
+    (
+        "execution_platform.md",
+        "05a9fb25d879b533b3bb9386a2d5969a2328141adfd99b20e542ed68a939902b",
+    ),
+    (
+        "insight_platform.md",
+        "17dafb1fbec2dd44f7ab7fe4aeae31c73b417cfd9ee607661c8fc73b9bfcda8e",
     ),
     (
         "execution_platform.md",
