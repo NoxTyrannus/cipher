@@ -43,6 +43,11 @@ impl CapabilityExecutor {
     fn execute_builtin(&self, _id: &str, builtin_name: &str, input: &Schema) -> Result<Schema> {
         let host = &self.host_context;
         let result: std::result::Result<Schema, String> = match builtin_name {
+            "path.exists" => crate::logic::builtin::host_functions::host_path_exists(host, input),
+            "file.glob" => crate::logic::builtin::host_functions::host_file_glob(host, input),
+            "json.validate" => {
+                crate::logic::builtin::host_functions::host_json_validate(host, input)
+            }
             "file.read" => crate::logic::builtin::host_functions::host_file_read(host, input),
             "file.write" => crate::logic::builtin::host_functions::host_file_write(host, input),
             "file.list" => crate::logic::builtin::host_functions::host_file_list(host, input),

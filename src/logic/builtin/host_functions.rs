@@ -62,6 +62,175 @@ fn ensure_within(path: &Path, roots: &[PathBuf]) -> Result<(), String> {
     }
 }
 
+pub fn host_path_exists(ctx: &HostContext, args: &Value) -> Result<Value, String> {
+    let path_str = match required_string(args, "path", "path.exists") {
+        Ok(v) => v,
+        Err(v) => return Ok(v),
+    };
+    let canonical = match resolve_sandbox_path(path_str, &ctx.permission.file_read_roots) {
+        Ok(path) => path,
+        Err(_) => {
+            return Ok(serde_json::json!({"exists": false, "is_file": false, "is_dir": false}))
+        }
+    };
+    match std::fs::metadata(&canonical) {
+        Ok(meta) => Ok(serde_json::json!({
+            "exists": true,
+            "is_file": meta.is_file(),
+            "is_dir": meta.is_dir(),
+        })),
+        Err(_) => Ok(serde_json::json!({"exists": false, "is_file": false, "is_dir": false})),
+    }
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    fn inner(p: &[char], t: &[char]) -> bool {
+        match (p.first(), t.first()) {
+            (None, None) => true,
+            (Some('*'), Some('*')) => {
+                let mut idx = 0;
+                while idx < p.len() && p[idx] == '*' {
+                    idx += 1;
+                }
+                if idx >= p.len() {
+                    return true;
+                }
+                for skip in 0..=t.len() {
+                    if inner(&p[idx..], &t[skip..]) {
+                        return true;
+                    }
+                }
+                false
+            }
+            (Some('*'), _) => {
+                let mut idx = 0;
+                while idx < p.len() && p[idx] == '*' {
+                    idx += 1;
+                }
+                if idx >= p.len() {
+                    return true;
+                }
+                for skip in 0..=t.len() {
+                    if skip > 0 && t[skip - 1] == '/' {
+                        break;
+                    }
+                    if inner(&p[idx..], &t[skip..]) {
+                        return true;
+                    }
+                }
+                false
+            }
+            (Some('?'), Some(_)) => inner(&p[1..], &t[1..]),
+            (Some(a), Some(b)) if a == b => inner(&p[1..], &t[1..]),
+            _ => false,
+        }
+    }
+    inner(
+        &pattern.chars().collect::<Vec<_>>(),
+        &text.chars().collect::<Vec<_>>(),
+    )
+}
+
+fn collect_workspace_files(root: &Path, limit: usize, out: &mut Vec<PathBuf>) {
+    if out.len() >= limit {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        if out.len() >= limit {
+            return;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        out.push(entry.path());
+        if file_type.is_dir() {
+            collect_workspace_files(&entry.path(), limit, out);
+        }
+    }
+}
+
+pub fn host_file_glob(ctx: &HostContext, args: &Value) -> Result<Value, String> {
+    let pattern = match required_string(args, "pattern", "file.glob") {
+        Ok(v) => v,
+        Err(v) => return Ok(v),
+    };
+    let root_str = args.get("root").and_then(|v| v.as_str()).unwrap_or(".");
+    let root = match resolve_sandbox_path(root_str, &ctx.permission.file_read_roots) {
+        Ok(root) => root,
+        Err(e) => return fail_str(format!("file.glob: {e}")),
+    };
+    let Ok(meta) = std::fs::metadata(&root) else {
+        return Ok(serde_json::json!({"matches": [], "count": 0}));
+    };
+    if !meta.is_dir() {
+        return fail_str("file.glob: root must be a directory");
+    }
+
+    let mut all = Vec::new();
+    collect_workspace_files(&root, 2000, &mut all);
+    let mut matches = Vec::new();
+    for path in all {
+        let Ok(rel) = path.strip_prefix(&root) else {
+            continue;
+        };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let haystack = if pattern.contains('/') {
+            rel.clone()
+        } else {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        if glob_match(pattern, &haystack) {
+            matches.push(rel);
+        }
+        if matches.len() >= 1000 {
+            break;
+        }
+    }
+    matches.sort();
+    let count = matches.len();
+    Ok(serde_json::json!({"matches": matches, "count": count}))
+}
+
+pub fn host_json_validate(_ctx: &HostContext, args: &Value) -> Result<Value, String> {
+    let text = match required_string(args, "text", "json.validate") {
+        Ok(v) => v,
+        Err(v) => return Ok(v),
+    };
+    let mut errors = Vec::new();
+    let parsed: Result<Value, _> = serde_json::from_str(text);
+    match parsed {
+        Ok(value) => {
+            if let Some(schema) = args.get("schema").filter(|v| v.is_object()) {
+                if let Ok(validator) = jsonschema::validator_for(schema) {
+                    if !validator.is_valid(&value) {
+                        errors.extend(
+                            validator
+                                .iter_errors(&value)
+                                .take(10)
+                                .map(|e| e.to_string()),
+                        );
+                    }
+                } else {
+                    errors.push("invalid json schema".to_string());
+                }
+            }
+            Ok(serde_json::json!({"valid": errors.is_empty(), "errors": errors}))
+        }
+        Err(e) => Ok(serde_json::json!({"valid": false, "errors": [e.to_string()]})),
+    }
+}
+
 pub fn host_file_read(ctx: &HostContext, args: &Value) -> Result<Value, String> {
     let path_str = match required_string(args, "path", "host_file_read") {
         Ok(v) => v,
@@ -226,6 +395,10 @@ pub fn host_text_grep(ctx: &HostContext, args: &Value) -> Result<Value, String> 
         Ok(v) => v,
         Err(v) => return Ok(v),
     };
+    let recursive = args
+        .get("recursive")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let canonical = match resolve_sandbox_path(path_str, &ctx.permission.file_read_roots) {
         Ok(p) => p,
@@ -233,14 +406,47 @@ pub fn host_text_grep(ctx: &HostContext, args: &Value) -> Result<Value, String> 
     };
     ensure_within(&canonical, &ctx.permission.file_read_roots)
         .map_err(|e| format!("host_text_grep: {e}"))?;
+    let meta =
+        std::fs::metadata(&canonical).map_err(|e| format!("host_text_grep: metadata: {e}"))?;
 
-    let content =
-        std::fs::read_to_string(&canonical).map_err(|e| format!("host_text_grep: read: {e}"))?;
-    let matches: Vec<String> = content
-        .lines()
-        .filter(|line| line.contains(pattern))
-        .map(|s| s.to_string())
-        .collect();
+    let mut matches: Vec<String> = Vec::new();
+    if meta.is_file() {
+        let content = std::fs::read_to_string(&canonical)
+            .map_err(|e| format!("host_text_grep: read: {e}"))?;
+        for line in content.lines().filter(|line| line.contains(pattern)) {
+            matches.push(line.to_string());
+        }
+    } else if meta.is_dir() && recursive {
+        let mut files = Vec::new();
+        collect_workspace_files(&canonical, 2000, &mut files);
+        for file in files {
+            let Ok(file_meta) = std::fs::metadata(&file) else {
+                continue;
+            };
+            if !file_meta.is_file() {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            for line in content.lines().filter(|line| line.contains(pattern)) {
+                let rel = file
+                    .strip_prefix(&canonical)
+                    .unwrap_or(&file)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                matches.push(format!("{rel}: {line}"));
+            }
+            if matches.len() >= 1000 {
+                break;
+            }
+        }
+    } else if meta.is_dir() {
+        return fail_str(
+            "host_text_grep: path is a directory; set recursive=true to search recursively",
+        );
+    }
+
     Ok(serde_json::json!({"matches": matches}))
 }
 
@@ -634,6 +840,77 @@ mod tests {
         let r = host_shell_exec(&ctx, &serde_json::json!({"command": "echo ok"})).unwrap();
         assert_eq!(r["exit_code"], 0);
         assert_eq!(r["stdout"].as_str().unwrap().trim(), "ok");
+    }
+
+    #[test]
+    fn path_exists_reports_type() {
+        let dir = tempdir().unwrap();
+        let ctx = ctx(dir.path());
+        host_file_write(&ctx, &serde_json::json!({"path": "x.txt", "content": "x"})).unwrap();
+        let r = host_path_exists(&ctx, &serde_json::json!({"path": "x.txt"})).unwrap();
+        assert_eq!(r["exists"], true);
+        assert_eq!(r["is_file"], true);
+        let r = host_path_exists(&ctx, &serde_json::json!({"path": "missing.txt"})).unwrap();
+        assert_eq!(r["exists"], false);
+    }
+
+    #[test]
+    fn file_glob_matches_nested_files() {
+        let dir = tempdir().unwrap();
+        let ctx = ctx(dir.path());
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        host_file_write(
+            &ctx,
+            &serde_json::json!({"path": "a/one.md", "content": "1"}),
+        )
+        .unwrap();
+        host_file_write(
+            &ctx,
+            &serde_json::json!({"path": "a/two.txt", "content": "2"}),
+        )
+        .unwrap();
+        let r = host_file_glob(&ctx, &serde_json::json!({"pattern": "**/*.md"})).unwrap();
+        assert_eq!(r["count"], 1);
+        assert!(r["matches"][0].as_str().unwrap().contains("one.md"));
+    }
+
+    #[test]
+    fn text_grep_recursive_directory() {
+        let dir = tempdir().unwrap();
+        let ctx = ctx(dir.path());
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        host_file_write(
+            &ctx,
+            &serde_json::json!({"path": "logs/a.log", "content": "ERROR one"}),
+        )
+        .unwrap();
+        host_file_write(
+            &ctx,
+            &serde_json::json!({"path": "logs/b.log", "content": "ok"}),
+        )
+        .unwrap();
+        let r = host_text_grep(
+            &ctx,
+            &serde_json::json!({"path": "logs", "pattern": "ERROR", "recursive": true}),
+        )
+        .unwrap();
+        assert!(r["matches"][0].as_str().unwrap().contains("a.log"));
+    }
+
+    #[test]
+    fn json_validate_reports_parse_and_schema_errors() {
+        let dir = tempdir().unwrap();
+        let ctx = ctx(dir.path());
+        let r = host_json_validate(&ctx, &serde_json::json!({"text": "{\"a\":1}"})).unwrap();
+        assert_eq!(r["valid"], true);
+        let r = host_json_validate(&ctx, &serde_json::json!({"text": "{bad"})).unwrap();
+        assert_eq!(r["valid"], false);
+        let r = host_json_validate(
+            &ctx,
+            &serde_json::json!({"text": "{\"a\":1}", "schema": {"type":"object","required":["b"]}}),
+        )
+        .unwrap();
+        assert_eq!(r["valid"], false);
     }
 
     #[test]
