@@ -933,6 +933,7 @@ impl NodeRunner {
             format!("node_id: {}", node.id),
             format!("prefilled_call: {canonical}"),
             format!("arguments: {args_summary}"),
+            format!("START {canonical}: args={args_summary}"),
         ];
         let registry = self.registry_snapshot();
         let capability_name = registry
@@ -1092,6 +1093,7 @@ impl NodeRunner {
             logs.push(format!("max_turns: {} (agent.config 覆盖)", max_turns));
         }
         let mut tool_call_count = 0u32;
+        let mut successful_calls = 0u32;
         for turn in 0..max_turns {
             let req = match LlmRequest::from_model_row(
                 &self.model_row,
@@ -1133,6 +1135,13 @@ impl NodeRunner {
             };
             match parse_subagent_output(&resp.content) {
                 SubagentAction::Done { summary } => {
+                    if successful_calls == 0 {
+                        logs.push(format!("DONE_REJECTED (no capability evidence): {summary}"));
+                        messages.push(ChatMessage::User {
+                            text: "你的 done 被拒绝：本轮还没有任何成功的能力调用证据。\n请至少调用一次能力并取得成功结果，再输出 done；或继续调用能力完成任务。".to_string(),
+                        });
+                        continue;
+                    }
                     logs.push(format!("DONE: {summary}"));
                     return (
                         NodeResult {
@@ -1167,6 +1176,13 @@ impl NodeRunner {
                         capability_name,
                         arguments,
                     };
+                    logs.push(format!(
+                        "START {capability}: args={}",
+                        crate::common::json_util::truncate_head_tail(
+                            &history_arguments.to_string(),
+                            800
+                        )
+                    ));
                     let outcome = match self.capability_runtime() {
                         Ok(Some((registry, executor))) => {
                             match CapabilityService::new(&registry, &executor) {
@@ -1198,6 +1214,7 @@ impl NodeRunner {
                     tool_call_count += 1;
                     match outcome {
                         Ok(summary) => {
+                            successful_calls += 1;
                             logs.push(format!("OK {capability}: {summary}"));
                             messages.push(ChatMessage::Assistant {
                                 text: serde_json::json!({"tool_call": {"name": capability, "arguments": history_arguments}}).to_string(),
@@ -2061,6 +2078,10 @@ impl ExecutionPlatform {
                     .filter(|v| v.is_object())
                     .cloned()
                     .unwrap_or_else(|| parse_task_context(cap_id, &task_ctx));
+                lines.push(format!(
+                    "START {cap_id}: args={}",
+                    crate::common::json_util::truncate_head_tail(&arguments.to_string(), 800)
+                ));
                 let call = CapabilityCall {
                     capability_id: cap_id.clone(),
                     capability_name: name,
@@ -4045,8 +4066,10 @@ mod tests {
     #[tokio::test]
     async fn a1_subagent_loop_invalid_output_recovers_then_done() {
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("loop.txt"), "hello").unwrap();
         let provider = Arc::new(SequenceProvider::new(vec![
             "not json at all",
+            r#"{"tool_call": {"name": "file.read", "arguments": {"path": "loop.txt"}}}"#,
             r#"{"done": true, "summary": "recovered"}"#,
         ]));
         let platform = a1_platform_with_provider(
@@ -4176,8 +4199,16 @@ mod tests {
                     .map(|m| m.text().to_string())
                     .unwrap_or_default(),
             );
+            let captured = self.captured.lock().unwrap();
+            let content = if captured.len() <= 1 {
+                r#"{"tool_call": {"name": "file.read", "arguments": {"path": "dep.txt"}}}"#
+                    .to_string()
+            } else {
+                r#"{"done": true, "summary": "used dependency result"}"#.to_string()
+            };
+            drop(captured);
             Ok(LlmResponse {
-                content: r#"{"done": true, "summary": "used dependency result"}"#.to_string(),
+                content,
                 tool_calls: vec![],
                 usage: None,
             })
@@ -4220,7 +4251,11 @@ mod tests {
             results[1].error
         );
         let captured = provider.captured.lock().unwrap();
-        assert_eq!(captured.len(), 1, "n2 两层式应调用 1 次 LLM: {captured:?}");
+        assert_eq!(
+            captured.len(),
+            2,
+            "n2 两层式应先调用工具再 done: {captured:?}"
+        );
         let system = &captured[0];
         assert!(system.contains("依赖节点结果:"), "system: {system}");
         assert!(system.contains("[n1]"), "dep 行必须带节点 id: {system}");

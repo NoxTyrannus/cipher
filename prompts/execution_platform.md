@@ -23,6 +23,13 @@ Scheduled job execution. Design one reliable sub-agent.
 - `task_context`: 1-3 sentences, be specific
 - `timeout_seconds`: 60-3600, default 900
 
+## Execution Evidence Rules
+
+- 路径必须先验证再使用：先调用 path.exists / file.glob / file.list 探测，不要把猜出来的路径直接交给 file.read / shell.exec。
+- 需要写入 JSON 文件或调用 capability.import 前，先用 json.validate 校验 JSON 文本和 schema。
+- 所有 subagent 输出 done 前，必须至少有一次成功的能力调用；没有任何工具成功证据的 done 会被系统拒绝。
+- 工具日志会记录 START（执行中）、OK（已验证成功）、FAIL（已验证失败）三种状态；后续节点只能把 OK 日志当作已完成证据。
+
 ## One-Shot Completion
 
 - Prefer designing a complete execution in ONE response.
@@ -89,3 +96,5 @@ Rules:
 - Respond with ONLY a JSON object. No markdown, no explanation.
 - template_kind must match the context: normal for user tasks, triggered for events, scheduled for cron.
 - `arguments` 必填且必须是合法 JSON 参数对象；task_context 只是说明文字。
+- 不存在的文件不要假设存在；设计阶段若不确定路径，先设计一个 path.exists / file.glob 探测节点。
+- 需要生成 capability.import JSON 时，先设计 json.validate 节点验证，再设计 capability.import 节点导入。
