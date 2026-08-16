@@ -4084,6 +4084,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a1_subagent_loop_rejects_done_without_tool_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(SequenceProvider::new(vec![
+            r#"{"done": true, "summary": "nothing to do"}"#,
+        ]));
+        let platform = a1_platform_with_provider(
+            Some(a1_flow_registry()),
+            Some(Arc::new(a1_flow_executor(tmp.path()))),
+            provider,
+        );
+        let node = flow_node("n1", vec![], "do something", "file.read", None);
+        let (result, _turns) = platform.node_runner().run_subagent_loop(&node, "").await;
+        assert_eq!(result.status, NodeStatus::Failed);
+        assert!(
+            result
+                .tool_call_logs
+                .iter()
+                .any(|line| line.contains("DONE_REJECTED")),
+            "done without evidence must be rejected: {:?}",
+            result.tool_call_logs
+        );
+    }
+
+    #[tokio::test]
+    async fn a1_subagent_loop_logs_start_before_tool_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("loop.txt"), "hello").unwrap();
+        let provider = Arc::new(SequenceProvider::new(vec![
+            r#"{"tool_call": {"name": "file.read", "arguments": {"path": "loop.txt"}}}"#,
+            r#"{"done": true, "summary": "read done"}"#,
+        ]));
+        let platform = a1_platform_with_provider(
+            Some(a1_flow_registry()),
+            Some(Arc::new(a1_flow_executor(tmp.path()))),
+            provider,
+        );
+        let node = flow_node("n1", vec![], "read loop", "file.read", None);
+        let (result, _turns) = platform.node_runner().run_subagent_loop(&node, "").await;
+        assert_eq!(result.status, NodeStatus::Completed);
+        let start_idx = result
+            .tool_call_logs
+            .iter()
+            .position(|line| line.starts_with("START file.read"));
+        let ok_idx = result
+            .tool_call_logs
+            .iter()
+            .position(|line| line.starts_with("OK file.read"));
+        assert!(start_idx.is_some() && ok_idx.is_some());
+        assert!(start_idx.unwrap() < ok_idx.unwrap());
+    }
+
+    #[tokio::test]
     async fn a1_subagent_loop_exhausts_turns_fails_gracefully() {
         let tmp = tempfile::tempdir().unwrap();
         let provider = Arc::new(SequenceProvider::new(vec![
