@@ -230,7 +230,7 @@ pub fn memory_attention_retire(db: &mut TriviumDb, args: &Value) -> Result<Value
     }
     db.flush()
         .map_err(|e| format!("memory.attention.retire flush: {e}"))?;
-    ok_value(serde_json::json!({"removed": removed, "retired_focus": retired}))
+    ok_value(serde_json::json!({"removed": removed, "retired": retired}))
 }
 
 fn source_refs_of(entry: &Value) -> Vec<String> {
