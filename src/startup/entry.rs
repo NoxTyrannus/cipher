@@ -41,7 +41,7 @@ fn init_tracing() {
         .try_init();
 }
 
-const LEGACY_DEFAULT_PROMPT_SHA256: [(&str, &str); 20] = [
+const LEGACY_DEFAULT_PROMPT_SHA256: [(&str, &str); 23] = [
     (
         "system.md",
         "a3e6f5e733ad55b953092b7f2b980d28540e2c18970615cd2fe6eac23ff3ebd4",
@@ -91,6 +91,19 @@ const LEGACY_DEFAULT_PROMPT_SHA256: [(&str, &str); 20] = [
     (
         "mode_loop.md",
         "16d403e3c612cc01cb422ab6a40972bdcaebfba5ee17fa3ce73e98a3705bf4a1",
+    ),
+    // v0.3.1 三模式提示词最小化前
+    (
+        "mode_unni.md",
+        "543379fde888c5797ff825f766631d091dc6db9f4479af9ca25a78ef663514e0",
+    ),
+    (
+        "mode_keep.md",
+        "2c65fe42e7fab4874da52d35c4a61ce34b8781a2ae1e61d69e6acda7612f421f",
+    ),
+    (
+        "mode_loop.md",
+        "1e9ac1d869ad03697a429c256ccc0a793240571bf6092b3a63d7c4990ed42c3d",
     ),
     (
         "execution_platform.md",
