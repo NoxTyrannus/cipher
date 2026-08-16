@@ -24,6 +24,7 @@ pub fn default_shell_capability_ids() -> Vec<String> {
         "file.chunk_read".to_string(),
         "text.grep".to_string(),
         "code.exec".to_string(),
+        "capability.import".to_string(),
     ];
     ids.push(default_shell_capability_id().to_string());
     ids

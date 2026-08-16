@@ -229,6 +229,7 @@ impl<'a> CapabilityService<'a> {
         validate_base_authority(row)?;
         validate_schema(&row.schema_in, arguments, &row.id, "input")?;
         let output = self.executor.execute(&row.id, self.registry, arguments)?;
+        evaluate_capability_output(&row.id, &output)?;
         validate_schema(&row.schema_out, &output, &row.id, "output")?;
         Ok(output)
     }
@@ -290,6 +291,40 @@ impl<'a> CapabilityService<'a> {
         validate_schema(schema_out, &output, &row.id, "output")?;
         Ok(output)
     }
+}
+
+/// 能力输出合同：所有能力都必须用输出定义证明成功。
+/// 标准规则：
+/// 1. success=false 或 error 非空 => 失败；
+/// 2. exit_code 存在且非 0 => 失败（shell/code 类能力）；
+/// 3. 之后仍必须通过 schema_out 校验（required 字段完整）。
+fn evaluate_capability_output(capability_id: &str, output: &Value) -> Result<()> {
+    if output.get("success").and_then(|v| v.as_bool()) == Some(false) {
+        let detail = output
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        return Err(AgentError::Parse(format!(
+            "capability '{capability_id}' output failed: {detail}"
+        )));
+    }
+    if let Some(error) = output.get("error").and_then(|v| v.as_str()) {
+        if !error.trim().is_empty() {
+            return Err(AgentError::Parse(format!(
+                "capability '{capability_id}' output contains error: {error}"
+            )));
+        }
+    }
+    if let Some(exit_code) = output.get("exit_code").and_then(|v| v.as_i64()) {
+        if exit_code != 0 {
+            let stderr = output.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
+            let stderr: String = stderr.chars().take(160).collect();
+            return Err(AgentError::Parse(format!(
+                "capability '{capability_id}' output failed with exit_code={exit_code} stderr={stderr}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_base_authority(row: &BaseCapabilityRow) -> Result<()> {
@@ -773,6 +808,36 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("input does not match"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn output_contract_rejects_success_false() {
+        let err = evaluate_capability_output(
+            "file.write",
+            &serde_json::json!({"success": false, "error": "disk full"}),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("disk full"));
+    }
+
+    #[test]
+    fn output_contract_rejects_nonzero_exit_code() {
+        let err = evaluate_capability_output(
+            "shell.exec",
+            &serde_json::json!({"stdout": "", "stderr": "boom", "exit_code": 1}),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("exit_code=1"));
+    }
+
+    #[test]
+    fn output_contract_accepts_clean_action_and_process_outputs() {
+        evaluate_capability_output("file.write", &serde_json::json!({"success": true})).unwrap();
+        evaluate_capability_output(
+            "shell.exec",
+            &serde_json::json!({"stdout": "ok", "stderr": "", "exit_code": 0}),
+        )
+        .unwrap();
     }
 
     #[test]

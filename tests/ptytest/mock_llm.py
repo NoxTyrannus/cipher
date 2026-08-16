@@ -303,6 +303,9 @@ class Handler(BaseHTTPRequestHandler):
                 bj = json.loads(raw.decode("utf-8"))
                 if isinstance(bj, dict):
                     bj.setdefault("thinking", {"type": "disabled"})
+                    # KEEP/LOOP 复杂自扩展任务实测：MiniMax 在 thinking disabled 下
+                    # 仍可能对 echo/reflect 输出散文；json_object 响应格式显著提升 JSON 契约。
+                    bj.setdefault("response_format", {"type": "json_object"})
                     fwd_body = json.dumps(bj).encode("utf-8")
             except Exception:  # noqa: BLE001 —— 非 JSON 请求体按原样转发
                 pass

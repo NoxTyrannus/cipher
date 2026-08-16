@@ -24,7 +24,11 @@
         "size": {
           "type": "integer"
         }
-      }
+      },
+      "required": [
+        "content",
+        "size"
+      ]
     },
     "executor": "builtin:file.read",
     "version": "1.0.0",
@@ -57,7 +61,10 @@
         "success": {
           "type": "boolean"
         }
-      }
+      },
+      "required": [
+        "success"
+      ]
     },
     "executor": "builtin:file.write",
     "version": "1.0.0",
@@ -88,8 +95,14 @@
           "items": {
             "type": "string"
           }
+        },
+        "success": {
+          "type": "boolean"
         }
-      }
+      },
+      "required": [
+        "success"
+      ]
     },
     "executor": "builtin:file.list",
     "version": "1.0.0",
@@ -118,7 +131,10 @@
         "success": {
           "type": "boolean"
         }
-      }
+      },
+      "required": [
+        "success"
+      ]
     },
     "executor": "builtin:file.delete",
     "version": "1.0.0",
@@ -151,7 +167,10 @@
         "success": {
           "type": "boolean"
         }
-      }
+      },
+      "required": [
+        "success"
+      ]
     },
     "executor": "builtin:file.move",
     "version": "1.0.0",
@@ -187,7 +206,10 @@
             "type": "string"
           }
         }
-      }
+      },
+      "required": [
+        "matches"
+      ]
     },
     "executor": "builtin:text.grep",
     "version": "1.0.0",
@@ -222,7 +244,12 @@
         "exit_code": {
           "type": "integer"
         }
-      }
+      },
+      "required": [
+        "stdout",
+        "stderr",
+        "exit_code"
+      ]
     },
     "executor": "builtin:shell.exec",
     "version": "1.0.0",
@@ -255,7 +282,10 @@
         "rows_affected": {
           "type": "integer"
         }
-      }
+      },
+      "required": [
+        "rows_affected"
+      ]
     },
     "executor": "builtin:db.insert",
     "version": "1.0.0",
@@ -291,7 +321,10 @@
         "rows_affected": {
           "type": "integer"
         }
-      }
+      },
+      "required": [
+        "rows_affected"
+      ]
     },
     "executor": "builtin:db.update",
     "version": "1.0.0",
@@ -324,7 +357,10 @@
         "rows_affected": {
           "type": "integer"
         }
-      }
+      },
+      "required": [
+        "rows_affected"
+      ]
     },
     "executor": "builtin:db.delete",
     "version": "1.0.0",
@@ -356,7 +392,10 @@
         "rows": {
           "type": "array"
         }
-      }
+      },
+      "required": [
+        "rows"
+      ]
     },
     "executor": "builtin:db.query",
     "version": "1.0.0",
@@ -397,7 +436,12 @@
         "is_eof": {
           "type": "boolean"
         }
-      }
+      },
+      "required": [
+        "content",
+        "bytes_read",
+        "is_eof"
+      ]
     },
     "executor": "builtin:file.chunk_read",
     "version": "1.0.0",
@@ -435,7 +479,12 @@
         "exit_code": {
           "type": "integer"
         }
-      }
+      },
+      "required": [
+        "stdout",
+        "stderr",
+        "exit_code"
+      ]
     },
     "executor": "builtin:code.exec",
     "version": "1.0.0",
@@ -487,7 +536,11 @@
         "error": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "items",
+        "count"
+      ]
     },
     "executor": "builtin:memory.list",
     "version": "1.0.0",
@@ -542,7 +595,11 @@
         "error": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "items",
+        "count"
+      ]
     },
     "executor": "builtin:memory.retrieve",
     "version": "1.0.0",
@@ -589,7 +646,10 @@
         "error": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "removed"
+      ]
     },
     "executor": "builtin:memory.delete",
     "version": "1.0.0",
@@ -653,7 +713,11 @@
         "error": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "written",
+        "ids"
+      ]
     },
     "executor": "builtin:memory.attention.write",
     "version": "1.0.0",
@@ -698,7 +762,11 @@
         "error": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "removed",
+        "retired"
+      ]
     },
     "executor": "builtin:memory.attention.retire",
     "version": "1.0.0",
@@ -762,7 +830,11 @@
         "error": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "written",
+        "ids"
+      ]
     },
     "executor": "builtin:memory.experience.write",
     "version": "1.0.0",
@@ -826,7 +898,11 @@
         "error": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "written",
+        "ids"
+      ]
     },
     "executor": "builtin:memory.preference.write",
     "version": "1.0.0",
@@ -914,7 +990,12 @@
         "error": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "success",
+        "node_changes",
+        "edge_changes"
+      ]
     },
     "executor": "builtin:memory.cognitive.update",
     "version": "1.0.0",
@@ -964,7 +1045,11 @@
         "error": {
           "type": "string"
         }
-      }
+      },
+      "required": [
+        "items",
+        "count"
+      ]
     },
     "executor": "builtin:memory.evidence.lookup",
     "version": "1.0.0",
@@ -1020,7 +1105,11 @@
             "null"
           ]
         }
-      }
+      },
+      "required": [
+        "success",
+        "imported"
+      ]
     },
     "executor": "builtin:capability.import",
     "version": "1.0.0",

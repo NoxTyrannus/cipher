@@ -43,6 +43,8 @@ pub struct OpenAiRequest<'a> {
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<serde_json::Value>,
     pub stream: bool,
 }
 
@@ -128,6 +130,7 @@ fn build_openai_request(req: &LlmRequest, stream: bool) -> OpenAiRequest<'_> {
         top_p: req.top_p,
         max_tokens: req.max_tokens,
         tools: req.tools.clone(),
+        response_format: req.response_format.clone(),
         stream,
     }
 }
@@ -590,6 +593,7 @@ mod tests {
             top_p: None,
             max_tokens: None,
             tools: vec![],
+            response_format: None,
             stream: false,
         };
         let j = serde_json::to_string(&req).unwrap();
@@ -613,6 +617,7 @@ mod tests {
             top_p: None,
             max_tokens: None,
             tools: vec![],
+            response_format: None,
             stream: true,
         };
         let j = serde_json::to_string(&req).unwrap();
