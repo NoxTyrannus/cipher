@@ -3,23 +3,24 @@ use crate::data::ModelRow;
 use crate::logic::model::message::{ChatMessage, SystemKind};
 use crate::logic::model::prompts::read_platform_prompt;
 use crate::logic::model::provider::{LlmProvider, LlmRequest};
+use crate::logic::model::stream::StreamChunk;
 use secrecy::SecretString;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use tokio::sync::{mpsc, Notify};
 
 use super::agent_pool::registry::{AgentEntry, AgentIdentity, AgentStatus};
 use super::agent_pool::AgentPool;
 use super::communication::{
-    AgentMessage, BoundaryCheck, ExecutionOutput, GoalAlignment, GrowthCheck, InsightOutput,
-    InsightResult, NodeResult, NodeStatus, ToolMemoryUpdate,
+    AgentMessage, ExecutionOutput, InsightOutput, InsightResult, NodeResult, NodeStatus,
+    ToolMemoryUpdate,
 };
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct InsightRawOutput {
     #[serde(default)]
-    insight: Option<InsightResult>,
+    insight: Option<String>,
 
     #[serde(default)]
     tool_memory: Vec<ToolMemoryUpdate>,
@@ -40,21 +41,6 @@ fn parse_insight_output(content: &str) -> Result<InsightRawOutput> {
         }
     }
 
-    if let Ok(insight) = serde_json::from_str::<InsightResult>(content) {
-        return Ok(InsightRawOutput {
-            insight: Some(insight),
-            tool_memory: vec![],
-        });
-    }
-    if let Some(json_block) = extract_json_block(content) {
-        if let Ok(insight) = serde_json::from_str::<InsightResult>(&json_block) {
-            return Ok(InsightRawOutput {
-                insight: Some(insight),
-                tool_memory: vec![],
-            });
-        }
-    }
-
     tracing::warn!(
         "insight_platform: failed to parse InsightRawOutput from LLM content: {}",
         crate::common::json_util::truncate_utf8_boundary(content, 200)
@@ -63,6 +49,36 @@ fn parse_insight_output(content: &str) -> Result<InsightRawOutput> {
         insight: None,
         tool_memory: vec![],
     })
+}
+
+/// 从尚未闭合的 JSON 流中提取 `"insight"` 字符串字段。
+/// 输出格式保证 insight 排在 tool_memory 之前，因此 insight 的闭合引号一出现
+/// 就可以先驱动下一环，而不必等待整个 JSON 对象完成。
+fn extract_json_string_field_prefix(text: &str, field: &str) -> Option<String> {
+    let key = format!("\"{field}\"");
+    let key_start = text.find(&key)?;
+    let rest = &text[key_start + key.len()..];
+    let colon = rest.find(':')?;
+    let after_colon = &rest[colon + 1..];
+    let value_start = after_colon.find('"')?;
+    let bytes = after_colon.as_bytes();
+    let mut index = value_start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => {
+                index += 2;
+            }
+            b'"' => {
+                let candidate = &after_colon[value_start..=index];
+                if let Ok(value) = serde_json::from_str::<String>(candidate) {
+                    return Some(value);
+                }
+                return None;
+            }
+            _ => index += 1,
+        }
+    }
+    None
 }
 
 fn extract_json_block(text: &str) -> Option<String> {
@@ -185,117 +201,211 @@ impl InsightPlatform {
             self.prompts_dir.as_deref(),
         );
 
-        let used_capabilities = execution_capability_ids(execution);
-        let (insight_result, mut tool_memory_updates) = match self
-            .call_llm_for_insight(&prompt)
-            .await
-        {
-            Ok(raw) => {
-                let insight = match raw.insight {
-                    Some(i) => i,
-                    None => {
-                        tracing::warn!(
-                            "insight_platform: LLM returned no insight for turn_id={turn_id}, using fallback"
-                        );
-                        fallback_insight(execution)
-                    }
-                };
-                (insight, raw.tool_memory)
-            }
-            Err(e) => {
-                tracing::error!("insight_platform: LLM call failed for turn_id={turn_id}: {e}");
-
-                (fallback_insight(execution), vec![])
-            }
-        };
-
-        let before_filter = tool_memory_updates.len();
-        tool_memory_updates.retain(|update| {
-            used_capabilities
-                .iter()
-                .any(|id| id == &update.capability_id)
-        });
-        if before_filter != tool_memory_updates.len() {
-            tracing::warn!(
-                dropped = before_filter - tool_memory_updates.len(),
-                allowed = ?used_capabilities,
-                "insight_platform: dropped hallucinated tool_memory capability_id(s)"
-            );
-        }
-        let output = InsightOutput {
-            insight: insight_result,
-            tool_memory: tool_memory_updates.clone(),
-        };
-        self.pool.set_insight(turn_id, output).await;
-        if let Err(e) = self.pool.send_insight_done(turn_id).await {
-            tracing::warn!("insight_platform: send_insight_done failed: {e}");
-        }
-
-        if let Err(e) = self.pool.send_trigger(turn_id, "insight_complete").await {
-            tracing::warn!("insight_platform: send_trigger insight_complete failed: {e}");
-        }
-        self.pool
-            .publish_event("insight_complete", turn_id.to_string());
-
-        if !tool_memory_updates.is_empty() {
-            tracing::debug!(
-                "insight_platform: routing {} tool_memory update(s) to service layer for turn_id={turn_id}",
-                tool_memory_updates.len()
-            );
-            if let Err(e) = self.tool_memory_tx.try_send(tool_memory_updates) {
-                tracing::warn!(
-                    "insight_platform: tool_memory_tx send error turn_id={turn_id}, error={e}"
-                );
-            }
-        }
-
-        tracing::debug!(
-            "insight_platform: turn_id={turn_id} insight done, InsightDone DM sent, tool_memory routed"
-        );
-    }
-
-    async fn call_llm_for_insight(&self, prompt: &str) -> Result<InsightRawOutput> {
         let messages = vec![
             ChatMessage::System {
-                text: prompt.to_string(),
+                text: prompt,
                 kind: SystemKind::Primary,
             },
             ChatMessage::User {
-                text: "Perform the three-question self-check now. Output ONLY the JSON."
-                    .to_string(),
+                text: "Review the execution evidence now. Output ONLY the JSON.".to_string(),
             },
         ];
-
-        let req = LlmRequest::from_model_row(&self.model_row, messages, self.api_key.clone())?;
-
-        let resp = self.provider.call(&req).await?;
-        match parse_insight_output(&resp.content) {
-            Ok(raw) => Ok(raw),
-            Err(first_error) => {
-                tracing::warn!("insight_platform: 洞察输出解析失败, 重试 1 次: {first_error}");
-                let retry_prompt = format!(
-                    "{prompt}\n\n## 上次输出解析失败\n{first_error}\n\
-                     请输出**单个完整 JSON 对象** (analysis 每段 ≤ 2 句简洁, 总输出 ≤ 600 字符, 不要截断)。"
+        let req = match LlmRequest::from_model_row(&self.model_row, messages, self.api_key.clone())
+        {
+            Ok(req) => req,
+            Err(e) => {
+                tracing::error!(
+                    "insight_platform: request build failed for turn_id={turn_id}: {e}"
                 );
-                let retry_messages = vec![
-                    ChatMessage::System {
-                        text: retry_prompt,
-                        kind: SystemKind::Primary,
-                    },
-                    ChatMessage::User {
-                        text: "Retry: output ONLY the complete JSON.".to_string(),
-                    },
-                ];
-                let retry_req = LlmRequest::from_model_row(
-                    &self.model_row,
-                    retry_messages,
-                    self.api_key.clone(),
-                )?;
-                let retry_resp = self.provider.call(&retry_req).await?;
-                parse_insight_output(&retry_resp.content)
+                publish_insight(&self.pool, turn_id, fallback_insight(execution), vec![]).await;
+                return;
+            }
+        };
+
+        let used_capabilities = execution_capability_ids(execution);
+        let state = Arc::new(Mutex::new(InsightStreamState::default()));
+        let notify = Arc::new(Notify::new());
+
+        let parser = tokio::spawn(run_insight_stream_parser(
+            Arc::clone(&self.pool),
+            self.tool_memory_tx.clone(),
+            turn_id.to_string(),
+            used_capabilities,
+            execution.cloned(),
+            Arc::clone(&state),
+            Arc::clone(&notify),
+        ));
+
+        let mut on_chunk = {
+            let state = Arc::clone(&state);
+            let notify = Arc::clone(&notify);
+            move |chunk: StreamChunk| {
+                if let StreamChunk::Delta(delta) = chunk {
+                    if let Ok(mut guard) = state.lock() {
+                        guard.text.push_str(&delta);
+                    }
+                    notify.notify_one();
+                }
+            }
+        };
+
+        let call_result = self.provider.call_stream(&req, &mut on_chunk).await;
+        {
+            if let Ok(mut guard) = state.lock() {
+                if let Ok(resp) = &call_result {
+                    if !resp.content.is_empty()
+                        && (guard.text.is_empty() || resp.content.len() > guard.text.len())
+                    {
+                        guard.text = resp.content.clone();
+                    }
+                }
+                guard.finished = true;
             }
         }
+        notify.notify_one();
+
+        if let Err(join_error) = parser.await {
+            tracing::error!(
+                "insight_platform: stream parser task failed for turn_id={turn_id}: {join_error}"
+            );
+        }
+
+        tracing::debug!("insight_platform: turn_id={turn_id} insight streaming finished");
     }
+}
+
+#[derive(Default)]
+struct InsightStreamState {
+    text: String,
+    insight_sent: bool,
+    tool_memory_done: bool,
+    finished: bool,
+}
+
+async fn run_insight_stream_parser(
+    pool: Arc<AgentPool>,
+    tool_memory_tx: mpsc::Sender<Vec<ToolMemoryUpdate>>,
+    turn_id: String,
+    used_capabilities: Vec<String>,
+    execution: Option<ExecutionOutput>,
+    state: Arc<Mutex<InsightStreamState>>,
+    notify: Arc<Notify>,
+) {
+    loop {
+        notify.notified().await;
+
+        let snapshot = {
+            let guard = match state.lock() {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+            (
+                guard.text.clone(),
+                guard.insight_sent,
+                guard.tool_memory_done,
+                guard.finished,
+            )
+        };
+
+        let mut insight_text = extract_json_string_field_prefix(&snapshot.0, "insight");
+        let mut tool_memory_updates = Vec::new();
+
+        if snapshot.3 {
+            match parse_insight_output(&snapshot.0) {
+                Ok(raw) => {
+                    if insight_text.is_none() {
+                        insight_text = raw.insight;
+                    }
+                    tool_memory_updates = raw.tool_memory;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "insight_platform: full insight output parse failed for turn_id={turn_id}: {e}"
+                    );
+                }
+            }
+            if insight_text.is_none() {
+                tracing::warn!(
+                    "insight_platform: no insight text received for turn_id={turn_id}, using fallback"
+                );
+                insight_text = Some(fallback_insight(execution.as_ref()).insight);
+            }
+        }
+
+        if !snapshot.1 {
+            if let Some(text) = insight_text {
+                publish_insight(&pool, &turn_id, InsightResult { insight: text }, vec![]).await;
+                if let Ok(mut guard) = state.lock() {
+                    guard.insight_sent = true;
+                }
+            }
+        }
+
+        if snapshot.3 && !snapshot.2 {
+            let dropped = filter_tool_memory_updates(&mut tool_memory_updates, &used_capabilities);
+            if dropped > 0 {
+                tracing::warn!(
+                    dropped,
+                    allowed = ?used_capabilities,
+                    "insight_platform: dropped hallucinated tool_memory capability_id(s)"
+                );
+            }
+            if !tool_memory_updates.is_empty() {
+                if let Err(e) = tool_memory_tx.try_send(tool_memory_updates) {
+                    tracing::warn!(
+                        "insight_platform: tool_memory_tx send error turn_id={turn_id}, error={e}"
+                    );
+                }
+            }
+            if let Ok(mut guard) = state.lock() {
+                guard.tool_memory_done = true;
+            }
+        }
+
+        let complete = {
+            let guard = match state.lock() {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+            guard.insight_sent && guard.tool_memory_done
+        };
+        if complete {
+            return;
+        }
+    }
+}
+
+fn filter_tool_memory_updates(
+    updates: &mut Vec<ToolMemoryUpdate>,
+    used_capabilities: &[String],
+) -> usize {
+    let before = updates.len();
+    updates.retain(|update| {
+        used_capabilities
+            .iter()
+            .any(|id| id == &update.capability_id)
+    });
+    before - updates.len()
+}
+
+async fn publish_insight(
+    pool: &AgentPool,
+    turn_id: &str,
+    insight: InsightResult,
+    tool_memory: Vec<ToolMemoryUpdate>,
+) {
+    let output = InsightOutput {
+        insight,
+        tool_memory,
+    };
+    pool.set_insight(turn_id, output).await;
+    if let Err(e) = pool.send_insight_done(turn_id).await {
+        tracing::warn!("insight_platform: send_insight_done failed: {e}");
+    }
+    if let Err(e) = pool.send_trigger(turn_id, "insight_complete").await {
+        tracing::warn!("insight_platform: send_trigger insight_complete failed: {e}");
+    }
+    pool.publish_event("insight_complete", turn_id.to_string());
 }
 
 fn build_insight_prompt(
@@ -548,106 +658,37 @@ fn format_node_result(nr: &NodeResult) -> String {
 }
 
 fn fallback_insight(execution: Option<&ExecutionOutput>) -> InsightResult {
-    let Some(execution) = execution else {
-        return InsightResult {
-            boundary_check: BoundaryCheck {
-                crossed: false,
-                violations: vec![],
-                analysis: "say-only round, no execution to check".into(),
-            },
-            goal_alignment: GoalAlignment {
-                aligned: true,
-                deviation: None,
-                analysis: "no execution, goal alignment n/a (conversation round)".into(),
-            },
-            growth_check: GrowthCheck {
-                growth_detected: false,
-                growth_type: None,
-                analysis: "no execution, no growth signal".into(),
-            },
-            needs_followup: false,
-            followup_hint: None,
-        };
-    };
-    let has_failures = execution
-        .node_results
-        .iter()
-        .any(|nr| nr.status == NodeStatus::Failed);
-
-    let all_failed = execution
-        .node_results
-        .iter()
-        .all(|nr| nr.status == NodeStatus::Failed);
-
-    let boundary_check = if all_failed {
-        BoundaryCheck {
-            crossed: true,
-            violations: vec!["execution_platform: all nodes failed".into()],
-            analysis: "insight_platform: all execution nodes failed — likely a constraint or capability issue".into(),
+    let text = match execution {
+        None => {
+            "本轮无执行，属于纯对话轮；没有执行证据需要复核，也没有可沉淀的工具经验。".to_string()
         }
-    } else if has_failures {
-        BoundaryCheck {
-            crossed: false,
-            violations: vec![],
-            analysis:
-                "insight_platform: partial failure detected, but no clear constraint violation"
-                    .into(),
-        }
-    } else {
-        BoundaryCheck {
-            crossed: false,
-            violations: vec![],
-            analysis: "insight_platform: all nodes completed successfully".into(),
+        Some(execution) => {
+            let failed: Vec<&NodeResult> = execution
+                .node_results
+                .iter()
+                .filter(|node| node.status == NodeStatus::Failed)
+                .collect();
+            if failed.is_empty() {
+                "执行平台所有节点均完成，节点状态与工具日志一致；目标是否真正达成仍需以实际产物为最终证据。".to_string()
+            } else {
+                let ids = failed
+                    .iter()
+                    .map(|node| node.node_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if failed.len() == execution.node_results.len() {
+                    format!(
+                        "执行平台所有节点失败（{ids}），本轮没有可用的执行证据；应先修正失败原因再继续，不把计划或总结当作完成。"
+                    )
+                } else {
+                    format!(
+                        "执行平台部分失败（{ids}）。已完成节点可保留证据，失败节点需在下一轮修正后重试；本轮不能视为最终完成。"
+                    )
+                }
+            }
         }
     };
-
-    let goal_alignment = if all_failed {
-        GoalAlignment {
-            aligned: false,
-            deviation: Some("insight_platform: no nodes completed successfully".into()),
-            analysis: "insight_platform: execution failed to produce any results".into(),
-        }
-    } else if has_failures {
-        GoalAlignment {
-            aligned: true,
-            deviation: Some(
-                "insight_platform: some nodes failed, partial results may still be useful".into(),
-            ),
-            analysis: "insight_platform: partial execution, review failed nodes".into(),
-        }
-    } else {
-        GoalAlignment {
-            aligned: true,
-            deviation: None,
-            analysis: "insight_platform: execution completed successfully".into(),
-        }
-    };
-
-    let growth_check = if has_failures {
-        GrowthCheck {
-            growth_detected: true,
-            growth_type: Some("failure_lesson".into()),
-            analysis: "insight_platform: failures detected — potential learning opportunity".into(),
-        }
-    } else {
-        GrowthCheck {
-            growth_detected: false,
-            growth_type: None,
-            analysis: "insight_platform: no failures, steady execution".into(),
-        }
-    };
-
-    InsightResult {
-        boundary_check,
-        goal_alignment,
-        growth_check,
-        needs_followup: has_failures,
-        followup_hint: if has_failures {
-            Some("insight_platform: review failed nodes for root cause".into())
-        } else {
-            None
-        },
-    }
+    InsightResult { insight: text }
 }
 
 pub async fn run(
@@ -694,47 +735,58 @@ mod tests {
         }
     }
 
+    fn execution(status: ExecutionStatus, nodes: Vec<NodeResult>) -> ExecutionOutput {
+        ExecutionOutput {
+            dag: ExecutionDag::Single {
+                template_kind: "normal".into(),
+                capability_ids: vec![],
+                task_context: "test".into(),
+            },
+            node_results: nodes,
+            status,
+        }
+    }
+
+    fn node(id: &str, status: NodeStatus) -> NodeResult {
+        NodeResult {
+            node_id: id.into(),
+            status,
+            summary: String::new(),
+            error: None,
+            tool_call_count: 0,
+            tool_call_logs: vec![],
+        }
+    }
+
     #[test]
     fn parse_valid_insight_raw_output() {
-        let json = r#"{"insight":{"boundary_check":{"crossed":false,"violations":[],"analysis":"all good"},"goal_alignment":{"aligned":true,"deviation":null,"analysis":"on track"},"growth_check":{"growth_detected":false,"growth_type":null,"analysis":"steady"},"needs_followup":false,"followup_hint":null},"tool_memory":[]}"#;
+        let json = r#"{"insight":"执行证据已核对：文件真实存在且内容符合目标。","tool_memory":[]}"#;
         let raw = parse_insight_output(json).unwrap();
-        let insight = raw.insight.unwrap();
-        assert!(!insight.boundary_check.crossed);
-        assert!(insight.goal_alignment.aligned);
-        assert!(!insight.needs_followup);
+        assert_eq!(
+            raw.insight.as_deref(),
+            Some("执行证据已核对：文件真实存在且内容符合目标。")
+        );
         assert!(raw.tool_memory.is_empty());
     }
 
     #[test]
     fn parse_insight_raw_with_tool_memory() {
-        let json = r#"{"insight":{"boundary_check":{"crossed":true,"violations":["timeout"],"analysis":"exceeded"},"goal_alignment":{"aligned":false,"deviation":"partial","analysis":"off"},"growth_check":{"growth_detected":true,"growth_type":"failure_lesson","analysis":"learn"},"needs_followup":true,"followup_hint":"retry"},"tool_memory":[{"capability_id":"http_client","description_patch":"add: handles connection_timeout","rating":"degraded","note":"HTTP client timed out on /api endpoint"}]}"#;
+        let json = r#"{"insight":"file.read 本轮超时，需要沉淀失败经验。","tool_memory":[{"capability_id":"file.read","description_patch":"add: handles timeout","rating":"degraded","note":"timed out on large file"}]}"#;
         let raw = parse_insight_output(json).unwrap();
-        let insight = raw.insight.unwrap();
-        assert!(insight.boundary_check.crossed);
-        assert!(!insight.goal_alignment.aligned);
-        assert!(insight.growth_check.growth_detected);
+        assert_eq!(
+            raw.insight.as_deref(),
+            Some("file.read 本轮超时，需要沉淀失败经验。")
+        );
         assert_eq!(raw.tool_memory.len(), 1);
-        assert_eq!(raw.tool_memory[0].capability_id, "http_client");
+        assert_eq!(raw.tool_memory[0].capability_id, "file.read");
         assert_eq!(raw.tool_memory[0].rating, "degraded");
     }
 
     #[test]
     fn parse_insight_in_code_block() {
-        let text = "some text\n```json\n{\"insight\":{\"boundary_check\":{\"crossed\":true,\"violations\":[\"timeout\"],\"analysis\":\"exceeded\"},\"goal_alignment\":{\"aligned\":false,\"deviation\":\"partial\",\"analysis\":\"off\"},\"growth_check\":{\"growth_detected\":true,\"growth_type\":\"failure_lesson\",\"analysis\":\"learn\"},\"needs_followup\":true,\"followup_hint\":\"retry\"},\"tool_memory\":[]}\n```\nmore";
+        let text = "前缀\n```json\n{\"insight\":\"目标未达成，缺验证文件。\",\"tool_memory\":[]}\n```\n后缀";
         let raw = parse_insight_output(text).unwrap();
-        let insight = raw.insight.unwrap();
-        assert!(insight.boundary_check.crossed);
-        assert!(!insight.goal_alignment.aligned);
-        assert!(insight.growth_check.growth_detected);
-    }
-
-    #[test]
-    fn parse_insight_old_format_compat() {
-        let json = r#"{"boundary_check":{"crossed":false,"violations":[],"analysis":"all good"},"goal_alignment":{"aligned":true,"deviation":null,"analysis":"on track"},"growth_check":{"growth_detected":false,"growth_type":null,"analysis":"steady"},"needs_followup":false,"followup_hint":null}"#;
-        let raw = parse_insight_output(json).unwrap();
-        let insight = raw.insight.unwrap();
-        assert!(!insight.boundary_check.crossed);
-        assert!(raw.tool_memory.is_empty());
+        assert_eq!(raw.insight.as_deref(), Some("目标未达成，缺验证文件。"));
     }
 
     #[test]
@@ -742,6 +794,52 @@ mod tests {
         let raw = parse_insight_output("garbage").unwrap();
         assert!(raw.insight.is_none());
         assert!(raw.tool_memory.is_empty());
+    }
+
+    #[test]
+    fn extract_insight_from_partial_stream() {
+        assert_eq!(
+            extract_json_string_field_prefix(r#"{"insight":"判断完成","#, "insight").as_deref(),
+            Some("判断完成")
+        );
+        assert_eq!(
+            extract_json_string_field_prefix(
+                r#"{"insight":"判断完成","tool_memory":[]}"#,
+                "insight"
+            )
+            .as_deref(),
+            Some("判断完成")
+        );
+        assert_eq!(
+            extract_json_string_field_prefix(r#"{"insight":"判"#, "insight"),
+            None
+        );
+        assert_eq!(
+            extract_json_string_field_prefix(r#"{"other":1}"#, "insight"),
+            None
+        );
+    }
+
+    #[test]
+    fn filter_tool_memory_updates_keeps_only_used_capabilities() {
+        let mut updates = vec![
+            ToolMemoryUpdate {
+                capability_id: "file.read".into(),
+                description_patch: "keep".into(),
+                rating: "good".into(),
+                note: String::new(),
+            },
+            ToolMemoryUpdate {
+                capability_id: "ghost.cap".into(),
+                description_patch: "drop".into(),
+                rating: "good".into(),
+                note: String::new(),
+            },
+        ];
+        let dropped = filter_tool_memory_updates(&mut updates, &["file.read".to_string()]);
+        assert_eq!(dropped, 1);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].capability_id, "file.read");
     }
 
     #[test]
@@ -764,13 +862,9 @@ mod tests {
 
     #[test]
     fn build_insight_prompt_contains_failure_info() {
-        let execution = ExecutionOutput {
-            dag: ExecutionDag::Single {
-                template_kind: "normal".into(),
-                capability_ids: vec![],
-                task_context: "test".into(),
-            },
-            node_results: vec![NodeResult {
+        let execution = execution(
+            ExecutionStatus::Failure,
+            vec![NodeResult {
                 node_id: "n1".into(),
                 status: NodeStatus::Failed,
                 summary: "".into(),
@@ -778,8 +872,7 @@ mod tests {
                 tool_call_count: 1,
                 tool_call_logs: vec!["HTTP GET /api → connection refused".into()],
             }],
-            status: ExecutionStatus::Failure,
-        };
+        );
 
         let prompt = build_insight_prompt("turn-1", "test goal", &[], Some(&execution), &[], None);
         assert!(prompt.contains("test goal"));
@@ -794,23 +887,10 @@ mod tests {
 
     #[test]
     fn build_insight_prompt_includes_pool_snapshot() {
-        let execution = ExecutionOutput {
-            dag: ExecutionDag::Single {
-                template_kind: "normal".into(),
-                capability_ids: vec![],
-                task_context: "test".into(),
-            },
-            node_results: vec![NodeResult {
-                node_id: "n1".into(),
-                status: NodeStatus::Completed,
-                summary: "done".into(),
-                error: None,
-                tool_call_count: 1,
-                tool_call_logs: vec![],
-            }],
-            status: ExecutionStatus::Success,
-        };
-
+        let execution = execution(
+            ExecutionStatus::Success,
+            vec![node("n1", NodeStatus::Completed)],
+        );
         let snapshot = vec![
             make_agent_entry(
                 "exec-plat",
@@ -844,14 +924,11 @@ mod tests {
         assert!(prompt.contains("execution=1"));
         assert!(prompt.contains("insight=1"));
         assert!(prompt.contains("Subagents: running=1"));
-        assert!(prompt.contains("ExecutionPlatform"));
-        assert!(prompt.contains("SubagentRunning(sub-1)"));
     }
 
     #[test]
     fn build_pool_snapshot_summary_empty() {
-        let summary = build_pool_snapshot_summary(&[]);
-        assert!(summary.contains("empty"));
+        assert!(build_pool_snapshot_summary(&[]).contains("empty"));
     }
 
     #[test]
@@ -874,100 +951,41 @@ mod tests {
     }
 
     #[test]
-    fn fallback_insight_detects_failures() {
-        let execution = ExecutionOutput {
-            dag: ExecutionDag::Single {
-                template_kind: "normal".into(),
-                capability_ids: vec![],
-                task_context: "test".into(),
-            },
-            node_results: vec![NodeResult {
-                node_id: "n1".into(),
-                status: NodeStatus::Failed,
-                summary: "".into(),
-                error: Some("error".into()),
-                tool_call_count: 0,
-                tool_call_logs: vec![],
-            }],
-            status: ExecutionStatus::Failure,
-        };
-
-        let result = fallback_insight(Some(&execution));
-        assert!(result.boundary_check.crossed);
-        assert!(!result.goal_alignment.aligned);
-        assert!(result.growth_check.growth_detected);
-        assert!(result.needs_followup);
+    fn fallback_insight_all_success() {
+        let result = fallback_insight(Some(&execution(
+            ExecutionStatus::Success,
+            vec![node("n1", NodeStatus::Completed)],
+        )));
+        assert!(result.insight.contains("所有节点均完成"));
     }
 
     #[test]
-    fn fallback_insight_all_success() {
-        let execution = ExecutionOutput {
-            dag: ExecutionDag::Single {
-                template_kind: "normal".into(),
-                capability_ids: vec![],
-                task_context: "test".into(),
-            },
-            node_results: vec![NodeResult {
-                node_id: "n1".into(),
-                status: NodeStatus::Completed,
-                summary: "done".into(),
-                error: None,
-                tool_call_count: 1,
-                tool_call_logs: vec![],
-            }],
-            status: ExecutionStatus::Success,
-        };
-
-        let result = fallback_insight(Some(&execution));
-        assert!(!result.boundary_check.crossed);
-        assert!(result.goal_alignment.aligned);
-        assert!(!result.growth_check.growth_detected);
-        assert!(!result.needs_followup);
+    fn fallback_insight_all_failed() {
+        let result = fallback_insight(Some(&execution(
+            ExecutionStatus::Failure,
+            vec![node("n1", NodeStatus::Failed)],
+        )));
+        assert!(result.insight.contains("所有节点失败"));
+        assert!(result.insight.contains("n1"));
     }
 
     #[test]
     fn fallback_insight_partial_failure() {
-        let execution = ExecutionOutput {
-            dag: ExecutionDag::Single {
-                template_kind: "normal".into(),
-                capability_ids: vec![],
-                task_context: "test".into(),
-            },
-            node_results: vec![
-                NodeResult {
-                    node_id: "n1".into(),
-                    status: NodeStatus::Completed,
-                    summary: "done".into(),
-                    error: None,
-                    tool_call_count: 1,
-                    tool_call_logs: vec![],
-                },
-                NodeResult {
-                    node_id: "n2".into(),
-                    status: NodeStatus::Failed,
-                    summary: "".into(),
-                    error: Some("timeout".into()),
-                    tool_call_count: 2,
-                    tool_call_logs: vec!["retry exhausted".into()],
-                },
+        let result = fallback_insight(Some(&execution(
+            ExecutionStatus::PartialFailure,
+            vec![
+                node("n1", NodeStatus::Completed),
+                node("n2", NodeStatus::Failed),
             ],
-            status: ExecutionStatus::PartialFailure,
-        };
-
-        let result = fallback_insight(Some(&execution));
-
-        assert!(!result.boundary_check.crossed);
-        assert!(result.goal_alignment.aligned);
-        assert!(result.growth_check.growth_detected);
-        assert!(result.needs_followup);
+        )));
+        assert!(result.insight.contains("部分失败"));
+        assert!(result.insight.contains("n2"));
     }
 
     #[test]
     fn fallback_insight_none_execution_say_only() {
         let result = fallback_insight(None);
-        assert!(!result.boundary_check.crossed);
-        assert!(result.goal_alignment.aligned);
-        assert!(!result.growth_check.growth_detected);
+        assert!(result.insight.contains("纯对话轮"));
     }
 
     #[test]
@@ -1023,7 +1041,6 @@ mod tests {
             status: ExecutionStatus::Success,
         };
 
-        // 设计里声明了 file.read，但没有实际调度证据，不能进入允许列表。
         assert_eq!(
             execution_capability_ids(Some(&execution)),
             vec![
@@ -1058,17 +1075,8 @@ mod tests {
         };
 
         let prompt = build_insight_prompt("turn-1", "goal", &[], Some(&execution), &[], None);
-        assert!(
-            prompt.contains("Actual Capability IDs Used This Turn"),
-            "missing allowed list section: {prompt}"
-        );
-        assert!(
-            prompt.contains("- file.read"),
-            "missing capability id: {prompt}"
-        );
-        assert!(
-            prompt.contains("tool_memory 中的 capability_id 只能是上述 id 之一"),
-            "missing hard rule: {prompt}"
-        );
+        assert!(prompt.contains("Actual Capability IDs Used This Turn"));
+        assert!(prompt.contains("- file.read"));
+        assert!(prompt.contains("tool_memory 中的 capability_id 只能是上述 id 之一"));
     }
 }

@@ -41,7 +41,7 @@ fn init_tracing() {
         .try_init();
 }
 
-const LEGACY_DEFAULT_PROMPT_SHA256: [(&str, &str); 23] = [
+const LEGACY_DEFAULT_PROMPT_SHA256: [(&str, &str); 24] = [
     (
         "system.md",
         "a3e6f5e733ad55b953092b7f2b980d28540e2c18970615cd2fe6eac23ff3ebd4",
@@ -112,6 +112,11 @@ const LEGACY_DEFAULT_PROMPT_SHA256: [(&str, &str); 23] = [
     (
         "insight_platform.md",
         "17dafb1fbec2dd44f7ab7fe4aeae31c73b417cfd9ee607661c8fc73b9bfcda8e",
+    ),
+    // v0.3.1 洞察输出单 insight 字段前
+    (
+        "insight_platform.md",
+        "5e7144c8adf143bf816480e5db5fd3d955fe2766314605670ae8b1a5d5c5359d",
     ),
     (
         "execution_platform.md",
@@ -1392,8 +1397,8 @@ fn build_echo_summary(
     }
     if let Some(ins) = &ctx.insight {
         parts.push(format!(
-            "洞察: 越界={} 需跟进={}",
-            ins.insight.boundary_check.crossed, ins.insight.needs_followup
+            "洞察: {}",
+            crate::common::json_util::truncate_head_tail(&ins.insight.insight, 800)
         ));
     }
     if let Some(mem) = &ctx.memory {
@@ -2184,23 +2189,7 @@ mod echo_summary_tests {
             execution,
             insight: Some(InsightOutput {
                 insight: crate::agent::communication::InsightResult {
-                    boundary_check: crate::agent::communication::BoundaryCheck {
-                        crossed: false,
-                        violations: vec![],
-                        analysis: String::new(),
-                    },
-                    goal_alignment: crate::agent::communication::GoalAlignment {
-                        aligned: true,
-                        deviation: None,
-                        analysis: String::new(),
-                    },
-                    growth_check: crate::agent::communication::GrowthCheck {
-                        growth_detected: false,
-                        growth_type: None,
-                        analysis: String::new(),
-                    },
-                    needs_followup: false,
-                    followup_hint: None,
+                    insight: String::new(),
                 },
                 tool_memory: vec![],
             }),

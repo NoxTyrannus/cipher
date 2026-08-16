@@ -129,32 +129,9 @@ pub struct InsightOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InsightResult {
-    pub boundary_check: BoundaryCheck,
-    pub goal_alignment: GoalAlignment,
-    pub growth_check: GrowthCheck,
-    pub needs_followup: bool,
-    pub followup_hint: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BoundaryCheck {
-    pub crossed: bool,
-    pub violations: Vec<String>,
-    pub analysis: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GoalAlignment {
-    pub aligned: bool,
-    pub deviation: Option<String>,
-    pub analysis: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GrowthCheck {
-    pub growth_detected: bool,
-    pub growth_type: Option<String>,
-    pub analysis: String,
+    /// 洞察中台基于三问方法得出的完整判断文本。
+    /// 三问只作为提示词中的思考方法存在，不再进入输出结构。
+    pub insight: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,28 +256,12 @@ mod tests {
     fn insight_output_serialization() {
         let output = InsightOutput {
             insight: InsightResult {
-                boundary_check: BoundaryCheck {
-                    crossed: false,
-                    violations: vec![],
-                    analysis: "all good".into(),
-                },
-                goal_alignment: GoalAlignment {
-                    aligned: true,
-                    deviation: None,
-                    analysis: "on track".into(),
-                },
-                growth_check: GrowthCheck {
-                    growth_detected: false,
-                    growth_type: None,
-                    analysis: "steady".into(),
-                },
-                needs_followup: false,
-                followup_hint: None,
+                insight: "执行证据已核对，目标已达成。".into(),
             },
             tool_memory: vec![],
         };
         let json = serde_json::to_string(&output).unwrap();
-        assert!(json.contains("boundary_check"));
+        assert!(json.contains("insight"));
     }
 
     #[test]

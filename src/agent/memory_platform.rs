@@ -682,22 +682,8 @@ fn build_attention_prompt(
     execution: Option<&ExecutionOutput>,
     existing_attention: &str,
 ) -> String {
-    let insight_summary = format!(
-        "Boundary Check: crossed={}, violations={:?}, analysis={}\n\
-         Goal Alignment: aligned={}, deviation={:?}, analysis={}\n\
-         Growth Check: growth_detected={}, growth_type={:?}, analysis={}\n\
-         Needs Followup: {}",
-        insight.insight.boundary_check.crossed,
-        insight.insight.boundary_check.violations,
-        insight.insight.boundary_check.analysis,
-        insight.insight.goal_alignment.aligned,
-        insight.insight.goal_alignment.deviation,
-        insight.insight.goal_alignment.analysis,
-        insight.insight.growth_check.growth_detected,
-        insight.insight.growth_check.growth_type,
-        insight.insight.growth_check.analysis,
-        insight.insight.needs_followup,
-    );
+    let insight_summary =
+        crate::common::json_util::truncate_head_tail(&insight.insight.insight, 2000);
 
     let execution_summary = match execution {
         Some(exec) => {
@@ -772,8 +758,8 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::super::communication::{
-        BoundaryCheck, ExecutionDag, ExecutionOutput, ExecutionStatus, GoalAlignment, GrowthCheck,
-        InsightOutput, InsightResult, NodeResult, NodeStatus,
+        ExecutionDag, ExecutionOutput, ExecutionStatus, InsightOutput, InsightResult, NodeResult,
+        NodeStatus,
     };
     use super::*;
 
@@ -781,23 +767,7 @@ mod tests {
     fn make_insight_output() -> InsightOutput {
         InsightOutput {
             insight: InsightResult {
-                boundary_check: BoundaryCheck {
-                    crossed: false,
-                    violations: vec![],
-                    analysis: "all within bounds".into(),
-                },
-                goal_alignment: GoalAlignment {
-                    aligned: true,
-                    deviation: None,
-                    analysis: "on track".into(),
-                },
-                growth_check: GrowthCheck {
-                    growth_detected: false,
-                    growth_type: None,
-                    analysis: "steady".into(),
-                },
-                needs_followup: false,
-                followup_hint: None,
+                insight: "all within bounds".into(),
             },
             tool_memory: vec![],
         }

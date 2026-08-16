@@ -34,6 +34,13 @@ MODE_MARKERS = {
     "loop": "Mode: LOOP",
 }
 
+# 洞察中台现在也走流式请求，不能只靠 stream 标志区分 thinking/platform。
+PLATFORM_MARKERS = (
+    "You are the result checker",
+    "You are the Execution Platform",
+    "你是注意力记忆 agent",
+)
+
 
 class UpstreamRelay:
     """透明代理：把应用的请求转发到上游真实 LLM（如 minimax），并把响应原样流式转发回应用。
@@ -184,7 +191,8 @@ class MockState:
 def classify(messages, stream):
     """返回 (kind, mode)。
 
-    思考引擎请求恒为流式（spawn_streaming → call_stream），平台请求恒为非流式。
+    思考引擎请求恒为流式（spawn_streaming → call_stream）；执行中台仍为非流式，
+    洞察中台现在也是流式，因此平台请求需先按系统提示词标记识别。
     子类型（user/echo/reflect2/final）按当前输入文本内容判定：
       - 输入不以"既定目标:"开头 → 用户原始输入（user）
       - 含"记忆中台已整理上一轮" → 融合思考最终实例（final）—— 该标记只在
@@ -201,6 +209,8 @@ def classify(messages, stream):
         if marker in text:
             mode = name
             break
+    if any(marker in text for marker in PLATFORM_MARKERS):
+        return "platform", mode
     if not stream:
         return "platform", mode
     # 当前输入 = 最后一条消息（assembler 将当前输入 push 为最后一个 User 消息）
