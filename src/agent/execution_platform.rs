@@ -173,6 +173,24 @@ fn resolve_capability_alias(name: &str) -> &str {
     }
 }
 
+/// Flow 设计转 execution DAG 时保留每个节点的 canonical capability_id。
+/// 历史上这里被写成 vec![]，导致洞察中台拿不到 flow 的能力证据列表。
+fn flow_dag_nodes(flow: &TaskFlow) -> Vec<super::communication::DagNode> {
+    flow.nodes
+        .iter()
+        .map(|node| {
+            let capability_ids = vec![resolve_capability_alias(&node.capability).to_string()];
+            super::communication::DagNode {
+                id: node.id.clone(),
+                template_kind: "flow".to_string(),
+                capability_ids,
+                task_context: node.task_description.clone(),
+                depends_on: node.depends_on.clone(),
+            }
+        })
+        .collect()
+}
+
 fn default_max_turns() -> u32 {
     10
 }
@@ -1517,17 +1535,7 @@ impl ExecutionPlatform {
                 } else {
                     let results = self.execute_flow(&flow).await;
                     let dag = ExecutionDag::Dag {
-                        nodes: flow
-                            .nodes
-                            .into_iter()
-                            .map(|n| super::communication::DagNode {
-                                id: n.id,
-                                template_kind: "flow".to_string(),
-                                capability_ids: vec![],
-                                task_context: n.task_description,
-                                depends_on: n.depends_on,
-                            })
-                            .collect(),
+                        nodes: flow_dag_nodes(&flow),
                     };
                     (dag, results)
                 }
@@ -2918,6 +2926,29 @@ fn thought_id_from_turn(turn_id: &str) -> ThoughtId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flow_dag_nodes_preserves_canonical_capability_ids() {
+        let flow = TaskFlow {
+            template_kind: "flow".to_string(),
+            trigger: None,
+            nodes: vec![TaskNode {
+                id: "n1".to_string(),
+                depends_on: vec![],
+                task_description: "list files".to_string(),
+                expected_output: String::new(),
+                capability: "file_list".to_string(),
+                prefilled_arguments: None,
+            }],
+        };
+
+        let nodes = flow_dag_nodes(&flow);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id, "n1");
+        assert_eq!(nodes[0].template_kind, "flow");
+        assert_eq!(nodes[0].capability_ids, vec!["file.list".to_string()]);
+        assert_eq!(nodes[0].task_context, "list files");
+    }
 
     #[test]
     fn agent_max_turns_reads_config_with_default_fallback() {
