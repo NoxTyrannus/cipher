@@ -242,23 +242,7 @@ mod tests {
             "t1",
             InsightOutput {
                 insight: super::super::super::communication::InsightResult {
-                    boundary_check: super::super::super::communication::BoundaryCheck {
-                        crossed: false,
-                        violations: vec![],
-                        analysis: "ok".into(),
-                    },
-                    goal_alignment: super::super::super::communication::GoalAlignment {
-                        aligned: true,
-                        deviation: None,
-                        analysis: "ok".into(),
-                    },
-                    growth_check: super::super::super::communication::GrowthCheck {
-                        growth_detected: false,
-                        growth_type: None,
-                        analysis: "ok".into(),
-                    },
-                    needs_followup: false,
-                    followup_hint: None,
+                    insight: "ok".into(),
                 },
                 tool_memory: vec![],
             },
