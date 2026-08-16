@@ -22,6 +22,8 @@ pub struct LlmRequest {
 
     pub tools: Vec<serde_json::Value>,
 
+    pub response_format: Option<serde_json::Value>,
+
     pub stream: bool,
 
     pub api_url: String,
@@ -57,6 +59,13 @@ impl LlmRequest {
             top_p,
             max_tokens,
             tools: vec![],
+            response_format: if model_row.api_type.eq_ignore_ascii_case("openai") {
+                Some(serde_json::json!({"type": "json_object"}))
+            } else {
+                config
+                    .as_ref()
+                    .and_then(|c| c.get("response_format").cloned())
+            },
             stream: false,
             api_url: model_row.api_url.clone(),
             api_key: Some(api_key),

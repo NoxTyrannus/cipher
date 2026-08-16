@@ -103,6 +103,13 @@ impl CapabilityExecutor {
         self.thought_store = Some(store);
     }
 
+    /// 从 duckdb 重新加载注册表；自扩展能力导入后调用，使当前进程可见新能力。
+    pub fn reload_registry(&self) -> Option<crate::data::duckdb::Registry> {
+        let db = self.duckdb.as_ref()?;
+        let conn = db.lock().ok()?;
+        crate::data::duckdb::loader::load_all_into_memory(&conn).ok()
+    }
+
     pub fn set_reload_tx(&mut self, tx: mpsc::Sender<ReloadEvent>) {
         self.reload_tx = Some(tx);
     }

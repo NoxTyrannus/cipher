@@ -800,7 +800,7 @@ fn sanitize_args_summary(args: &serde_json::Value) -> String {
 
 #[derive(Clone)]
 struct NodeRunner {
-    registry: Option<Registry>,
+    registry: Arc<std::sync::Mutex<Option<Registry>>>,
     executor: Option<Arc<CapabilityExecutor>>,
     provider: Arc<dyn LlmProvider>,
     model_row: ModelRow,
@@ -808,6 +808,35 @@ struct NodeRunner {
 }
 
 impl NodeRunner {
+    fn registry_snapshot(&self) -> Option<Registry> {
+        self.registry.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    fn refresh_registry(&self) {
+        let Some(executor) = &self.executor else {
+            return;
+        };
+        let Some(registry) = executor.reload_registry() else {
+            return;
+        };
+        if let Ok(mut guard) = self.registry.lock() {
+            *guard = Some(registry);
+        }
+    }
+
+    fn capability_runtime(
+        &self,
+    ) -> std::result::Result<Option<(Registry, Arc<CapabilityExecutor>)>, String> {
+        self.refresh_registry();
+        let Some(registry) = self.registry_snapshot() else {
+            return Ok(None);
+        };
+        let Some(executor) = &self.executor else {
+            return Ok(None);
+        };
+        Ok(Some((registry, Arc::clone(executor))))
+    }
+
     pub async fn execute_flow_public(&self, flow: &TaskFlow) -> Vec<NodeResult> {
         let layers = match topological_layers(&flow.nodes) {
             Ok(l) => l,
@@ -905,8 +934,8 @@ impl NodeRunner {
             format!("prefilled_call: {canonical}"),
             format!("arguments: {args_summary}"),
         ];
-        let capability_name = self
-            .registry
+        let registry = self.registry_snapshot();
+        let capability_name = registry
             .as_ref()
             .and_then(|r| {
                 r.base_capabilities
@@ -924,8 +953,8 @@ impl NodeRunner {
             capability_name,
             arguments: arguments.clone(),
         };
-        let service = match self.capability_service() {
-            Ok(Some(s)) => s,
+        let runtime = match self.capability_runtime() {
+            Ok(Some(runtime)) => runtime,
             Ok(None) => {
                 logs.push("NO_RUNTIME: registry/executor 未配置".to_string());
                 return NodeResult {
@@ -938,12 +967,26 @@ impl NodeRunner {
                 };
             }
             Err(e) => {
-                logs.push(format!("capability service init failed: {e}"));
+                logs.push(format!("capability runtime init failed: {e}"));
                 return NodeResult {
                     node_id: node.id.clone(),
                     status: NodeStatus::Failed,
                     summary: String::new(),
                     error: Some(e),
+                    tool_call_count: 0,
+                    tool_call_logs: logs,
+                };
+            }
+        };
+        let service = match CapabilityService::new(&runtime.0, &runtime.1) {
+            Ok(service) => service,
+            Err(e) => {
+                logs.push(format!("capability service init failed: {e}"));
+                return NodeResult {
+                    node_id: node.id.clone(),
+                    status: NodeStatus::Failed,
+                    summary: String::new(),
+                    error: Some(e.to_string()),
                     tool_call_count: 0,
                     tool_call_logs: logs,
                 };
@@ -1009,8 +1052,8 @@ impl NodeRunner {
         );
         let mut logs = vec![format!("node_id: {}", node.id)];
         let capability = resolve_capability_alias(&node.capability).to_string();
-        let schema = self
-            .registry
+        let registry = self.registry_snapshot();
+        let schema = registry
             .as_ref()
             .and_then(|r| {
                 r.base_capabilities
@@ -1041,7 +1084,7 @@ impl NodeRunner {
             },
         ];
         let max_turns = self
-            .registry
+            .registry_snapshot()
             .as_ref()
             .and_then(agent_max_turns_from_registry)
             .unwrap_or(SUBAGENT_MAX_TURNS);
@@ -1104,8 +1147,8 @@ impl NodeRunner {
                     );
                 }
                 SubagentAction::Arguments { arguments } => {
-                    let capability_name = self
-                        .registry
+                    let registry = self.registry_snapshot();
+                    let capability_name = registry
                         .as_ref()
                         .and_then(|r| {
                             r.base_capabilities
@@ -1124,23 +1167,33 @@ impl NodeRunner {
                         capability_name,
                         arguments,
                     };
-                    let outcome = match self.capability_service() {
-                        Ok(Some(service)) => match service.execute_for_agent("agent", &cap_call) {
-                            Ok(result) => {
-                                if let Some(fail) = Self::output_indicates_failure(&result.output) {
-                                    Err(format!("{capability}: {fail}"))
-                                } else {
-                                    let summary = crate::common::json_util::truncate_head_tail(
-                                        &result.output.to_string(),
-                                        4000,
-                                    );
-                                    Ok(summary)
+                    let outcome = match self.capability_runtime() {
+                        Ok(Some((registry, executor))) => {
+                            match CapabilityService::new(&registry, &executor) {
+                                Ok(service) => {
+                                    match service.execute_for_agent("agent", &cap_call) {
+                                        Ok(result) => {
+                                            if let Some(fail) =
+                                                Self::output_indicates_failure(&result.output)
+                                            {
+                                                Err(format!("{capability}: {fail}"))
+                                            } else {
+                                                let summary =
+                                                    crate::common::json_util::truncate_head_tail(
+                                                        &result.output.to_string(),
+                                                        4000,
+                                                    );
+                                                Ok(summary)
+                                            }
+                                        }
+                                        Err(e) => Err(format!("{capability}: {e}")),
+                                    }
                                 }
+                                Err(e) => Err(e.to_string()),
                             }
-                            Err(e) => Err(format!("{capability}: {e}")),
-                        },
+                        }
                         Ok(None) => Err("no capability runtime".to_string()),
-                        Err(e) => Err(e),
+                        Err(e) => Err(e.to_string()),
                     };
                     tool_call_count += 1;
                     match outcome {
@@ -1188,15 +1241,6 @@ impl NodeRunner {
         )
     }
 
-    fn capability_service(&self) -> std::result::Result<Option<CapabilityService<'_>>, String> {
-        match (&self.registry, &self.executor) {
-            (Some(registry), Some(executor)) => CapabilityService::new(registry, executor)
-                .map(Some)
-                .map_err(|e| format!("capability service init: {e}")),
-            _ => Ok(None),
-        }
-    }
-
     fn output_indicates_failure(output: &serde_json::Value) -> Option<String> {
         ExecutionPlatform::output_indicates_failure(output)
     }
@@ -1225,7 +1269,7 @@ pub struct ExecutionPlatform {
 
     capability_ids: Vec<String>,
 
-    registry: Option<Registry>,
+    registry: Arc<std::sync::Mutex<Option<Registry>>>,
 
     executor: Option<Arc<CapabilityExecutor>>,
 }
@@ -1305,9 +1349,38 @@ impl ExecutionPlatform {
             cursor_store,
             prompts_dir,
             capability_ids,
-            registry,
+            registry: Arc::new(std::sync::Mutex::new(registry)),
             executor,
         }
+    }
+
+    fn registry_snapshot(&self) -> Option<Registry> {
+        self.registry.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    fn refresh_registry(&self) {
+        let Some(executor) = &self.executor else {
+            return;
+        };
+        let Some(registry) = executor.reload_registry() else {
+            return;
+        };
+        if let Ok(mut guard) = self.registry.lock() {
+            *guard = Some(registry);
+        }
+    }
+
+    fn capability_runtime(
+        &self,
+    ) -> std::result::Result<Option<(Registry, Arc<CapabilityExecutor>)>, String> {
+        self.refresh_registry();
+        let Some(registry) = self.registry_snapshot() else {
+            return Ok(None);
+        };
+        let Some(executor) = &self.executor else {
+            return Ok(None);
+        };
+        Ok(Some((registry, Arc::clone(executor))))
     }
 
     pub fn spawn(mut self) -> tokio::task::JoinHandle<()> {
@@ -1368,13 +1441,14 @@ impl ExecutionPlatform {
 
         let template_kind = infer_template_kind(&ctx.thinking.goal, &ctx.thinking.constraints);
 
+        let registry = self.registry_snapshot();
         let prompt = build_execution_prompt(
             template_kind,
             &ctx.thinking.goal,
             &ctx.thinking.constraints,
             self.prompts_dir.as_deref(),
             &self.capability_ids,
-            self.registry.as_ref(),
+            registry.as_ref(),
         );
 
         let prompt = self.enrich_prompt_with_environment(&prompt).await;
@@ -1944,27 +2018,17 @@ impl ExecutionPlatform {
             node.capability_ids
         );
 
-        let (registry, executor) = match (&self.registry, &self.executor) {
-            (Some(registry), Some(executor)) => {
-                (Some(registry.clone()), Some(Arc::clone(executor)))
+        let (registry, executor) = match self.capability_runtime() {
+            Ok(Some(runtime)) => runtime,
+            Ok(None) => {
+                tracing::warn!("execution_platform: registry/executor 未配置, SubAgent 降级模拟");
+                return Ok(SubAgentLogs {
+                    lines: vec![],
+                    tool_call_count: 0,
+                });
             }
-            _ => (None, None),
+            Err(e) => return Err(e),
         };
-        let Some((registry, executor)) = registry.zip(executor) else {
-            let mut lines = vec![
-                format!("node_id: {}", node.id),
-                format!("task_context: {}", node.task_context),
-                format!("capabilities: {:?}", node.capability_ids),
-                format!("timeout: {}s", node.timeout_seconds),
-            ];
-            lines.push("NO_RUNTIME: registry/executor 未配置, 降级模拟".to_string());
-            lines.push("EXECUTED: simulation completed (no runtime)".to_string());
-            return Ok(SubAgentLogs {
-                lines,
-                tool_call_count: 0,
-            });
-        };
-
         let node_id = node.id.clone();
         let caps = node.capability_ids.clone();
         let task_ctx = node.task_context.clone();
@@ -2034,15 +2098,6 @@ impl ExecutionPlatform {
         }
     }
 
-    fn capability_service(&self) -> std::result::Result<Option<CapabilityService<'_>>, String> {
-        match (&self.registry, &self.executor) {
-            (Some(registry), Some(executor)) => CapabilityService::new(registry, executor)
-                .map(Some)
-                .map_err(|e| format!("capability service init: {e}")),
-            _ => Ok(None),
-        }
-    }
-
     #[allow(dead_code)]
     fn build_capability_call(&self, capability_id: &str, task_context: &str) -> CapabilityCall {
         self.build_capability_call_with_args(capability_id, task_context, None)
@@ -2054,8 +2109,8 @@ impl ExecutionPlatform {
         task_context: &str,
         explicit_args: Option<&serde_json::Value>,
     ) -> CapabilityCall {
-        let name = self
-            .registry
+        let registry = self.registry_snapshot();
+        let name = registry
             .as_ref()
             .and_then(|r| {
                 r.base_capabilities
@@ -2139,13 +2194,14 @@ impl ExecutionPlatform {
     pub async fn probe_goal(&self, goal: &str) -> ProbeRunReport {
         let started = std::time::Instant::now();
         let template_kind = infer_template_kind(goal, &[]);
+        let registry = self.registry_snapshot();
         let base_prompt = build_execution_prompt(
             template_kind,
             goal,
             &[],
             self.prompts_dir.as_deref(),
             &self.capability_ids,
-            self.registry.as_ref(),
+            registry.as_ref(),
         );
         let prompt = self.enrich_prompt_with_environment(&base_prompt).await;
 
@@ -2446,43 +2502,56 @@ impl ExecutionPlatform {
 
         let mut tool_call_count = 0u32;
         let mut failure: Option<String> = None;
-        match self.capability_service() {
-            Ok(Some(service)) => {
-                for cap_id in &design.capability_ids {
-                    let call = self.build_capability_call_with_args(
-                        cap_id,
-                        &design.task_context,
-                        Self::design_args_for(design.arguments.as_ref(), cap_id),
-                    );
-                    match service.execute_for_agent("agent", &call) {
-                        Ok(result) => {
-                            if let Some(fail_reason) =
-                                Self::output_indicates_failure(&result.output)
-                            {
-                                tracing::warn!(
-                                    "execution_platform: capability FAIL {cap_id}: {fail_reason}"
-                                );
-                                self.subagent_pool.append_log(
-                                    &handle.id,
-                                    &format!("FAIL {cap_id}: {fail_reason}"),
-                                );
-                                failure = Some(format!("{cap_id}: {fail_reason}"));
-                                break;
+        match self.capability_runtime() {
+            Ok(Some((registry, executor))) => {
+                let service = CapabilityService::new(&registry, &executor);
+                match service {
+                    Ok(service) => {
+                        for cap_id in &design.capability_ids {
+                            let call = self.build_capability_call_with_args(
+                                cap_id,
+                                &design.task_context,
+                                Self::design_args_for(design.arguments.as_ref(), cap_id),
+                            );
+                            match service.execute_for_agent("agent", &call) {
+                                Ok(result) => {
+                                    if let Some(fail_reason) =
+                                        Self::output_indicates_failure(&result.output)
+                                    {
+                                        tracing::warn!(
+                                            "execution_platform: capability FAIL {cap_id}: {fail_reason}"
+                                        );
+                                        self.subagent_pool.append_log(
+                                            &handle.id,
+                                            &format!("FAIL {cap_id}: {fail_reason}"),
+                                        );
+                                        failure = Some(format!("{cap_id}: {fail_reason}"));
+                                        break;
+                                    }
+                                    tool_call_count += 1;
+                                    let preview = result.output.to_string();
+                                    let preview: String = preview.chars().take(200).collect();
+                                    tracing::info!(
+                                        "execution_platform: capability OK {cap_id}: {preview}"
+                                    );
+                                    self.subagent_pool
+                                        .append_log(&handle.id, &format!("OK {cap_id}: {preview}"));
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "execution_platform: capability FAIL {cap_id}: {e}"
+                                    );
+                                    self.subagent_pool
+                                        .append_log(&handle.id, &format!("FAIL {cap_id}: {e}"));
+                                    failure = Some(format!("{cap_id}: {e}"));
+                                    break;
+                                }
                             }
-                            tool_call_count += 1;
-                            let preview = result.output.to_string();
-                            let preview: String = preview.chars().take(200).collect();
-                            tracing::info!("execution_platform: capability OK {cap_id}: {preview}");
-                            self.subagent_pool
-                                .append_log(&handle.id, &format!("OK {cap_id}: {preview}"));
                         }
-                        Err(e) => {
-                            tracing::warn!("execution_platform: capability FAIL {cap_id}: {e}");
-                            self.subagent_pool
-                                .append_log(&handle.id, &format!("FAIL {cap_id}: {e}"));
-                            failure = Some(format!("{cap_id}: {e}"));
-                            break;
-                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("execution_platform: capability service init failed: {e}");
+                        failure = Some(e.to_string());
                     }
                 }
             }
@@ -2492,7 +2561,7 @@ impl ExecutionPlatform {
                     .append_log(&handle.id, "NO_RUNTIME: registry/executor 未配置, 降级模拟");
             }
             Err(e) => {
-                tracing::warn!("execution_platform: capability service init failed: {e}");
+                tracing::warn!("execution_platform: capability runtime init failed: {e}");
                 failure = Some(e);
             }
         }
@@ -2688,6 +2757,28 @@ fn build_execution_prompt(
             .join("\n")
     };
 
+    let methods_str = registry
+        .map(|registry| {
+            let methods: Vec<String> = registry
+                .usage_methods
+                .values()
+                .map(|method| {
+                    format!(
+                        "- method id: {}\n  name: {}\n  prompt: {}",
+                        method.id,
+                        method.name,
+                        crate::common::json_util::truncate_head_tail(&method.prompt, 4000)
+                    )
+                })
+                .collect();
+            if methods.is_empty() {
+                "none".to_string()
+            } else {
+                methods.join("\n")
+            }
+        })
+        .unwrap_or_else(|| "none".to_string());
+
     let caps_str = if capabilities.is_empty() {
         "none".to_string()
     } else {
@@ -2716,7 +2807,7 @@ fn build_execution_prompt(
     };
 
     format!(
-        "{}\n\n## Task Input\n\n**Goal:** {}\n\n**Constraints:**\n{}\n\n**Available Capabilities:**\n{}\n\n**Template Kind:** {}\n\n## Output Format (TaskFlow v2)\n\
+        "{}\n\n## Task Input\n\n**Goal:** {}\n\n**Constraints:**\n{}\n\n**Available Capabilities:**\n{}\n\n**Capability Methods (LLM-facing):**\n{}\n\n**Template Kind:** {}\n\n## Output Format (TaskFlow v2)\n\
          输出**任务流程** JSON (节点-任务流程化设计, 一个节点一件事一种工具, **每个节点必须配 capability**):\n\n\
          示例 1 (一步执行):\n\
          ```json\n\
@@ -2751,7 +2842,7 @@ fn build_execution_prompt(
            否则节点会并行执行, 前序产物尚不存在 → 失败 (反例: n3 读 n2 创建的脚本但不声明 depends_on → 并行执行 → 文件不存在)\n\
          - 不要写散文到 prefilled_arguments 中, 参数必须是可执行的值\n\
          - trigger 仅用于定时 (cron) / webhook / 内部事件, 普通任务省略",
-        base, goal, constraints_str, caps_str, template_kind
+        base, goal, constraints_str, caps_str, methods_str, template_kind
     )
 }
 
@@ -3098,7 +3189,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("evt.txt"), "event-triggered").unwrap();
         let runner = NodeRunner {
-            registry: Some(a1_flow_registry()),
+            registry: Arc::new(std::sync::Mutex::new(Some(a1_flow_registry()))),
             executor: Some(Arc::new(a1_flow_executor(tmp.path()))),
             provider: Arc::new(SequenceProvider::new(vec![])),
             model_row: ModelRow {
@@ -3160,7 +3251,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("hook.txt"), "hook-triggered").unwrap();
         let runner = NodeRunner {
-            registry: Some(a1_flow_registry()),
+            registry: Arc::new(std::sync::Mutex::new(Some(a1_flow_registry()))),
             executor: Some(Arc::new(a1_flow_executor(tmp.path()))),
             provider: Arc::new(SequenceProvider::new(vec![])),
             model_row: ModelRow {

@@ -28,7 +28,12 @@
           "type": "array"
         },
         "final": {}
-      }
+      },
+      "required": [
+        "capability_id",
+        "steps",
+        "final"
+      ]
     },
     "executor": "dag",
     "dag": [
@@ -74,7 +79,12 @@
           "type": "array"
         },
         "final": {}
-      }
+      },
+      "required": [
+        "capability_id",
+        "steps",
+        "final"
+      ]
     },
     "executor": "dag",
     "dag": [
@@ -117,7 +127,12 @@
           "type": "array"
         },
         "final": {}
-      }
+      },
+      "required": [
+        "capability_id",
+        "steps",
+        "final"
+      ]
     },
     "executor": "dag",
     "dag": [
@@ -159,7 +174,12 @@
           "type": "array"
         },
         "final": {}
-      }
+      },
+      "required": [
+        "capability_id",
+        "steps",
+        "final"
+      ]
     },
     "executor": "dag",
     "dag": [
@@ -205,7 +225,12 @@
           "type": "array"
         },
         "final": {}
-      }
+      },
+      "required": [
+        "capability_id",
+        "steps",
+        "final"
+      ]
     },
     "executor": "dag",
     "dag": [
@@ -266,7 +291,12 @@
           "type": "array"
         },
         "final": {}
-      }
+      },
+      "required": [
+        "capability_id",
+        "steps",
+        "final"
+      ]
     },
     "executor": "dag",
     "dag": [
@@ -332,7 +362,12 @@
           "type": "array"
         },
         "final": {}
-      }
+      },
+      "required": [
+        "capability_id",
+        "steps",
+        "final"
+      ]
     },
     "executor": "dag",
     "dag": [
@@ -385,7 +420,12 @@
           "type": "array"
         },
         "final": {}
-      }
+      },
+      "required": [
+        "capability_id",
+        "steps",
+        "final"
+      ]
     },
     "executor": "dag",
     "dag": [
@@ -433,7 +473,12 @@
           "type": "array"
         },
         "final": {}
-      }
+      },
+      "required": [
+        "capability_id",
+        "steps",
+        "final"
+      ]
     },
     "executor": "dag",
     "dag": [
@@ -485,7 +530,12 @@
           "type": "array"
         },
         "final": {}
-      }
+      },
+      "required": [
+        "capability_id",
+        "steps",
+        "final"
+      ]
     },
     "executor": "dag",
     "dag": [

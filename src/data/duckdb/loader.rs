@@ -620,7 +620,7 @@ pub fn update_model_api_key_by_provider(
     api_key: &SecretString,
 ) -> Result<usize, AgentError> {
     conn.execute(
-        "UPDATE model SET api_key = ?, updated_at = CURRENT_TIMESTAMP WHERE provider = ?",
+        "UPDATE model SET api_key = ?, updated_at = now() WHERE provider = ?",
         duckdb::params![api_key.expose_secret(), provider],
     )
     .map_err(|error| AgentError::Bootstrap(format!("update_model_api_key_by_provider: {error}")))
@@ -643,11 +643,11 @@ pub fn write_usage_observation(
     let metadata = serde_json::json!({ "rating": rating, "note": note });
     conn.execute(
         "INSERT INTO usage_method (id, capability_id, name, prompt, examples, metadata, updated_at) \
-         VALUES (?, ?, ?, ?, NULL, ?, CURRENT_TIMESTAMP) \
+         VALUES (?, ?, ?, ?, NULL, ?, now()) \
          ON CONFLICT (id) DO UPDATE SET \
              prompt = excluded.prompt, \
              metadata = excluded.metadata, \
-             updated_at = CURRENT_TIMESTAMP",
+             updated_at = now()",
         duckdb::params![
             id,
             capability_id,
@@ -692,7 +692,7 @@ pub fn rename_agent(
     display_name: &str,
 ) -> Result<(), AgentError> {
     conn.execute(
-        "UPDATE agent SET display_name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        "UPDATE agent SET display_name = ?, updated_at = now() WHERE id = ?",
         duckdb::params![display_name, id],
     )
     .map_err(|error| AgentError::Bootstrap(format!("rename_agent {id}: {error}")))?;
@@ -701,7 +701,7 @@ pub fn rename_agent(
 
 pub fn set_default_agent(conn: &duckdb::Connection, id: &str) -> Result<(), AgentError> {
     conn.execute(
-        "UPDATE agent SET is_default = (id = ?), updated_at = CURRENT_TIMESTAMP",
+        "UPDATE agent SET is_default = (id = ?), updated_at = now()",
         duckdb::params![id],
     )
     .map_err(|error| AgentError::Bootstrap(format!("set_default_agent {id}: {error}")))?;
