@@ -181,7 +181,7 @@
     "id": "text.grep",
     "name": "Grep Text",
     "type": "function",
-    "description": "在文件中搜索文本模式",
+    "description": "在文件中搜索文本模式；path 为目录且 recursive=true 时递归搜索目录内文件",
     "schema_in": {
       "type": "object",
       "properties": {
@@ -190,6 +190,10 @@
         },
         "path": {
           "type": "string"
+        },
+        "recursive": {
+          "type": "boolean",
+          "description": "path 为目录时必须为 true，递归搜索目录内所有文件"
         }
       },
       "required": [
@@ -1112,6 +1116,130 @@
       ]
     },
     "executor": "builtin:capability.import",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "path.exists",
+    "name": "Path Exists",
+    "type": "function",
+    "description": "检查工作区路径是否存在，并返回文件/目录类型",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "exists": {
+          "type": "boolean"
+        },
+        "is_file": {
+          "type": "boolean"
+        },
+        "is_dir": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "exists",
+        "is_file",
+        "is_dir"
+      ]
+    },
+    "executor": "builtin:path.exists",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "file.glob",
+    "name": "Glob Files",
+    "type": "function",
+    "description": "按 glob 模式在工作区内匹配文件路径（支持 *、**、?）",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "pattern": {
+          "type": "string"
+        },
+        "root": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "matches": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "count": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "matches",
+        "count"
+      ]
+    },
+    "executor": "builtin:file.glob",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "json.validate",
+    "name": "Validate JSON",
+    "type": "function",
+    "description": "校验 JSON 文本，可选 JSON Schema 校验，返回错误列表",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "schema": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "text"
+      ]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "valid": {
+          "type": "boolean"
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "valid",
+        "errors"
+      ]
+    },
+    "executor": "builtin:json.validate",
     "version": "1.0.0",
     "enabled": true,
     "partition": "system"

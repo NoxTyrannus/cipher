@@ -129,3 +129,49 @@
 ```
 
 复合能力内部每个节点仍按对应 base 能力合同校验；任一步失败，整个 composite 失败。
+
+## 模板八：探测类（path.exists）
+
+```json
+{
+  "schema_out": {
+    "type": "object",
+    "properties": {
+      "exists": { "type": "boolean" },
+      "is_file": { "type": "boolean" },
+      "is_dir": { "type": "boolean" }
+    },
+    "required": ["exists", "is_file", "is_dir"]
+  }
+}
+```
+
+## 模板九：模式匹配类（file.glob）
+
+```json
+{
+  "schema_out": {
+    "type": "object",
+    "properties": {
+      "matches": { "type": "array", "items": { "type": "string" } },
+      "count": { "type": "integer" }
+    },
+    "required": ["matches", "count"]
+  }
+}
+```
+
+## 模板十：校验类（json.validate）
+
+```json
+{
+  "schema_out": {
+    "type": "object",
+    "properties": {
+      "valid": { "type": "boolean" },
+      "errors": { "type": "array", "items": { "type": "string" } }
+    },
+    "required": ["valid", "errors"]
+  }
+}
+```

@@ -3,6 +3,9 @@ use serde_json::Value;
 use std::collections::HashSet;
 
 pub const BUILTIN_EXECUTORS: &[&str] = &[
+    "builtin:path.exists",
+    "builtin:file.glob",
+    "builtin:json.validate",
     "builtin:file.read",
     "builtin:file.write",
     "builtin:file.list",

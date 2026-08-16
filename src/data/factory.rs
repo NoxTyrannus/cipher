@@ -16,6 +16,9 @@ pub fn default_shell_capability_name() -> &'static str {
 
 pub fn default_shell_capability_ids() -> Vec<String> {
     let mut ids = vec![
+        "path.exists".to_string(),
+        "file.glob".to_string(),
+        "json.validate".to_string(),
         "file.read".to_string(),
         "file.write".to_string(),
         "file.list".to_string(),
