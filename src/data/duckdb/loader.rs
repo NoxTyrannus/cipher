@@ -241,9 +241,11 @@ fn validate_persisted_contracts(conn: &duckdb::Connection) -> Result<(), AgentEr
         })?;
         register_persisted_id(&mut owners, &id, "usage_method")?;
         if !executable_ids.contains(&capability_id) {
-            return Err(AgentError::Bootstrap(format!(
-                "usage_method '{id}' references unknown or non-executable capability_id '{capability_id}'"
-            )));
+            tracing::warn!(
+                capability_id,
+                usage_method_id = id,
+                "validate_persisted_contracts: orphan usage_method will be ignored at load"
+            );
         }
     }
     Ok(())
@@ -576,6 +578,16 @@ fn load_usage_methods(
     for row in rows {
         let (id, capability_id, name, prompt, examples, metadata) =
             row.map_err(|error| AgentError::Bootstrap(format!("row usage_method: {error}")))?;
+        if !registry.base_capabilities.contains_key(&capability_id)
+            && !registry.composite_capabilities.contains_key(&capability_id)
+        {
+            tracing::warn!(
+                capability_id,
+                usage_method_id = id,
+                "load_usage_methods: skipping orphan usage_method (unknown capability_id)"
+            );
+            continue;
+        }
         let examples = parse_optional_json(examples, &format!("usage_method '{id}'.examples"))?;
         let metadata = parse_optional_json(metadata, &format!("usage_method '{id}'.metadata"))?;
         registry.usage_methods.insert(
@@ -633,6 +645,19 @@ pub fn write_usage_observation(
     rating: &str,
     note: &str,
 ) -> Result<(), AgentError> {
+    let executable: i64 = conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM base_capability WHERE id = ? AND enabled = true AND tombstoned_at IS NULL) + \
+         (SELECT COUNT(*) FROM composite_capability WHERE id = ? AND enabled = true AND tombstoned_at IS NULL)",
+        duckdb::params![capability_id, capability_id],
+        |row| row.get(0),
+    ).map_err(|e| AgentError::Bootstrap(format!("write_usage_observation({capability_id}) lookup: {e}")))?;
+    if executable == 0 {
+        tracing::warn!(
+            capability_id,
+            "write_usage_observation skipped: capability_id is not an executable registry contract"
+        );
+        return Ok(());
+    }
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(capability_id.as_bytes());
     let suffix: String = digest[..6]
@@ -899,6 +924,71 @@ mod tests {
 
         let error = load_all_into_memory(&connection).expect_err("collision must fail");
         assert!(error.to_string().contains("disabled"));
+    }
+
+    #[test]
+    fn load_skips_orphan_usage_method_instead_of_failing() {
+        let connection = duckdb::Connection::open_in_memory().expect("open DuckDB");
+        create_all_tables(&connection).expect("create schema");
+        connection
+            .execute_batch(
+                "INSERT INTO base_capability \
+                 (id, name, type, description, schema_in, schema_out, executor, version, enabled) \
+                 VALUES ('active', 'Active', 'function', 'active', '{}', '{}', 'active', '1', true); \
+                 INSERT INTO usage_method (id, capability_id, name, prompt) \
+                 VALUES ('orphan', 'thinking-output-validation', 'Orphan', 'use it');",
+            )
+            .expect("insert orphan fixture");
+
+        let registry = load_all_into_memory(&connection).expect("orphan must not break bootstrap");
+        assert!(registry.usage_methods.is_empty(), "orphan must be skipped");
+    }
+
+    #[test]
+    fn write_usage_observation_skips_unknown_capability() {
+        let connection = duckdb::Connection::open_in_memory().expect("open DuckDB");
+        create_all_tables(&connection).expect("create schema");
+
+        write_usage_observation(
+            &connection,
+            "thinking-output-validation",
+            "hallucinated",
+            "good",
+            "must not be persisted",
+        )
+        .expect("unknown capability must be skipped without error");
+
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM usage_method", [], |row| row.get(0))
+            .expect("count usage_method");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn write_usage_observation_persists_for_executable_capability() {
+        let connection = duckdb::Connection::open_in_memory().expect("open DuckDB");
+        create_all_tables(&connection).expect("create schema");
+        connection
+            .execute_batch(
+                "INSERT INTO base_capability \
+                 (id, name, type, description, schema_in, schema_out, executor, version, enabled) \
+                 VALUES ('file.read', 'Read', 'function', 'read', '{}', '{}', 'read', '1', true);",
+            )
+            .expect("insert capability");
+
+        write_usage_observation(
+            &connection,
+            "file.read",
+            "add timeout lesson",
+            "good",
+            "fast",
+        )
+        .expect("valid capability observation must persist");
+
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM usage_method", [], |row| row.get(0))
+            .expect("count usage_method");
+        assert_eq!(count, 1);
     }
 
     #[test]
