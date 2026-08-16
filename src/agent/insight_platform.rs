@@ -185,7 +185,11 @@ impl InsightPlatform {
             self.prompts_dir.as_deref(),
         );
 
-        let (insight_result, tool_memory_updates) = match self.call_llm_for_insight(&prompt).await {
+        let used_capabilities = execution_capability_ids(execution);
+        let (insight_result, mut tool_memory_updates) = match self
+            .call_llm_for_insight(&prompt)
+            .await
+        {
             Ok(raw) => {
                 let insight = match raw.insight {
                     Some(i) => i,
@@ -205,6 +209,19 @@ impl InsightPlatform {
             }
         };
 
+        let before_filter = tool_memory_updates.len();
+        tool_memory_updates.retain(|update| {
+            used_capabilities
+                .iter()
+                .any(|id| id == &update.capability_id)
+        });
+        if before_filter != tool_memory_updates.len() {
+            tracing::warn!(
+                dropped = before_filter - tool_memory_updates.len(),
+                allowed = ?used_capabilities,
+                "insight_platform: dropped hallucinated tool_memory capability_id(s)"
+            );
+        }
         let output = InsightOutput {
             insight: insight_result,
             tool_memory: tool_memory_updates.clone(),
@@ -351,6 +368,21 @@ fn build_insight_prompt(
         }
     };
 
+    let used_capabilities = execution_capability_ids(execution);
+    let capability_section = if used_capabilities.is_empty() {
+        "## Actual Capability IDs Used This Turn\n\n(none — 执行中台没有记录到任何能力调用；tool_memory 必须为空)"
+            .to_string()
+    } else {
+        let lines = used_capabilities
+            .iter()
+            .map(|id| format!("- {id}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "## Actual Capability IDs Used This Turn\n\n{lines}\n\n规则：tool_memory 中的 capability_id 只能是上述 id 之一。禁止使用上述列表之外的能力名。"
+        )
+    };
+
     let trace_hint = format!(
         "## Trace Access\n\n\
          本轮的完整执行记录已落盘，可按索引查证：\n\
@@ -362,14 +394,54 @@ fn build_insight_prompt(
     let pool_summary = build_pool_snapshot_summary(pool_snapshot);
 
     format!(
-        "{}\n\n## Task Input\n\n**Goal:** {}\n\n**Constraints:**\n{}\n\n{}\n\n{}\n\n## Agent Pool Status\n\n{}",
+        "{}\n\n## Task Input\n\n**Goal:** {}\n\n**Constraints:**\n{}\n\n{}\n\n{}\n\n{}\n\n## Agent Pool Status\n\n{}",
         base,
         goal,
         constraints_str,
         execution_section,
+        capability_section,
         trace_hint,
         pool_summary,
     )
+}
+
+fn execution_capability_ids(execution: Option<&ExecutionOutput>) -> Vec<String> {
+    let Some(execution) = execution else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+
+    // 以执行中台节点日志里的真实调用证据为准，而不是以执行设计（DAG/Single）
+    // 声明的能力为准：设计里的能力可能被跳过或从未执行，若把它们列入
+    // tool_memory 允许列表，仍然会给幻觉写入留口子。
+    for node_result in &execution.node_results {
+        for log in &node_result.tool_call_logs {
+            if let Some(id) = capability_id_from_tool_log(log) {
+                ids.push(id);
+            }
+        }
+    }
+
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn capability_id_from_tool_log(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if let Some(rest) = trimmed.strip_prefix("prefilled_call: ") {
+        let id = rest.split_whitespace().next().unwrap_or("").trim();
+        return (!id.is_empty()).then(|| id.to_string());
+    }
+    for prefix in ["START ", "OK ", "FAIL "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            let id = rest.split(':').next().unwrap_or("").trim();
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn build_pool_snapshot_summary(snapshot: &[AgentEntry]) -> String {
@@ -903,5 +975,100 @@ mod tests {
         let prompt = build_insight_prompt("turn-1", "用户说你好", &[], None, &[], None);
         assert!(prompt.contains("say-only"), "应标注无执行轮: {prompt}");
         assert!(prompt.contains("用户说你好"), "goal 应包含 say 内容");
+    }
+
+    #[test]
+    fn capability_id_from_tool_log_parses_evidence_lines() {
+        assert_eq!(
+            capability_id_from_tool_log("START file.read: args={...}"),
+            Some("file.read".to_string())
+        );
+        assert_eq!(
+            capability_id_from_tool_log("  OK shell.exec: done"),
+            Some("shell.exec".to_string())
+        );
+        assert_eq!(
+            capability_id_from_tool_log("FAIL code.exec: boom"),
+            Some("code.exec".to_string())
+        );
+        assert_eq!(
+            capability_id_from_tool_log("prefilled_call: text.grep"),
+            Some("text.grep".to_string())
+        );
+        assert_eq!(capability_id_from_tool_log("DONE: all good"), None);
+        assert_eq!(capability_id_from_tool_log("noise"), None);
+    }
+
+    #[test]
+    fn execution_capability_ids_extracts_actual_tool_evidence() {
+        let execution = ExecutionOutput {
+            dag: ExecutionDag::Single {
+                template_kind: "normal".into(),
+                capability_ids: vec!["file.read".into()],
+                task_context: "test".into(),
+            },
+            node_results: vec![NodeResult {
+                node_id: "n1".into(),
+                status: NodeStatus::Completed,
+                summary: "done".into(),
+                error: None,
+                tool_call_count: 2,
+                tool_call_logs: vec![
+                    "START shell.exec: args={\"command\":\"ls\"}".into(),
+                    "OK file.write: wrote 1 byte".into(),
+                    "FAIL path.exists: denied".into(),
+                    "DONE: finished".into(),
+                ],
+            }],
+            status: ExecutionStatus::Success,
+        };
+
+        // 设计里声明了 file.read，但没有实际调度证据，不能进入允许列表。
+        assert_eq!(
+            execution_capability_ids(Some(&execution)),
+            vec![
+                "file.write".to_string(),
+                "path.exists".to_string(),
+                "shell.exec".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn build_insight_prompt_lists_allowed_capability_ids() {
+        let execution = ExecutionOutput {
+            dag: ExecutionDag::Dag {
+                nodes: vec![super::super::communication::DagNode {
+                    id: "n1".into(),
+                    template_kind: "dag".into(),
+                    capability_ids: vec!["file.read".into()],
+                    task_context: "read".into(),
+                    depends_on: vec![],
+                }],
+            },
+            node_results: vec![NodeResult {
+                node_id: "n1".into(),
+                status: NodeStatus::Completed,
+                summary: "done".into(),
+                error: None,
+                tool_call_count: 1,
+                tool_call_logs: vec!["START file.read: args={\"path\":\"a.txt\"}".into()],
+            }],
+            status: ExecutionStatus::Success,
+        };
+
+        let prompt = build_insight_prompt("turn-1", "goal", &[], Some(&execution), &[], None);
+        assert!(
+            prompt.contains("Actual Capability IDs Used This Turn"),
+            "missing allowed list section: {prompt}"
+        );
+        assert!(
+            prompt.contains("- file.read"),
+            "missing capability id: {prompt}"
+        );
+        assert!(
+            prompt.contains("tool_memory 中的 capability_id 只能是上述 id 之一"),
+            "missing hard rule: {prompt}"
+        );
     }
 }
