@@ -332,7 +332,8 @@ pub fn host_file_list(ctx: &HostContext, args: &Value) -> Result<Value, String> 
             .collect(),
         Err(e) => return fail_str(format!("host_file_list: read_dir: {e}")),
     };
-    Ok(serde_json::json!({"entries": entries}))
+    let count = entries.len();
+    Ok(serde_json::json!({"success": true, "entries": entries, "count": count}))
 }
 
 pub fn host_file_delete(ctx: &HostContext, args: &Value) -> Result<Value, String> {

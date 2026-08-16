@@ -98,10 +98,15 @@
         },
         "success": {
           "type": "boolean"
+        },
+        "count": {
+          "type": "integer"
         }
       },
       "required": [
-        "success"
+        "success",
+        "entries",
+        "count"
       ]
     },
     "executor": "builtin:file.list",
