@@ -114,7 +114,7 @@ pub fn seed_cognitive_memory(data_dir: &Path, db: &mut TriviumDb) -> Result<()> 
         });
         let zero_vec = vec![0.0_f32; db.db().dim()];
         db.db_mut().insert(&zero_vec, payload).map_err(|e| {
-            AgentError::Bootstrap(format!("seed cognitive node {}: {e}", node.node_id))
+            AgentError::Bootstrap(format!("seed cognitive node {id}: {e}", id = node.node_id))
         })?;
     }
 
@@ -220,9 +220,16 @@ pub fn import_factory_defaults(conn: &duckdb::Connection, data_dir: &Path) -> Re
             capability_ids.push(id.to_string());
         }
     }
+    // 主 agent 上下文排除内部管理分子：subagent.* 由执行中台专属平台 agent 使用，
+    // usage_method.observe 由洞察平台专属 agent 使用，二者都不进入主 agent 上下文。
     let agent_capability_allowlist: Vec<String> = capability_ids
         .iter()
-        .filter(|id| !id.starts_with("memory.") && !id.starts_with("db."))
+        .filter(|id| {
+            !id.starts_with("memory.")
+                && !id.starts_with("db.")
+                && !id.starts_with("subagent.")
+                && *id != "usage_method.observe"
+        })
         .cloned()
         .collect();
 
@@ -306,6 +313,8 @@ pub fn import_factory_defaults(conn: &duckdb::Connection, data_dir: &Path) -> Re
     .map_err(|e| AgentError::Bootstrap(format!("seed agent config: {e}")))?;
 
     seed_memory_agents(conn)?;
+    seed_subagent_templates(conn)?;
+    seed_platform_agents(conn)?;
 
     tracing::info!(
         "import_factory_defaults: {} base + agent capability_allowlist={}",
@@ -372,6 +381,130 @@ pub fn seed_memory_agents(conn: &duckdb::Connection) -> Result<()> {
             duckdb::params![id, name, caps_json, name],
         )
         .map_err(|e| AgentError::Bootstrap(format!("seed memory agent {id}: {e}")))?;
+    }
+    Ok(())
+}
+
+/// 四个 subagent 模板行（§5.1 / §14）。
+///
+/// `mode = 'subagent_template'`，可读不可改；capability_allowlist 非空（安全集合）；
+/// config.subagent 含 lifecycle/startup/trigger/memory_window_pct/briefing/预算字段。
+/// ON CONFLICT DO NOTHING：重复执行不破坏已有行（含用户改动）。
+pub fn seed_subagent_templates(conn: &duckdb::Connection) -> Result<()> {
+    // (id, display_name, lifecycle_kind, startup, allowlist)
+    let templates: &[(&str, &str, &str, &str, &[&str])] = &[
+        (
+            "subagent.template.normal",
+            "Normal Subagent Template",
+            "temporary",
+            "normal",
+            &["file.read", "file.list", "path.exists", "text.grep"],
+        ),
+        (
+            "subagent.template.resident",
+            "Resident Subagent Template",
+            "resident",
+            "normal",
+            &["file.read", "file.list", "path.exists", "text.grep"],
+        ),
+        (
+            "subagent.template.scheduled",
+            "Scheduled Subagent Template",
+            "temporary",
+            "scheduled",
+            &["file.read", "file.list", "path.exists", "text.grep"],
+        ),
+        (
+            "subagent.template.condition",
+            "Condition Subagent Template",
+            "resident",
+            "condition",
+            &["file.read", "file.list", "path.exists", "text.grep"],
+        ),
+    ];
+    for (id, name, lifecycle, startup, allowlist) in templates {
+        let trigger = match *startup {
+            "scheduled" => serde_json::json!({
+                "type": "schedule",
+                "cron": "* * * * *",
+                "description": "定时触发范例（v0.3.1 不实现调度器）"
+            }),
+            "condition" => serde_json::json!({
+                "type": "condition",
+                "description": "条件触发范例（v0.3.1 不实现调度器）"
+            }),
+            _ => serde_json::Value::Null,
+        };
+        let config = serde_json::json!({
+            "subagent": {
+                "lifecycle": lifecycle,
+                "startup": startup,
+                "trigger": trigger,
+                "memory_window_pct": 80,
+                "briefing": true,
+                "max_retries": 0,
+                "attempt_timeout_seconds": 600,
+                "total_timeout_seconds": 3600,
+            }
+        });
+        let prompt = format!(
+            "你是 subagent「{name}」，一个有最小记忆的异步工作单元。\n             ## 角色与任务边界\n             - 只处理执行中台分配的任务，不越界，不访问未授权能力，不创建/删除其他 subagent。\n             - 完成分配任务后立即以简报合同收口，不额外继续工作。\n             ## 能力调用规范\n             - 能力调用规范见系统提供的统一片段（capability_call.md 由运行时按需拼接），不要自行重写调用协议。\n             - 你只能调用 available_capabilities 中已授权的能力。\n             ## 运行方式\n             - 每轮从固定能力组选择 0/1/多个能力，多个调用按声明顺序依次执行；能力调用结果不回到本轮 LLM。\n             - 每轮只做一次模型调用。\n             ## 简报输出合同\n             - 任务完成时输出：{{\"done\": true, \"summary\": \"简明结果\"}}"
+        );
+        let allowlist_json = serde_json::to_string(&allowlist.to_vec()).map_err(|error| {
+            AgentError::Parse(format!("serialize template allowlist for {id}: {error}"))
+        })?;
+        conn.execute(
+            "INSERT INTO agent (id, name, mode, prompt, capability_allowlist, config, display_name, is_default) \
+             VALUES (?, ?, 'subagent_template', ?, CAST(? AS JSON), CAST(? AS JSON), ?, false) \
+             ON CONFLICT (id) DO NOTHING",
+            duckdb::params![
+                id,
+                name,
+                prompt,
+                allowlist_json,
+                config.to_string(),
+                name,
+            ],
+        )
+        .map_err(|error| AgentError::Bootstrap(format!("seed subagent template {id}: {error}")))?;
+    }
+    Ok(())
+}
+
+/// 核心平台 agent 表内预授权（§4.1）：执行中台六个 subagent.*、洞察平台 usage_method.observe。
+///
+/// INSERT ON CONFLICT DO NOTHING，幂等；已存在的行（含用户手工改动）不被覆盖。
+pub fn seed_platform_agents(conn: &duckdb::Connection) -> Result<()> {
+    let agents: &[(&str, &str, &[&str])] = &[
+        (
+            "execution-platform",
+            "Execution Platform",
+            &[
+                "subagent.create",
+                "subagent.run",
+                "subagent.update",
+                "subagent.sleep",
+                "subagent.wake",
+                "subagent.delete",
+            ],
+        ),
+        (
+            "insight-platform",
+            "Insight Platform",
+            &["usage_method.observe"],
+        ),
+    ];
+    for (id, name, caps) in agents {
+        let caps_json = serde_json::to_string(caps).map_err(|error| {
+            AgentError::Parse(format!("serialize capability_allowlist for {id}: {error}"))
+        })?;
+        conn.execute(
+            "INSERT INTO agent (id, name, mode, capability_allowlist, display_name, is_default) \
+             VALUES (?, ?, 'platform', CAST(? AS JSON), ?, false) \
+             ON CONFLICT (id) DO NOTHING",
+            duckdb::params![id, name, caps_json, name],
+        )
+        .map_err(|error| AgentError::Bootstrap(format!("seed platform agent {id}: {error}")))?;
     }
     Ok(())
 }
@@ -509,5 +642,167 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "wrong permissions for {name}: {mode:o}");
         }
+    }
+
+    #[test]
+    fn seed_subagent_templates_and_platform_agents_are_idempotent() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        crate::data::duckdb::schema::create_all_tables(&conn).unwrap();
+        let dir = tempdir().unwrap();
+        ensure_default_capabilities(dir.path()).unwrap();
+        import_factory_defaults(&conn, dir.path()).unwrap();
+
+        let template_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent WHERE mode = 'subagent_template'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(template_count, 4);
+        let platform_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent WHERE mode = 'platform'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(platform_count, 2);
+
+        // 幂等：再跑一遍不增加行、不破坏已有行。
+        import_factory_defaults(&conn, dir.path()).unwrap();
+        let template_count_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent WHERE mode = 'subagent_template'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(template_count_after, 4);
+        let platform_count_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent WHERE mode = 'platform'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(platform_count_after, 2);
+
+        // 模板 allowlist 非空安全集合。
+        let allowlist_text: Option<String> = conn
+            .query_row(
+                "SELECT CAST(capability_allowlist AS VARCHAR) FROM agent                  WHERE id = 'subagent.template.normal'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let allowlist: serde_json::Value = serde_json::from_str(&allowlist_text.unwrap()).unwrap();
+        assert!(
+            !allowlist.as_array().unwrap().is_empty(),
+            "template allowlist must be non-empty"
+        );
+    }
+
+    #[test]
+    fn seed_preserves_existing_agent_rows() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        crate::data::duckdb::schema::create_all_tables(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO agent (id, name, mode, capability_allowlist, is_default) \
+             VALUES ('user-keep', 'User', 'unni', '[\"file.read\"]', false);",
+        )
+        .unwrap();
+        let dir = tempdir().unwrap();
+        ensure_default_capabilities(dir.path()).unwrap();
+        import_factory_defaults(&conn, dir.path()).unwrap();
+
+        let keep_text: Option<String> = conn
+            .query_row(
+                "SELECT CAST(capability_allowlist AS VARCHAR) FROM agent WHERE id = 'user-keep'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(keep_text.unwrap(), "[\"file.read\"]");
+    }
+
+    #[test]
+    fn main_agent_allowlist_excludes_subagent_and_observe() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        crate::data::duckdb::schema::create_all_tables(&conn).unwrap();
+        let dir = tempdir().unwrap();
+        ensure_default_capabilities(dir.path()).unwrap();
+        import_factory_defaults(&conn, dir.path()).unwrap();
+
+        let allowlist_text: Option<String> = conn
+            .query_row(
+                "SELECT CAST(capability_allowlist AS VARCHAR) FROM agent WHERE id = 'agent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let allowlist: serde_json::Value = serde_json::from_str(&allowlist_text.unwrap()).unwrap();
+        let ids: Vec<&str> = allowlist
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert!(!ids.iter().any(|id| id.starts_with("subagent.")));
+        assert!(!ids.contains(&"usage_method.observe"));
+        assert!(ids.contains(&"file.read"));
+    }
+
+    #[test]
+    fn platform_agents_hold_molecule_allowlists() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        crate::data::duckdb::schema::create_all_tables(&conn).unwrap();
+        let dir = tempdir().unwrap();
+        ensure_default_capabilities(dir.path()).unwrap();
+        import_factory_defaults(&conn, dir.path()).unwrap();
+
+        let exec_text: Option<String> = conn
+            .query_row(
+                "SELECT CAST(capability_allowlist AS VARCHAR) FROM agent                  WHERE id = 'execution-platform'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let exec: serde_json::Value = serde_json::from_str(&exec_text.unwrap()).unwrap();
+        let exec_ids: Vec<&str> = exec
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        for expected in [
+            "subagent.create",
+            "subagent.run",
+            "subagent.update",
+            "subagent.sleep",
+            "subagent.wake",
+            "subagent.delete",
+        ] {
+            assert!(
+                exec_ids.contains(&expected),
+                "execution-platform missing {expected}"
+            );
+        }
+
+        let insight_text: Option<String> = conn
+            .query_row(
+                "SELECT CAST(capability_allowlist AS VARCHAR) FROM agent                  WHERE id = 'insight-platform'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let insight: serde_json::Value = serde_json::from_str(&insight_text.unwrap()).unwrap();
+        let insight_ids: Vec<&str> = insight
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert_eq!(insight_ids, vec!["usage_method.observe"]);
     }
 }

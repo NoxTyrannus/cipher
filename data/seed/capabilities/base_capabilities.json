@@ -1248,5 +1248,222 @@
     "version": "1.0.0",
     "enabled": true,
     "partition": "system"
+  },
+  {
+    "id": "subagent.create",
+    "name": "Create Subagent",
+    "type": "molecule",
+    "description": "从表内 subagent 模板创建实例：校验 allowlist ⊆ 模板、model 存在，prewrite invocation 后生成 sg_ 实例行并初始化记忆/last_output 文件",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "template_id": {"type": "string"},
+        "name": {"type": "string"},
+        "task_input": {"type": "string"},
+        "capability_allowlist": {"type": "array", "items": {"type": "string"}},
+        "lifecycle": {"type": "string", "enum": ["temporary", "resident"]},
+        "startup": {"type": "string", "enum": ["normal", "scheduled", "condition"]},
+        "trigger": {"type": ["object", "null"]},
+        "model_id": {"type": "string"},
+        "budget": {
+          "type": "object",
+          "properties": {
+            "max_retries": {"type": "integer", "minimum": 0},
+            "attempt_timeout_seconds": {"type": "integer", "minimum": 1},
+            "total_timeout_seconds": {"type": "integer", "minimum": 1}
+          }
+        }
+      },
+      "required": ["template_id"]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "subagent_id": {"type": "string"},
+        "lifecycle": {"type": "string"},
+        "capability_allowlist": {"type": "array", "items": {"type": "string"}},
+        "model_id": {"type": "string"},
+        "memory_ref": {"type": "string"},
+        "last_output_ref": {"type": "string"}
+      },
+      "required": ["subagent_id", "lifecycle"]
+    },
+    "executor": "builtin:subagent.create",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "subagent.update",
+    "name": "Update Subagent",
+    "type": "molecule",
+    "description": "修改 subagent 实例的 prompt / capability_allowlist / startup / trigger / model_id / budget；变更后 allowlist 仍必须 ⊆ 来源模板；running 中只写持久行",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "subagent_id": {"type": "string"},
+        "prompt": {"type": "string"},
+        "capability_allowlist": {"type": "array", "items": {"type": "string"}},
+        "startup": {"type": "string", "enum": ["normal", "scheduled", "condition"]},
+        "trigger": {"type": ["object", "null"]},
+        "model_id": {"type": "string"},
+        "budget": {
+          "type": "object",
+          "properties": {
+            "max_retries": {"type": "integer", "minimum": 0},
+            "attempt_timeout_seconds": {"type": "integer", "minimum": 1},
+            "total_timeout_seconds": {"type": "integer", "minimum": 1}
+          }
+        }
+      },
+      "required": ["subagent_id"]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "subagent_id": {"type": "string"},
+        "lifecycle": {"type": "string"},
+        "updated_fields": {"type": "array", "items": {"type": "string"}}
+      },
+      "required": ["subagent_id", "lifecycle"]
+    },
+    "executor": "builtin:subagent.update",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "subagent.run",
+    "name": "Run Subagent",
+    "type": "molecule",
+    "description": "按启动方式派发一次异步运行：前置 idle/failed，冻结定义快照，persist running，通知 runtime spawn，立即返回 accepted 不等待",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "subagent_id": {"type": "string"},
+        "task_input": {"type": "string"}
+      },
+      "required": ["subagent_id"]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "subagent_id": {"type": "string"},
+        "accepted": {"type": "boolean"},
+        "lifecycle": {"type": "string"}
+      },
+      "required": ["subagent_id", "accepted"]
+    },
+    "executor": "builtin:subagent.run",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "subagent.sleep",
+    "name": "Sleep Subagent",
+    "type": "molecule",
+    "description": "休眠 subagent：前置 idle/failed，persist lifecycle=sleeping",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "subagent_id": {"type": "string"}
+      },
+      "required": ["subagent_id"]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "subagent_id": {"type": "string"},
+        "lifecycle": {"type": "string"}
+      },
+      "required": ["subagent_id", "lifecycle"]
+    },
+    "executor": "builtin:subagent.sleep",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "subagent.wake",
+    "name": "Wake Subagent",
+    "type": "molecule",
+    "description": "唤醒 sleeping 的 subagent 回到 idle：仅前置 sleeping",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "subagent_id": {"type": "string"}
+      },
+      "required": ["subagent_id"]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "subagent_id": {"type": "string"},
+        "lifecycle": {"type": "string"}
+      },
+      "required": ["subagent_id", "lifecycle"]
+    },
+    "executor": "builtin:subagent.wake",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "subagent.delete",
+    "name": "Delete Subagent",
+    "type": "molecule",
+    "description": "软删除/归档 subagent：前置 idle/sleeping/failed（running 拒绝，tombstoned 幂等），persist tombstoned_at，记忆/last_output 文件保留",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "subagent_id": {"type": "string"}
+      },
+      "required": ["subagent_id"]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "subagent_id": {"type": "string"},
+        "lifecycle": {"type": "string"},
+        "archived": {"type": "boolean"}
+      },
+      "required": ["subagent_id", "lifecycle"]
+    },
+    "executor": "builtin:subagent.delete",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "usage_method.observe",
+    "name": "Observe Usage Method",
+    "type": "molecule",
+    "description": "把洞察中台的 usage observation 提案写回 usage_method：capability_id 必须出现在最近一次能力调用日志中；只 UPDATE usage_method 行，禁止改 base/composite 稳定契约",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "capability_id": {"type": "string"},
+        "observation": {"type": "string"},
+        "suggestion": {"type": "string"}
+      },
+      "required": ["capability_id", "observation", "suggestion"]
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "success": {"type": "boolean"},
+        "capability_id": {"type": "string"},
+        "usage_method_id": {"type": "string"},
+        "created": {"type": "boolean"},
+        "updated": {"type": "boolean"}
+      },
+      "required": ["success"]
+    },
+    "executor": "builtin:usage_method.observe",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
   }
 ]
+
