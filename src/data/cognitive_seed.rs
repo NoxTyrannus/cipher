@@ -220,7 +220,7 @@ pub fn import_factory_defaults(conn: &duckdb::Connection, data_dir: &Path) -> Re
             capability_ids.push(id.to_string());
         }
     }
-    let agent_tool_caps: Vec<String> = capability_ids
+    let agent_capability_allowlist: Vec<String> = capability_ids
         .iter()
         .filter(|id| !id.starts_with("memory.") && !id.starts_with("db."))
         .cloned()
@@ -284,20 +284,20 @@ pub fn import_factory_defaults(conn: &duckdb::Connection, data_dir: &Path) -> Re
         .map_err(|e| AgentError::Bootstrap(format!("import usage_method {id}: {e}")))?;
     }
 
-    let caps_json = serde_json::to_string(&agent_tool_caps)
-        .map_err(|e| AgentError::Parse(format!("serialize tool_caps: {e}")))?;
+    let caps_json = serde_json::to_string(&agent_capability_allowlist)
+        .map_err(|e| AgentError::Parse(format!("serialize capability_allowlist: {e}")))?;
     conn.execute(
-        "INSERT INTO agent (id, name, mode, tool_caps, is_default) \
+        "INSERT INTO agent (id, name, mode, capability_allowlist, is_default) \
          SELECT 'agent', 'Agent', 'unni', CAST(? AS JSON), true \
          WHERE NOT EXISTS (SELECT 1 FROM agent WHERE id = 'agent')",
         duckdb::params![caps_json],
     )
     .map_err(|e| AgentError::Bootstrap(format!("seed agent: {e}")))?;
     conn.execute(
-        "UPDATE agent SET tool_caps = CAST(? AS JSON) WHERE id = 'agent'",
+        "UPDATE agent SET capability_allowlist = CAST(? AS JSON) WHERE id = 'agent'",
         duckdb::params![caps_json],
     )
-    .map_err(|e| AgentError::Bootstrap(format!("update agent tool_caps: {e}")))?;
+    .map_err(|e| AgentError::Bootstrap(format!("update agent capability_allowlist: {e}")))?;
     conn.execute(
         "UPDATE agent SET config = '{\"max_turns\": 8}' \
          WHERE id = 'agent' AND (config IS NULL OR config = 'null')",
@@ -308,9 +308,9 @@ pub fn import_factory_defaults(conn: &duckdb::Connection, data_dir: &Path) -> Re
     seed_memory_agents(conn)?;
 
     tracing::info!(
-        "import_factory_defaults: {} base + agent tool_caps={}",
+        "import_factory_defaults: {} base + agent capability_allowlist={}",
         base_rows.len(),
-        agent_tool_caps.len()
+        agent_capability_allowlist.len()
     );
     Ok(())
 }
@@ -362,10 +362,11 @@ pub fn seed_memory_agents(conn: &duckdb::Connection) -> Result<()> {
         ),
     ];
     for (id, name, caps) in agents {
-        let caps_json = serde_json::to_string(caps)
-            .map_err(|e| AgentError::Parse(format!("serialize tool_caps for {id}: {e}")))?;
+        let caps_json = serde_json::to_string(caps).map_err(|e| {
+            AgentError::Parse(format!("serialize capability_allowlist for {id}: {e}"))
+        })?;
         conn.execute(
-            "INSERT INTO agent (id, name, mode, tool_caps, display_name, is_default) \
+            "INSERT INTO agent (id, name, mode, capability_allowlist, display_name, is_default) \
              VALUES (?, ?, 'unni', CAST(? AS JSON), ?, false) \
              ON CONFLICT (id) DO NOTHING",
             duckdb::params![id, name, caps_json, name],

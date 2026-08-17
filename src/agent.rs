@@ -1,8 +1,10 @@
 pub mod agent_pool;
+pub mod capability_protocol;
 pub mod communication;
 pub mod context_assembler;
 pub mod dispatcher;
 pub mod execution_platform;
+pub mod execution_types;
 pub mod insight_platform;
 pub mod memory;
 pub mod memory_platform;
@@ -10,4 +12,3 @@ pub mod output;
 pub mod subagent;
 pub mod thinking;
 pub mod thought;
-pub mod tool_protocol;

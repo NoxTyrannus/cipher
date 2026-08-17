@@ -14,7 +14,7 @@ use super::communication::{
     AgentMessage, AttentionFragment, AttentionRetireBatch, ExecutionOutput, ExperienceFragment,
     InsightOutput, MemoryOutput, NodeStatus,
 };
-use super::memory::tool_agent::{run_tool_loop, ToolLoopRequest};
+use super::memory::capability_agent::{run_capability_loop, CapabilityLoopRequest};
 
 #[cfg(test)]
 fn extract_json_block(text: &str) -> Option<String> {
@@ -204,13 +204,13 @@ impl MemoryPlatform {
             "{attention_prompt}\n\n## 可用能力（服务层能力调用）\n{tool_catalog}\n\n## 输出协议\n             你通过工具调用完成记忆处理。每轮只输出一个 JSON：\n             - 调用能力: {{\"tool_call\":{{\"name\":\"<能力id>\",\"arguments\":{{...}}}}}}\n             - 全部处理完成: {{\"done\":true,\"summary\":\"<本轮处理摘要>\"}}\n\n             规则:\n- 先 memory.list 或 memory.retrieve 查看现有注意力，再决定 write/retire/delete\n             - memory.attention.write 的 source_refs 使用本轮的 thought_id 证据引用\n             - 完成所有记忆操作后必须输出 done\n- 只输出 JSON，不输出解释"
         );
 
-        let outcome = run_tool_loop(
+        let outcome = run_capability_loop(
             &self.provider,
             &self.model_row,
             &self.api_key,
             registry,
             executor,
-            ToolLoopRequest {
+            CapabilityLoopRequest {
                 actor_id: "attention-agent".to_string(),
                 system_prompt,
                 user_prompt: format!(
@@ -345,7 +345,7 @@ fn memory_tool_catalog(
 }
 
 fn attention_output_from_trace(
-    trace: &crate::agent::memory::tool_agent::ToolLoopOutcome,
+    trace: &crate::agent::memory::capability_agent::CapabilityLoopOutcome,
 ) -> MemoryOutput {
     let mut attention = Vec::new();
     for call in &trace.calls {
@@ -385,7 +385,7 @@ fn attention_output_from_trace(
 }
 
 fn retired_focus_from_trace(
-    trace: &crate::agent::memory::tool_agent::ToolLoopOutcome,
+    trace: &crate::agent::memory::capability_agent::CapabilityLoopOutcome,
 ) -> (Vec<String>, Vec<Vec<String>>) {
     let mut focus = Vec::new();
     let mut source_refs = Vec::new();

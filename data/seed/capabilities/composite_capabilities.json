@@ -149,7 +149,7 @@
   {
     "id": "agent.update",
     "name": "Update Agent",
-    "description": "更新 agent 注册表（tool_caps 等），内部固定 table=agent",
+    "description": "更新 agent 注册表（capability_allowlist 等），内部固定 table=agent",
     "schema_in": {
       "type": "object",
       "properties": {

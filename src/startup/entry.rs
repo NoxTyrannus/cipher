@@ -352,7 +352,7 @@ pub async fn run_normal(
 
     // 关键：能力/agent 种子在 import_factory_defaults 中才写入 DuckDB，
     // 而 `app_state.registry` 在 bootstrap() 时已加载（早于种子）。
-    // 必须在此重载，执行平台/记忆 agent 才能拿到最新 tool_caps 与能力行。
+    // 必须在此重载，执行平台/记忆 agent 才能拿到最新 capability_allowlist 与能力行。
     app_state.registry = crate::data::duckdb::loader::load_all_into_memory(&app_state.duckdb)?;
 
     let memory_db = {
