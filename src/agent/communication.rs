@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
 
+// T0 冻结的执行中台共享契约。旧 ExecutionDag/NodeResult/ExecutionStatus 已删除，
+// 新执行中台主输出统一使用这些类型。
+pub use crate::agent::execution_types::{
+    CapabilityLifecycleRecord, CapabilityLifecycleState, ExecutionOutput, SubagentLifecycle,
+    SubagentLifecycleKind, SubagentRuntimeState, SubagentStartup, UsageObservation,
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AgentMessage {
     Execute { turn_id: String },
@@ -66,80 +73,15 @@ pub enum TurnStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionOutput {
-    pub dag: ExecutionDag,
-    pub node_results: Vec<NodeResult>,
-    pub status: ExecutionStatus,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ExecutionDag {
-    #[serde(rename = "single")]
-    Single {
-        template_kind: String,
-        capability_ids: Vec<String>,
-        task_context: String,
-    },
-    #[serde(rename = "dag")]
-    Dag { nodes: Vec<DagNode> },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DagNode {
-    pub id: String,
-    pub template_kind: String,
-    pub capability_ids: Vec<String>,
-    pub task_context: String,
-    pub depends_on: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeResult {
-    pub node_id: String,
-    pub status: NodeStatus,
-    pub summary: String,
-    pub error: Option<String>,
-    pub tool_call_count: u32,
-
-    #[serde(default)]
-    pub tool_call_logs: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NodeStatus {
-    Completed,
-    Failed,
-
-    Skipped,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ExecutionStatus {
-    Success,
-    PartialFailure,
-    Failure,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InsightOutput {
     pub insight: InsightResult,
-    pub tool_memory: Vec<ToolMemoryUpdate>,
+    #[serde(default)]
+    pub usage_observations: Vec<UsageObservation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InsightResult {
-    /// 洞察中台基于三问方法得出的完整判断文本。
-    /// 三问只作为提示词中的思考方法存在，不再进入输出结构。
     pub insight: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolMemoryUpdate {
-    pub capability_id: String,
-    pub description_patch: String,
-    pub rating: String,
-    pub note: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -184,7 +126,6 @@ pub struct CognitiveFragment {
 #[derive(Debug, Clone)]
 pub struct AttentionRetireBatch {
     pub retired_focus: Vec<String>,
-    /// 与 retired_focus 一一对应；每个元素是该 focus 被淘汰时的原始记忆索引。
     pub source_refs: Vec<Vec<String>>,
 }
 
@@ -225,40 +166,33 @@ mod tests {
     }
 
     #[test]
-    fn execution_dag_single_serialization() {
-        let dag = ExecutionDag::Single {
-            template_kind: "normal".into(),
-            capability_ids: vec!["cap_1".into()],
-            task_context: "do something".into(),
-        };
-        let json = serde_json::to_string(&dag).unwrap();
-        assert!(json.contains("single"));
-        assert!(json.contains("normal"));
-    }
-
-    #[test]
-    fn execution_dag_multi_serialization() {
-        let dag = ExecutionDag::Dag {
-            nodes: vec![DagNode {
-                id: "n1".into(),
-                template_kind: "normal".into(),
-                capability_ids: vec!["cap_1".into()],
-                task_context: "step 1".into(),
-                depends_on: vec![],
+    fn new_execution_output_serialization() {
+        let output = ExecutionOutput {
+            task_design: "test".into(),
+            task_status: "done".into(),
+            lifecycle_actions: vec![CapabilityLifecycleRecord {
+                capability_id: "subagent.create".into(),
+                capability_name: "Create Subagent".into(),
+                arguments_summary: "{}".into(),
+                lifecycle_state: CapabilityLifecycleState::Completed,
+                invocation_ref: None,
+                error: None,
+                capability_call_logs: vec!["OK subagent.create".into()],
             }],
+            subagent_states: vec![],
         };
-        let json = serde_json::to_string(&dag).unwrap();
-        assert!(json.contains("dag"));
-        assert!(json.contains("n1"));
+        let json = serde_json::to_string(&output).unwrap();
+        assert!(json.contains("subagent.create"));
+        assert!(json.contains("completed"));
     }
 
     #[test]
     fn insight_output_serialization() {
         let output = InsightOutput {
             insight: InsightResult {
-                insight: "执行证据已核对，目标已达成。".into(),
+                insight: "方向正确，继续执行。".into(),
             },
-            tool_memory: vec![],
+            usage_observations: vec![],
         };
         let json = serde_json::to_string(&output).unwrap();
         assert!(json.contains("insight"));
