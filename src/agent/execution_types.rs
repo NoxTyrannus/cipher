@@ -84,6 +84,8 @@ pub enum SubagentLifecycle {
     Running,
     /// 空闲（可 run / update / sleep / delete）。
     Idle,
+    /// 休眠（仅 wake 可回到 idle）。
+    Sleeping,
     /// 运行失败（AgentPool 运行时身份保留为 idle，供快照展示与后续操作）。
     Failed,
     /// 软删除终态（记忆/last_output 文件保留，移出 AgentPool）。
@@ -279,6 +281,7 @@ mod tests {
             (SubagentLifecycle::Created, "created"),
             (SubagentLifecycle::Running, "running"),
             (SubagentLifecycle::Idle, "idle"),
+            (SubagentLifecycle::Sleeping, "sleeping"),
             (SubagentLifecycle::Failed, "failed"),
             (SubagentLifecycle::Tombstoned, "tombstoned"),
         ] {
