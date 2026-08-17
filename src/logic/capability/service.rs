@@ -12,6 +12,8 @@ use std::collections::{HashMap, VecDeque};
 #[serde(deny_unknown_fields)]
 pub struct CapabilityCall {
     pub capability_id: String,
+    /// 可选；为空时由服务层解析权威名称并回填到结果。
+    #[serde(default)]
     pub capability_name: String,
     pub arguments: Value,
 }
@@ -121,7 +123,13 @@ impl<'a> CapabilityService<'a> {
                 )))
             }
         };
-        if authority_id != &call.capability_id || authority_name != &call.capability_name {
+        if authority_id != &call.capability_id {
+            return Err(AgentError::Parse(format!(
+                "capability identity mismatch for '{}'",
+                call.capability_id
+            )));
+        }
+        if !call.capability_name.is_empty() && authority_name != &call.capability_name {
             return Err(AgentError::Parse(format!(
                 "capability identity mismatch for '{}'",
                 call.capability_id
