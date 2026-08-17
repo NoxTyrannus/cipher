@@ -302,7 +302,6 @@ pub async fn run_normal(
         })?;
     let exec_api_key = crate::logic::model::api_key::resolve_api_key(&default_model)?;
     let insight_api_key = exec_api_key.clone();
-    let subagent_pool = std::sync::Arc::new(crate::agent::subagent::SubAgentPool::new());
     let insight_provider = std::sync::Arc::clone(&exec_provider);
     let memory_provider = std::sync::Arc::clone(&exec_provider);
     let memory_api_key = exec_api_key.clone();
@@ -366,43 +365,103 @@ pub async fn run_normal(
     let pool_exec = std::sync::Arc::clone(&pool);
     let exec_provider_clone = exec_provider;
     let exec_model = default_model.clone();
-    let exec_subagent_pool = std::sync::Arc::clone(&subagent_pool);
-    let exec_trivium_db = Some(std::sync::Arc::clone(&trivium_db));
-    let exec_product_store = Some(std::sync::Arc::new(
-        crate::data::platform_product_store::PlatformProductStore::open(&config.data_dir)?,
-    ));
-    let exec_cursor_store = Some(std::sync::Arc::new(
-        crate::data::platform_cursor::CursorStore::open(&config.data_dir, "execution")?,
-    ));
     let exec_prompts_dir = prompts_dir.clone();
-    let exec_capability_ids = crate::data::factory::default_shell_capability_ids();
 
     let shared_thought_store = std::sync::Arc::new(
         crate::data::thought_store::ThoughtStore::open(app_state.paths.thoughts_data_root())
             .map_err(|e| AgentError::Bootstrap(format!("ThoughtStore open: {e}")))?,
     );
 
+    let exec_duckdb_conn = std::sync::Arc::new(std::sync::Mutex::new(
+        duckdb::Connection::open(app_state.paths.duckdb()).map_err(|e| {
+            AgentError::Bootstrap(format!("open DuckDB for execution runtime: {e}"))
+        })?,
+    ));
     let exec_registry = Some(app_state.registry.clone());
+    let exec_duckdb = Some(std::sync::Arc::clone(&exec_duckdb_conn));
+    let exec_storage_root = Some(app_state.paths.storage_root().to_path_buf());
     let exec_executor = {
         let mut ex = crate::logic::capability::executor::CapabilityExecutor::new();
         ex.set_workspace_root(&std::env::current_dir().unwrap_or_default());
         ex.set_triviumdb(std::sync::Arc::clone(&trivium_db));
         ex.set_thought_store(std::sync::Arc::clone(&shared_thought_store));
-        let duckdb_path = app_state.paths.duckdb();
-        match duckdb::Connection::open(&duckdb_path) {
-            Ok(conn) => {
-                ex.set_duckdb(std::sync::Arc::new(std::sync::Mutex::new(conn)));
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "execution_platform: duckdb open for executor failed (db.* 不可用): {e}"
-                );
-            }
-        }
-        Some(std::sync::Arc::new(ex))
+        ex.set_duckdb(std::sync::Arc::clone(&exec_duckdb_conn));
+        ex.set_storage_root(app_state.paths.storage_root());
+        std::sync::Arc::new(ex)
     };
-    let memory_executor =
-        std::sync::Arc::clone(exec_executor.as_ref().expect("executor configured"));
+
+    // 安装 subagent runtime：TA 分子通过 executor hook 通知，TB RuntimeSpawnHook 负责
+    // resolve model -> resolve api key -> pick provider -> spawn async runtime。
+    {
+        let finish_duckdb = std::sync::Arc::clone(&exec_duckdb_conn);
+        let finish_pool = std::sync::Arc::clone(&pool);
+        let finish_storage_root = app_state.paths.storage_root().to_path_buf();
+        let finish: std::sync::Arc<
+            dyn Fn(&crate::agent::subagent_runtime::SubagentFinish) + Send + Sync,
+        > = std::sync::Arc::new(
+            move |finish: &crate::agent::subagent_runtime::SubagentFinish| {
+                let lifecycle = match finish.outcome {
+                    crate::agent::subagent_runtime::SubagentOutcome::Done { .. } => {
+                        crate::agent::execution_types::SubagentLifecycle::Idle
+                    }
+                    crate::agent::subagent_runtime::SubagentOutcome::Failed { .. } => {
+                        crate::agent::execution_types::SubagentLifecycle::Failed
+                    }
+                };
+                let (final_state, error) = match &finish.outcome {
+                    crate::agent::subagent_runtime::SubagentOutcome::Done { .. } => {
+                        ("completed", None)
+                    }
+                    crate::agent::subagent_runtime::SubagentOutcome::Failed { reason } => {
+                        ("failed", Some(reason.as_str()))
+                    }
+                };
+                if let Ok(conn) = finish_duckdb.lock() {
+                    if let Err(e) = crate::agent::subagent_capability::set_subagent_lifecycle(
+                        &conn,
+                        &finish.subagent_id,
+                        lifecycle,
+                    ) {
+                        tracing::warn!("subagent finish: set_subagent_lifecycle failed: {e}");
+                    }
+                }
+                if let Err(e) = crate::agent::subagent_capability::close_subagent_invocation(
+                    &finish_storage_root,
+                    &finish.invocation_id,
+                    final_state,
+                    error,
+                ) {
+                    tracing::warn!("subagent finish: close_subagent_invocation failed: {e}");
+                }
+                let subagent_id = finish.subagent_id.clone();
+                let finish_pool = finish_pool.clone();
+                let runtime = tokio::runtime::Handle::try_current();
+                if let Ok(runtime) = runtime {
+                    runtime.spawn(async move {
+                        finish_pool
+                            .update_subagent_lifecycle(&subagent_id, lifecycle)
+                            .await;
+                    });
+                }
+            },
+        );
+
+        let subagent_provider_registry =
+            crate::startup::init_flow::build_provider_registry(&default_model)?;
+        let runtime_hook = crate::agent::subagent_runtime::RuntimeSpawnHook::new(
+            std::sync::Arc::clone(&pool),
+            app_state.registry.clone(),
+            std::sync::Arc::clone(&exec_executor),
+            app_state.paths.storage_root().to_path_buf(),
+            subagent_provider_registry,
+            None,
+            finish,
+        );
+        let bridge = crate::agent::execution_platform::SubagentRuntimeBridge::new(runtime_hook);
+        exec_executor.set_subagent_spawn_hook(std::sync::Arc::new(bridge));
+    }
+
+    let memory_executor = std::sync::Arc::clone(&exec_executor);
     let execution_task = tokio::spawn(async move {
         crate::agent::execution_platform::run(
             pool_exec,
@@ -410,50 +469,49 @@ pub async fn run_normal(
             exec_provider_clone,
             exec_model,
             exec_api_key,
-            exec_subagent_pool,
-            exec_trivium_db,
-            exec_product_store,
-            exec_cursor_store,
             exec_prompts_dir,
-            exec_capability_ids,
             exec_registry,
-            exec_executor,
+            Some(exec_executor),
+            exec_duckdb,
+            exec_storage_root,
         )
         .await;
     });
 
-    let (tool_memory_tx, tool_memory_rx): (
-        mpsc::Sender<Vec<crate::agent::communication::ToolMemoryUpdate>>,
-        mpsc::Receiver<Vec<crate::agent::communication::ToolMemoryUpdate>>,
+    let (usage_observation_tx, usage_observation_rx): (
+        mpsc::Sender<Vec<crate::agent::communication::UsageObservation>>,
+        mpsc::Receiver<Vec<crate::agent::communication::UsageObservation>>,
     ) = mpsc::channel(32);
 
-    let tool_memory_conn = duckdb::Connection::open(app_state.paths.duckdb())
-        .map_err(|e| AgentError::Bootstrap(format!("open duckdb for tool_memory consumer: {e}")))?;
+    // 洞察只产生 usage observation 提案；这里通过 CapabilityService 调用
+    // usage_method.observe 分子能力写回 usage_method，不直连 DuckDB。
+    let usage_registry = app_state.registry.clone();
+    let usage_executor = std::sync::Arc::clone(&memory_executor);
     tokio::spawn(async move {
-        let mut rx = tool_memory_rx;
-        while let Some(updates) = rx.recv().await {
-            for update in updates {
-                if let Err(e) = crate::data::duckdb::loader::write_usage_observation(
-                    &tool_memory_conn,
-                    &update.capability_id,
-                    &update.description_patch,
-                    &update.rating,
-                    &update.note,
-                ) {
-                    tracing::warn!(
-                        "tool_memory: write_usage_observation failed for {}: {e}",
-                        update.capability_id
-                    );
-                } else {
-                    tracing::debug!(
-                        "tool_memory: usage_method updated for capability={}, rating={}",
-                        update.capability_id,
-                        update.rating
-                    );
+        let mut rx = usage_observation_rx;
+        while let Some(observations) = rx.recv().await {
+            for observation in observations {
+                let call = crate::logic::capability::service::CapabilityCall {
+                    capability_id: "usage_method.observe".to_string(),
+                    capability_name: "Observe Usage Method".to_string(),
+                    arguments: serde_json::json!({
+                        "capability_id": observation.capability_id,
+                        "observation": observation.observation,
+                        "suggestion": observation.suggestion,
+                    }),
+                };
+                match crate::logic::capability::service::CapabilityService::new(
+                    &usage_registry,
+                    &usage_executor,
+                )
+                .and_then(|service| service.execute_for_agent("insight-platform", &call))
+                {
+                    Ok(_) => tracing::debug!("usage_method.observe: observation persisted"),
+                    Err(e) => tracing::warn!("usage_method.observe failed: {e}"),
                 }
             }
         }
-        tracing::info!("tool_memory consumer: rx closed, shutting down");
+        tracing::info!("usage observation consumer: rx closed, shutting down");
     });
     let pool_insight = std::sync::Arc::clone(&pool);
     let insight_model = default_model.clone();
@@ -465,7 +523,7 @@ pub async fn run_normal(
             insight_provider,
             insight_model,
             insight_api_key,
-            tool_memory_tx,
+            usage_observation_tx,
             insight_prompts_dir,
         )
         .await;
@@ -1381,18 +1439,30 @@ fn build_echo_summary(
     let mut parts: Vec<String> = Vec::new();
     parts.push(format!("既定目标: {}", ctx.thinking.goal));
     if let Some(exec) = &ctx.execution {
-        let node_lines: Vec<String> = exec
-            .node_results
+        let failed = exec
+            .lifecycle_actions
             .iter()
-            .map(|n| match &n.error {
-                Some(err) => format!("{}: 失败[{}]", n.node_id, err),
-                None => format!("{}: {}", n.node_id, n.summary),
+            .filter(|record| {
+                matches!(
+                    record.lifecycle_state,
+                    crate::agent::communication::CapabilityLifecycleState::Failed
+                        | crate::agent::communication::CapabilityLifecycleState::Rejected
+                )
+            })
+            .count();
+        let action_lines: Vec<String> = exec
+            .lifecycle_actions
+            .iter()
+            .map(|record| match &record.error {
+                Some(err) => format!("{}: 失败[{}]", record.capability_id, err),
+                None => format!("{}: {:?}", record.capability_id, record.lifecycle_state),
             })
             .collect();
         parts.push(format!(
-            "执行结果: {:?}, 节点明细 [{}]",
-            exec.status,
-            node_lines.join("; ")
+            "执行结果: 完成 {} 项 / 失败 {} 项, 动作明细 [{}]",
+            exec.lifecycle_actions.len().saturating_sub(failed),
+            failed,
+            action_lines.join("; ")
         ));
     }
     if let Some(ins) = &ctx.insight {
@@ -2154,23 +2224,24 @@ mod prompt_install_tests {
 mod echo_summary_tests {
     use super::*;
     use crate::agent::communication::{
-        AttentionFragment, ExecutionOutput, ExecutionStatus, ExperienceFragment, InsightOutput,
-        MemoryOutput, NodeResult, NodeStatus, ThinkDecision, ThinkingOutput, TurnContext,
-        TurnStatus,
+        AttentionFragment, CapabilityLifecycleRecord, CapabilityLifecycleState, ExecutionOutput,
+        ExperienceFragment, InsightOutput, MemoryOutput, ThinkDecision, ThinkingOutput,
+        TurnContext, TurnStatus,
     };
 
-    fn node_result(id: &str, summary: &str, error: Option<&str>) -> NodeResult {
-        NodeResult {
-            node_id: id.into(),
-            status: if error.is_some() {
-                NodeStatus::Failed
-            } else {
-                NodeStatus::Completed
-            },
-            summary: summary.into(),
+    fn action(
+        capability_id: &str,
+        state: CapabilityLifecycleState,
+        error: Option<&str>,
+    ) -> CapabilityLifecycleRecord {
+        CapabilityLifecycleRecord {
+            capability_id: capability_id.into(),
+            capability_name: String::new(),
+            arguments_summary: "{}".into(),
+            lifecycle_state: state,
+            invocation_ref: None,
             error: error.map(str::to_string),
-            tool_call_count: 1,
-            tool_call_logs: vec![],
+            capability_call_logs: vec![],
         }
     }
 
@@ -2191,7 +2262,7 @@ mod echo_summary_tests {
                 insight: crate::agent::communication::InsightResult {
                     insight: String::new(),
                 },
-                tool_memory: vec![],
+                usage_observations: vec![],
             }),
             memory,
             status: TurnStatus::Memorizing,
@@ -2202,19 +2273,20 @@ mod echo_summary_tests {
     }
 
     #[test]
-    fn echo_summary_includes_node_summaries_and_attention_content() {
+    fn echo_summary_includes_lifecycle_actions_and_attention_content() {
         let ctx = turn_context(
             Some(ExecutionOutput {
-                dag: crate::agent::communication::ExecutionDag::Single {
-                    template_kind: "normal".into(),
-                    capability_ids: vec!["shell.exec".into()],
-                    task_context: String::new(),
-                },
-                node_results: vec![
-                    node_result("n1", "ERROR 计数: a=3, b=2, c=2", None),
-                    node_result("n2", "counted all", Some("文件缺失")),
+                task_design: "d".into(),
+                task_status: "s".into(),
+                lifecycle_actions: vec![
+                    action("subagent.create", CapabilityLifecycleState::Completed, None),
+                    action(
+                        "subagent.run",
+                        CapabilityLifecycleState::Rejected,
+                        Some("文件缺失"),
+                    ),
                 ],
-                status: ExecutionStatus::PartialFailure,
+                subagent_states: vec![],
             }),
             Some(MemoryOutput {
                 attention: vec![AttentionFragment {
@@ -2232,11 +2304,11 @@ mod echo_summary_tests {
             }),
         );
         let summary = build_echo_summary(&ctx, "t1", "echo");
+        assert!(summary.contains("subagent.create"), "{summary}");
         assert!(
-            summary.contains("n1: ERROR 计数: a=3, b=2, c=2"),
+            summary.contains("subagent.run: 失败[文件缺失]"),
             "{summary}"
         );
-        assert!(summary.contains("n2: 失败[文件缺失]"), "{summary}");
         assert!(
             summary.contains("logs/a.log 中 ERROR 出现 3 次"),
             "{summary}"
@@ -2255,7 +2327,7 @@ mod echo_summary_tests {
             summary.contains("记忆中台已整理上一轮 (thought_id=t1)"),
             "{summary}"
         );
-        assert!(!summary.contains("节点明细"), "{summary}");
+        assert!(!summary.contains("动作明细"), "{summary}");
     }
 
     #[test]
@@ -2277,13 +2349,14 @@ mod echo_summary_tests {
     fn echo_summary_truncates_overlong_total() {
         let ctx = turn_context(
             Some(ExecutionOutput {
-                dag: crate::agent::communication::ExecutionDag::Single {
-                    template_kind: "normal".into(),
-                    capability_ids: vec!["shell.exec".into()],
-                    task_context: String::new(),
-                },
-                node_results: vec![node_result("n1", &"x".repeat(5000), None)],
-                status: ExecutionStatus::Success,
+                task_design: "d".into(),
+                task_status: "s".into(),
+                lifecycle_actions: vec![action(
+                    &"x".repeat(5000),
+                    CapabilityLifecycleState::Completed,
+                    None,
+                )],
+                subagent_states: vec![],
             }),
             None,
         );
@@ -2309,12 +2382,11 @@ mod echo_summary_tests {
 
     #[test]
     fn keep_budget_token_exhausts_after_instances() {
-        // 每实例估值 8K, 预算 24K → 第 3 次 record 后耗尽
         let mut t = KeepBudgetTracker::new(24_000, 300);
-        t.record_instance(); // 8K
-        t.record_instance(); // 16K
+        t.record_instance();
+        t.record_instance();
         assert!(!t.token_exceeded());
-        t.record_instance(); // 24K ≥ 24K
+        t.record_instance();
         assert!(t.token_exceeded());
         assert!(t.exceeded());
     }

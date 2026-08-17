@@ -1299,6 +1299,19 @@ fn prewrite_invocation(
     Ok(invocation_id)
 }
 
+/// TB runtime 收口时闭合 subagent.run 的 invocation 终态。
+///
+/// 该路径由 TC 的 finish 回调调用；成功后写 `<invocation_id>.result.json`，
+/// 保持首文件不可变。失败只告警，不改变 runtime 已经写好的 last_output/memory。
+pub fn close_subagent_invocation(
+    storage_root: &Path,
+    invocation_id: &str,
+    final_state: &str,
+    error: Option<&str>,
+) -> Result<()> {
+    append_invocation_result(storage_root, invocation_id, final_state, error)
+}
+
 /// 执行后追加 invocation 终态（<id>.result.json），保持首文件不可变。
 fn append_invocation_result(
     storage_root: &Path,

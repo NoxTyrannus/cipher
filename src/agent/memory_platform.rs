@@ -2,7 +2,9 @@ use crate::data::duckdb::Registry;
 use crate::data::triviumdb::TriviumDb;
 use crate::data::ModelRow;
 use crate::logic::capability::executor::CapabilityExecutor;
-use crate::logic::model::prompts::read_platform_prompt;
+use crate::logic::model::prompts::{
+    compose_agent_capability_prompt, read_platform_prompt, CapabilityPromptEntry,
+};
 use crate::logic::model::provider::LlmProvider;
 use secrecy::SecretString;
 use std::path::{Path, PathBuf};
@@ -11,8 +13,8 @@ use tokio::sync::mpsc;
 
 use super::agent_pool::AgentPool;
 use super::communication::{
-    AgentMessage, AttentionFragment, AttentionRetireBatch, ExecutionOutput, ExperienceFragment,
-    InsightOutput, MemoryOutput, NodeStatus,
+    AgentMessage, AttentionFragment, AttentionRetireBatch, CapabilityLifecycleState,
+    ExecutionOutput, ExperienceFragment, InsightOutput, MemoryOutput,
 };
 use super::memory::capability_agent::{run_capability_loop, CapabilityLoopRequest};
 
@@ -199,10 +201,8 @@ impl MemoryPlatform {
             return;
         };
 
-        let tool_catalog = memory_tool_catalog(registry, executor, "attention-agent");
-        let system_prompt = format!(
-            "{attention_prompt}\n\n## 可用能力（服务层能力调用）\n{tool_catalog}\n\n## 输出协议\n             你通过工具调用完成记忆处理。每轮只输出一个 JSON：\n             - 调用能力: {{\"tool_call\":{{\"name\":\"<能力id>\",\"arguments\":{{...}}}}}}\n             - 全部处理完成: {{\"done\":true,\"summary\":\"<本轮处理摘要>\"}}\n\n             规则:\n- 先 memory.list 或 memory.retrieve 查看现有注意力，再决定 write/retire/delete\n             - memory.attention.write 的 source_refs 使用本轮的 thought_id 证据引用\n             - 完成所有记忆操作后必须输出 done\n- 只输出 JSON，不输出解释"
-        );
+        let available = memory_capability_entries(registry, executor, "attention-agent");
+        let system_prompt = compose_agent_capability_prompt(&attention_prompt, &available);
 
         let outcome = run_capability_loop(
             &self.provider,
@@ -321,27 +321,25 @@ impl MemoryPlatform {
     }
 }
 
-fn memory_tool_catalog(
+fn memory_capability_entries(
     registry: &Registry,
     executor: &Arc<CapabilityExecutor>,
     actor_id: &str,
-) -> String {
+) -> Vec<CapabilityPromptEntry> {
     let Ok(service) = crate::logic::capability::service::CapabilityService::new(registry, executor)
     else {
-        return "No capability catalog available.".to_string();
+        return Vec::new();
     };
     let Ok(defs) = service.definitions_for_agent(actor_id) else {
-        return "No capability catalog available.".to_string();
+        return Vec::new();
     };
-    defs.iter()
-        .map(|d| {
-            format!(
-                "- id: {}\n  name: {}\n  description: {}\n  schema_in: {}",
-                d.capability_id, d.capability_name, d.description, d.input_schema
-            )
+    defs.into_iter()
+        .map(|d| CapabilityPromptEntry {
+            capability_id: d.capability_id,
+            capability_name: d.capability_name,
+            description: d.description,
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect()
 }
 
 fn attention_output_from_trace(
@@ -604,15 +602,19 @@ fn fallback_memory(execution: Option<&ExecutionOutput>) -> MemoryOutput {
     let mut experience = Vec::new();
 
     if let Some(exec) = execution {
-        for nr in &exec.node_results {
-            if nr.status == NodeStatus::Failed {
-                let title = format!("Node {} failed", nr.node_id);
-                let error_reason = nr.error.as_deref().unwrap_or("unknown error");
+        for record in &exec.lifecycle_actions {
+            if matches!(
+                record.lifecycle_state,
+                CapabilityLifecycleState::Failed | CapabilityLifecycleState::Rejected
+            ) {
+                let title = format!("Lifecycle action {} failed", record.capability_id);
+                let error_reason = record.error.as_deref().unwrap_or("unknown error");
                 let summary = format!(
-                    "Execution node '{}' failed with error: {}. Tool calls: {}. This failure should be analyzed for root cause and the system should learn to handle similar situations.",
-                    nr.node_id,
+                    "Lifecycle action '{}' ended {:?} with error: {}. Capability calls: {}. This failure should be analyzed for root cause and the system should learn to handle similar situations.",
+                    record.capability_id,
+                    record.lifecycle_state,
                     error_reason,
-                    nr.tool_call_count
+                    record.capability_call_logs.len()
                 );
                 experience.push(ExperienceFragment {
                     title,
@@ -687,18 +689,18 @@ fn build_attention_prompt(
 
     let execution_summary = match execution {
         Some(exec) => {
-            let mut lines = vec![format!("Overall Status: {:?}", exec.status)];
-            for nr in &exec.node_results {
-                let status_str = match nr.status {
-                    NodeStatus::Completed => "Completed",
-                    NodeStatus::Failed => "Failed",
-                    NodeStatus::Skipped => "Skipped",
-                };
+            let mut lines = vec![
+                format!("task_design: {}", exec.task_design),
+                format!("task_status: {}", exec.task_status),
+            ];
+            for record in &exec.lifecycle_actions {
                 lines.push(format!(
-                    "  - node_id={} {} (tool_calls={})",
-                    nr.node_id, status_str, nr.tool_call_count
+                    "  - capability_id={} lifecycle={:?} (calls={})",
+                    record.capability_id,
+                    record.lifecycle_state,
+                    record.capability_call_logs.len()
                 ));
-                if let Some(ref err) = nr.error {
+                if let Some(ref err) = record.error {
                     lines.push(format!("    error: {}", err));
                 }
             }
@@ -758,8 +760,8 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::super::communication::{
-        ExecutionDag, ExecutionOutput, ExecutionStatus, InsightOutput, InsightResult, NodeResult,
-        NodeStatus,
+        CapabilityLifecycleRecord, CapabilityLifecycleState, ExecutionOutput, InsightOutput,
+        InsightResult,
     };
     use super::*;
 
@@ -769,37 +771,36 @@ mod tests {
             insight: InsightResult {
                 insight: "all within bounds".into(),
             },
-            tool_memory: vec![],
+            usage_observations: vec![],
         }
     }
 
     #[test]
     fn fallback_memory_extracts_failure_experience() {
         let execution = ExecutionOutput {
-            dag: ExecutionDag::Single {
-                template_kind: "normal".into(),
-                capability_ids: vec![],
-                task_context: "test".into(),
-            },
-            node_results: vec![
-                NodeResult {
-                    node_id: "n1".into(),
-                    status: NodeStatus::Completed,
-                    summary: "done".into(),
+            task_design: "test".into(),
+            task_status: "waiting".into(),
+            lifecycle_actions: vec![
+                CapabilityLifecycleRecord {
+                    capability_id: "subagent.create".into(),
+                    capability_name: "Create Subagent".into(),
+                    arguments_summary: "{}".into(),
+                    lifecycle_state: CapabilityLifecycleState::Completed,
+                    invocation_ref: None,
                     error: None,
-                    tool_call_count: 1,
-                    tool_call_logs: vec![],
+                    capability_call_logs: vec![],
                 },
-                NodeResult {
-                    node_id: "n2".into(),
-                    status: NodeStatus::Failed,
-                    summary: "".into(),
+                CapabilityLifecycleRecord {
+                    capability_id: "subagent.run".into(),
+                    capability_name: "Run Subagent".into(),
+                    arguments_summary: "{}".into(),
+                    lifecycle_state: CapabilityLifecycleState::Failed,
+                    invocation_ref: None,
                     error: Some("timeout".into()),
-                    tool_call_count: 3,
-                    tool_call_logs: vec!["retry 1 failed".into(), "retry 2 failed".into()],
+                    capability_call_logs: vec!["retry 1 failed".into(), "retry 2 failed".into()],
                 },
             ],
-            status: ExecutionStatus::PartialFailure,
+            subagent_states: vec![],
         };
 
         let result = fallback_memory(Some(&execution));
@@ -808,7 +809,7 @@ mod tests {
             1,
             "should have 1 failure experience"
         );
-        assert!(result.experience[0].title.contains("n2"));
+        assert!(result.experience[0].title.contains("subagent.run"));
         assert!(result.experience[0].summary.contains("timeout"));
     }
 
@@ -822,20 +823,18 @@ mod tests {
     #[test]
     fn fallback_memory_all_success_no_experience() {
         let execution = ExecutionOutput {
-            dag: ExecutionDag::Single {
-                template_kind: "normal".into(),
-                capability_ids: vec![],
-                task_context: "test".into(),
-            },
-            node_results: vec![NodeResult {
-                node_id: "n1".into(),
-                status: NodeStatus::Completed,
-                summary: "done".into(),
+            task_design: "test".into(),
+            task_status: "done".into(),
+            lifecycle_actions: vec![CapabilityLifecycleRecord {
+                capability_id: "subagent.create".into(),
+                capability_name: "Create Subagent".into(),
+                arguments_summary: "{}".into(),
+                lifecycle_state: CapabilityLifecycleState::Completed,
+                invocation_ref: None,
                 error: None,
-                tool_call_count: 1,
-                tool_call_logs: vec![],
+                capability_call_logs: vec![],
             }],
-            status: ExecutionStatus::Success,
+            subagent_states: vec![],
         };
 
         let result = fallback_memory(Some(&execution));
