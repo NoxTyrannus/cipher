@@ -10,5 +10,6 @@ pub mod memory;
 pub mod memory_platform;
 pub mod output;
 pub mod subagent;
+pub mod subagent_capability;
 pub mod thinking;
 pub mod thought;
