@@ -178,7 +178,7 @@ pub struct AssembledContext {
     pub history: Vec<String>,
     pub long_term_memory: Vec<String>,
     pub rag_results: Vec<String>,
-    pub tool_state: Vec<String>,
+    pub capability_state: Vec<String>,
     pub scratchpad: Vec<String>,
 }
 

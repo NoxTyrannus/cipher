@@ -8,29 +8,10 @@ pub enum TokenCountingStrategy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderToolConstraints {
-    pub max_tools_per_request: usize,
-    pub max_tool_name_length: usize,
-    pub requires_tool_choice_param: bool,
-}
-
-impl Default for ProviderToolConstraints {
-    fn default() -> Self {
-        Self {
-            max_tools_per_request: 128,
-            max_tool_name_length: 64,
-            requires_tool_choice_param: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelCapability {
     pub context_window: usize,
     pub max_output_tokens: usize,
     pub token_counting_strategy: TokenCountingStrategy,
-    pub supports_native_tools: bool,
-    pub provider_tool_constraints: ProviderToolConstraints,
     #[serde(default)]
     pub temperature: Option<f32>,
 
@@ -42,55 +23,53 @@ fn builtin_model_capability(model_id: &str) -> Option<ModelCapability> {
     let id = model_id.to_lowercase();
     let entry = match id.as_str() {
         "gpt-4o" | "gpt-4o-2024-08-06" | "gpt-4o-2024-05-13" => {
-            Some((128000, 16384, TokenCountingStrategy::Tiktoken, true))
+            Some((128000, 16384, TokenCountingStrategy::Tiktoken))
         }
         "gpt-4o-mini" | "gpt-4o-mini-2024-07-18" => {
-            Some((128000, 16384, TokenCountingStrategy::Tiktoken, true))
+            Some((128000, 16384, TokenCountingStrategy::Tiktoken))
         }
         "gpt-4-turbo" | "gpt-4-turbo-2024-04-09" => {
-            Some((128000, 4096, TokenCountingStrategy::Tiktoken, true))
+            Some((128000, 4096, TokenCountingStrategy::Tiktoken))
         }
-        "gpt-4" | "gpt-4-0613" => Some((8192, 4096, TokenCountingStrategy::Tiktoken, true)),
+        "gpt-4" | "gpt-4-0613" => Some((8192, 4096, TokenCountingStrategy::Tiktoken)),
         "gpt-3.5-turbo" | "gpt-3.5-turbo-0125" => {
-            Some((16385, 4096, TokenCountingStrategy::Tiktoken, true))
+            Some((16385, 4096, TokenCountingStrategy::Tiktoken))
         }
 
         "claude-3-5-sonnet-20241022" | "claude-3-5-sonnet" | "claude-sonnet-4-6" => {
-            Some((200000, 8192, TokenCountingStrategy::Conservative, true))
+            Some((200000, 8192, TokenCountingStrategy::Conservative))
         }
         "claude-3-opus-20240229" | "claude-3-opus" => {
-            Some((200000, 4096, TokenCountingStrategy::Conservative, true))
+            Some((200000, 4096, TokenCountingStrategy::Conservative))
         }
         "claude-3-haiku-20240307" | "claude-3-haiku" => {
-            Some((200000, 4096, TokenCountingStrategy::Conservative, true))
+            Some((200000, 4096, TokenCountingStrategy::Conservative))
         }
 
         id if id.contains("doubao-pro") || id.contains("doubao-pro") => {
-            Some((200000, 8192, TokenCountingStrategy::Conservative, true))
+            Some((200000, 8192, TokenCountingStrategy::Conservative))
         }
         id if id.contains("doubao-lite") => {
-            Some((200000, 8192, TokenCountingStrategy::Conservative, true))
+            Some((200000, 8192, TokenCountingStrategy::Conservative))
         }
         id if id.contains("doubao-mini") => {
-            Some((32000, 4096, TokenCountingStrategy::Conservative, false))
+            Some((32000, 4096, TokenCountingStrategy::Conservative))
         }
 
-        id if id.contains("deepseek") => {
-            Some((128000, 8192, TokenCountingStrategy::Conservative, true))
-        }
+        id if id.contains("deepseek") => Some((128000, 8192, TokenCountingStrategy::Conservative)),
 
-        id if id.contains("glm") => Some((128000, 8192, TokenCountingStrategy::Conservative, true)),
+        id if id.contains("glm") => Some((128000, 8192, TokenCountingStrategy::Conservative)),
 
         id if id.contains("minimax") => {
-            Some((1_000_000, 8192, TokenCountingStrategy::Conservative, true))
+            Some((1_000_000, 8192, TokenCountingStrategy::Conservative))
         }
 
         id if id.contains("kimi") || id.contains("moonshot") => {
-            Some((200000, 8192, TokenCountingStrategy::Conservative, true))
+            Some((200000, 8192, TokenCountingStrategy::Conservative))
         }
         _ => None,
     };
-    entry.map(|(ctx, out, strat, tools)| {
+    entry.map(|(ctx, out, strat)| {
         let temperature = if id.contains("kimi") || id.contains("moonshot") || id.contains("k3") {
             Some(1.0_f32)
         } else if id.contains("sensenova") || id.contains("sense") {
@@ -110,8 +89,6 @@ fn builtin_model_capability(model_id: &str) -> Option<ModelCapability> {
             context_window: ctx,
             max_output_tokens: out,
             token_counting_strategy: strat,
-            supports_native_tools: tools,
-            provider_tool_constraints: ProviderToolConstraints::default(),
             temperature,
             top_p,
         }
@@ -124,8 +101,6 @@ fn provider_default_capability(api_type: &str) -> Option<ModelCapability> {
             context_window: 128000,
             max_output_tokens: 4096,
             token_counting_strategy: TokenCountingStrategy::Tiktoken,
-            supports_native_tools: true,
-            provider_tool_constraints: ProviderToolConstraints::default(),
             temperature: None,
             top_p: None,
         }),
@@ -133,8 +108,6 @@ fn provider_default_capability(api_type: &str) -> Option<ModelCapability> {
             context_window: 200000,
             max_output_tokens: 4096,
             token_counting_strategy: TokenCountingStrategy::Conservative,
-            supports_native_tools: true,
-            provider_tool_constraints: ProviderToolConstraints::default(),
             temperature: None,
             top_p: None,
         }),
@@ -177,11 +150,6 @@ pub fn resolve_model_capability(row: &ModelRow) -> ModelCapability {
                 context_window: context_window.unwrap_or(128000),
                 max_output_tokens: max_output_tokens.unwrap_or(4096),
                 token_counting_strategy: tiktoken_support,
-                supports_native_tools: config
-                    .get("supports_tool_calls")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true),
-                provider_tool_constraints: ProviderToolConstraints::default(),
                 temperature: config_temperature,
                 top_p: config_top_p,
             };
@@ -209,8 +177,6 @@ pub fn resolve_model_capability(row: &ModelRow) -> ModelCapability {
         context_window: 4096,
         max_output_tokens: 512,
         token_counting_strategy: TokenCountingStrategy::Conservative,
-        supports_native_tools: false,
-        provider_tool_constraints: ProviderToolConstraints::default(),
         temperature: config_temperature,
         top_p: None,
     }
@@ -239,7 +205,6 @@ mod tests {
         let cap = resolve_model_capability(&make_row("gpt-4o", "openai", None));
         assert_eq!(cap.context_window, 128000);
         assert_eq!(cap.token_counting_strategy, TokenCountingStrategy::Tiktoken);
-        assert!(cap.supports_native_tools);
     }
 
     #[test]
@@ -269,7 +234,6 @@ mod tests {
             cap.token_counting_strategy,
             TokenCountingStrategy::Conservative
         );
-        assert!(!cap.supports_native_tools);
     }
 
     #[test]
@@ -285,7 +249,6 @@ mod tests {
         let cap = resolve_model_capability(&make_row("doubao-mini-1.5", "openai", None));
         assert_eq!(cap.context_window, 32000);
         assert_eq!(cap.max_output_tokens, 4096);
-        assert!(!cap.supports_native_tools);
     }
 
     #[test]
@@ -294,8 +257,6 @@ mod tests {
             context_window: 128000,
             max_output_tokens: 4096,
             token_counting_strategy: TokenCountingStrategy::Tiktoken,
-            supports_native_tools: true,
-            provider_tool_constraints: ProviderToolConstraints::default(),
             top_p: None,
             temperature: Some(0.7),
         };
@@ -306,11 +267,6 @@ mod tests {
         assert_eq!(
             deserialized.token_counting_strategy,
             TokenCountingStrategy::Tiktoken
-        );
-        assert!(deserialized.supports_native_tools);
-        assert_eq!(
-            deserialized.provider_tool_constraints.max_tools_per_request,
-            128
         );
     }
 
@@ -324,7 +280,6 @@ mod tests {
             cap.token_counting_strategy,
             TokenCountingStrategy::Conservative
         );
-        assert!(cap.supports_native_tools);
     }
 
     #[test]

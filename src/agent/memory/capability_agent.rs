@@ -121,7 +121,7 @@ pub async fn run_capability_loop(
                         match resolve_capability_identity(registry, &invocation) {
                             Ok(v) => v,
                             Err(e) => {
-                                logs.push(format!("INVALID tool (turn {turn}): {e}"));
+                                logs.push(format!("INVALID capability (turn {turn}): {e}"));
                                 messages.push(ChatMessage::User {
                                     text: format!(
                                     "能力调用被拒绝: {e}\n请使用可用能力并重试，或输出 done 结束。"
@@ -157,7 +157,6 @@ pub async fn run_capability_loop(
                                     }
                                 })
                                 .to_string(),
-                                tool_calls: vec![],
                             });
                             messages.push(ChatMessage::User {
                                 text: format!("能力 {capability_id} 执行结果: {truncated}"),
@@ -206,7 +205,7 @@ pub async fn run_capability_loop(
 
 /// 按 capability_id 解析注册表中的权威 (id, name)。
 ///
-/// 不做 provider 原生 tool_call 别名解析（该适配路径已随旧执行链路删除）；
+/// 不使用 provider 原生函数调用；
 /// 调用方提交的 capability_name 若存在，交由服务层校验一致性。
 fn resolve_capability_identity(
     registry: &Registry,

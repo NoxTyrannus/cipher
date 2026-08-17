@@ -496,16 +496,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_conversation_file_with_tool_calls() {
+    fn parse_conversation_file_with_capability_calls_marker() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("20260712_120001.md");
-        let content = "---\nrole: \"assistant\"\nmodel_id: \"test-model\"\ncreated_at: \"1234567890\"\nusage:\n  prompt_tokens: 10\n  completion_tokens: 20\n---\n\nLet me read that file\n\n<!-- tool_calls -->\n```json\n{\"id\": \"call_1\"}\n```\n";
+        let content = "---\nrole: \"assistant\"\nmodel_id: \"test-model\"\ncreated_at: \"1234567890\"\nusage:\n  prompt_tokens: 10\n  completion_tokens: 20\n---\n\nLet me read that file\n\n<!-- capability_calls -->\n```json\n{\"capability_id\": \"file.read\"}\n```\n";
         std::fs::write(&path, content).unwrap();
 
         let msg = parse_conversation_file(&path).unwrap();
         assert_eq!(msg.role, "assistant");
         assert!(msg.content.contains("Let me read that file"));
-        assert!(msg.content.contains("<!-- tool_calls -->"));
+        assert!(msg.content.contains("<!-- capability_calls -->"));
     }
 
     #[test]

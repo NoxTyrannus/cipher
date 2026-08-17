@@ -1,13 +1,12 @@
 use super::error::map_reqwest_error;
 use super::message::{normalize_with_system, ChatMessage};
-use super::provider::{LlmProvider, LlmRequest, LlmResponse, ToolCall, ToolCallFormat, Usage};
+use super::provider::{LlmProvider, LlmRequest, LlmResponse, Usage};
 use super::stream::{find_double_newline, StreamChunk};
 use crate::common::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::time::Duration;
 
 pub struct OpenAiProvider {
@@ -41,8 +40,6 @@ pub struct OpenAiRequest<'a> {
     pub top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub tools: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<serde_json::Value>,
     pub stream: bool,
@@ -52,28 +49,6 @@ pub struct OpenAiRequest<'a> {
 pub struct OpenAiMessage {
     pub role: String,
     pub content: String,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub tool_call_id: Option<String>,
-
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[serde(default)]
-    pub tool_calls: Vec<OpenAiToolCallOut>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct OpenAiToolCallOut {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub function: OpenAiFunctionOut,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct OpenAiFunctionOut {
-    pub name: String,
-    pub arguments: String,
 }
 
 fn build_openai_request(req: &LlmRequest, stream: bool) -> OpenAiRequest<'_> {
@@ -83,8 +58,6 @@ fn build_openai_request(req: &LlmRequest, stream: bool) -> OpenAiRequest<'_> {
         messages.push(OpenAiMessage {
             role: "system".to_string(),
             content: normalized.system,
-            tool_call_id: None,
-            tool_calls: vec![],
         });
     }
     for msg in &normalized.messages {
@@ -92,33 +65,10 @@ fn build_openai_request(req: &LlmRequest, stream: bool) -> OpenAiRequest<'_> {
             ChatMessage::User { text } => messages.push(OpenAiMessage {
                 role: "user".to_string(),
                 content: text.clone(),
-                tool_call_id: None,
-                tool_calls: vec![],
             }),
-            ChatMessage::Assistant { text, tool_calls } => {
-                let tool_calls: Vec<OpenAiToolCallOut> = tool_calls
-                    .iter()
-                    .map(|tc| OpenAiToolCallOut {
-                        id: tc.id.clone(),
-                        kind: "function".to_string(),
-                        function: OpenAiFunctionOut {
-                            name: tc.name.clone(),
-                            arguments: serde_json::to_string(&tc.arguments).unwrap_or_default(),
-                        },
-                    })
-                    .collect();
-                messages.push(OpenAiMessage {
-                    role: "assistant".to_string(),
-                    content: text.clone(),
-                    tool_call_id: None,
-                    tool_calls,
-                });
-            }
-            ChatMessage::ToolResult { id, text, .. } => messages.push(OpenAiMessage {
-                role: "tool".to_string(),
+            ChatMessage::Assistant { text } => messages.push(OpenAiMessage {
+                role: "assistant".to_string(),
                 content: text.clone(),
-                tool_call_id: Some(id.clone()),
-                tool_calls: vec![],
             }),
             ChatMessage::System { .. } => unreachable!("normalize 已抽取全部 System"),
         }
@@ -129,7 +79,6 @@ fn build_openai_request(req: &LlmRequest, stream: bool) -> OpenAiRequest<'_> {
         temperature: req.temperature,
         top_p: req.top_p,
         max_tokens: req.max_tokens,
-        tools: req.tools.clone(),
         response_format: req.response_format.clone(),
         stream,
     }
@@ -150,23 +99,6 @@ pub struct OpenAiChoice {
 pub struct OpenAiMessageOut {
     #[serde(default)]
     pub content: Option<String>,
-    #[serde(default)]
-    pub tool_calls: Option<Vec<OpenAiToolCallRaw>>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct OpenAiToolCallRaw {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub function: OpenAiFunctionCall,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct OpenAiFunctionCall {
-    pub name: String,
-
-    pub arguments: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,12 +106,6 @@ pub struct OpenAiUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
-}
-
-struct OpenAiToolCallBuilder {
-    id: String,
-    name: String,
-    arguments: String,
 }
 
 #[async_trait]
@@ -191,27 +117,8 @@ impl LlmProvider for OpenAiProvider {
         "OpenAI"
     }
 
-    fn tool_call_format(&self) -> ToolCallFormat {
-        ToolCallFormat::OpenAI
-    }
-
     async fn call(&self, req: &LlmRequest) -> Result<LlmResponse> {
-        if req.api_url.is_empty() {
-            return Err(crate::common::AgentError::Llm(
-                "openai: req.api_url is empty (model.api_url required)".to_string(),
-            ));
-        }
-        let base_url = req.api_url.clone();
-        let api_key_str = req
-            .api_key
-            .as_ref()
-            .map(|s| s.expose_secret().to_string())
-            .ok_or_else(|| {
-                crate::common::AgentError::Llm(
-                    "openai: req.api_key is None (model.api_key required)".to_string(),
-                )
-            })?;
-        let url = format!("{}/chat/completions", base_url);
+        let (url, api_key_str) = prepare_url_and_key(req, "openai")?;
         let body = build_openai_request(req, false);
 
         let result = self
@@ -239,12 +146,7 @@ impl LlmProvider for OpenAiProvider {
         };
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            let body_bytes = resp.bytes().await.unwrap_or_default();
-            let body = String::from_utf8_lossy(&body_bytes);
-            return Err(crate::common::AgentError::Llm(format!(
-                "openai HTTP {status}: {body}"
-            )));
+            return http_error(resp, "openai").await;
         }
 
         let parsed: OpenAiResponse = resp
@@ -258,35 +160,8 @@ impl LlmProvider for OpenAiProvider {
             .and_then(|c| c.message.content.clone())
             .unwrap_or_default();
 
-        let tool_calls: Vec<ToolCall> = parsed
-            .choices
-            .first()
-            .and_then(|c| c.message.tool_calls.as_ref())
-            .map(|tcs| {
-                tcs.iter()
-                    .filter_map(|raw| {
-                        match serde_json::from_str(&raw.function.arguments) {
-                            Ok(args) => Some(ToolCall {
-                                id: raw.id.clone(),
-                                name: raw.function.name.clone(),
-                                arguments: args,
-                            }),
-                            Err(e) => {
-                                tracing::warn!(
-                                    "openai: skipping tool_call {} (id={}): invalid arguments JSON: {e}",
-                                    raw.function.name, raw.id
-                                );
-                                None
-                            }
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
         Ok(LlmResponse {
             content,
-            tool_calls,
             usage: parsed.usage.map(|u| Usage {
                 prompt_tokens: u.prompt_tokens,
                 completion_tokens: u.completion_tokens,
@@ -300,22 +175,7 @@ impl LlmProvider for OpenAiProvider {
         req: &LlmRequest,
         on_chunk: &mut (dyn FnMut(StreamChunk) + Send),
     ) -> Result<LlmResponse> {
-        if req.api_url.is_empty() {
-            return Err(crate::common::AgentError::Llm(
-                "openai: req.api_url is empty (model.api_url required)".to_string(),
-            ));
-        }
-        let base_url = req.api_url.clone();
-        let api_key_str = req
-            .api_key
-            .as_ref()
-            .map(|s| s.expose_secret().to_string())
-            .ok_or_else(|| {
-                crate::common::AgentError::Llm(
-                    "openai: req.api_key is None (model.api_key required)".to_string(),
-                )
-            })?;
-        let url = format!("{}/chat/completions", base_url);
+        let (url, api_key_str) = prepare_url_and_key(req, "openai")?;
         let body = build_openai_request(req, true);
 
         let result = self
@@ -345,24 +205,15 @@ impl LlmProvider for OpenAiProvider {
         };
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            let body_bytes = resp.bytes().await.unwrap_or_default();
-            let body = String::from_utf8_lossy(&body_bytes);
-            return Err(crate::common::AgentError::Llm(format!(
-                "openai HTTP {status}: {body}"
-            )));
+            return http_error(resp, "openai").await;
         }
 
         let mut stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
         let mut accumulated = String::new();
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut tool_call_builders: HashMap<usize, OpenAiToolCallBuilder> = HashMap::new();
-        let mut _first_chunk_received = false;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| map_reqwest_error(e, "openai"))?;
-            _first_chunk_received = true;
             buf.extend_from_slice(&chunk);
             while let Some(pos) = find_double_newline(&buf) {
                 let event_bytes: Vec<u8> = buf.drain(..pos + 2).collect();
@@ -370,9 +221,9 @@ impl LlmProvider for OpenAiProvider {
                 for line in event.lines() {
                     if let Some(data) = line.strip_prefix("data: ") {
                         if data == "[DONE]" {
+                            on_chunk(StreamChunk::Done);
                             return Ok(LlmResponse {
                                 content: accumulated,
-                                tool_calls,
                                 usage: None,
                             });
                         }
@@ -393,40 +244,6 @@ impl LlmProvider for OpenAiProvider {
                                 on_chunk(StreamChunk::Delta(s.to_string()));
                             }
                         }
-                        if let Some(tcs) = parsed
-                            .pointer("/choices/0/delta/tool_calls")
-                            .and_then(|v| v.as_array())
-                        {
-                            for tc in tcs {
-                                let index =
-                                    tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                                let builder =
-                                    tool_call_builders.entry(index).or_insert_with(|| {
-                                        OpenAiToolCallBuilder {
-                                            id: String::new(),
-                                            name: String::new(),
-                                            arguments: String::new(),
-                                        }
-                                    });
-                                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                                    if builder.id.is_empty() {
-                                        builder.id = id.to_string();
-                                    }
-                                }
-                                if let Some(name) =
-                                    tc.pointer("/function/name").and_then(|v| v.as_str())
-                                {
-                                    if builder.name.is_empty() {
-                                        builder.name = name.to_string();
-                                    }
-                                }
-                                if let Some(args) =
-                                    tc.pointer("/function/arguments").and_then(|v| v.as_str())
-                                {
-                                    builder.arguments.push_str(args);
-                                }
-                            }
-                        }
                     }
                 }
             }
@@ -439,35 +256,45 @@ impl LlmProvider for OpenAiProvider {
                     .first()
                     .and_then(|c| c.message.content.clone())
                     .unwrap_or_default();
-            }
-        }
-
-        if tool_calls.is_empty() && !tool_call_builders.is_empty() {
-            for (_, builder) in tool_call_builders.drain() {
-                match serde_json::from_str(&builder.arguments) {
-                    Ok(args) => {
-                        tool_calls.push(ToolCall {
-                            id: builder.id,
-                            name: builder.name,
-                            arguments: args,
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "openai: failed to parse tool_call arguments for {}: {e}",
-                            builder.name
-                        );
-                    }
+                if !accumulated.is_empty() {
+                    on_chunk(StreamChunk::Delta(accumulated.clone()));
                 }
             }
         }
 
+        on_chunk(StreamChunk::Done);
         Ok(LlmResponse {
             content: accumulated,
-            tool_calls,
             usage: None,
         })
     }
+}
+
+fn prepare_url_and_key(req: &LlmRequest, name: &str) -> Result<(String, String)> {
+    if req.api_url.is_empty() {
+        return Err(crate::common::AgentError::Llm(format!(
+            "{name}: req.api_url is empty (model.api_url required)"
+        )));
+    }
+    let key = req
+        .api_key
+        .as_ref()
+        .map(|s| s.expose_secret().to_string())
+        .ok_or_else(|| {
+            crate::common::AgentError::Llm(format!(
+                "{name}: req.api_key is None (model.api_key required)"
+            ))
+        })?;
+    Ok((format!("{}/chat/completions", req.api_url), key))
+}
+
+async fn http_error(resp: reqwest::Response, name: &str) -> Result<LlmResponse> {
+    let status = resp.status();
+    let body_bytes = resp.bytes().await.unwrap_or_default();
+    let body = String::from_utf8_lossy(&body_bytes);
+    Err(crate::common::AgentError::Llm(format!(
+        "{name} HTTP {status}: {body}"
+    )))
 }
 
 #[cfg(test)]
@@ -475,76 +302,10 @@ mod tests {
     use super::*;
     use crate::logic::model::message::{ChatMessage, SystemKind};
 
-    fn tool_result_msg(id: &str, text: &str) -> ChatMessage {
-        ChatMessage::ToolResult {
-            id: id.to_string(),
-            name: "cap_x".to_string(),
-            text: text.to_string(),
-            is_error: false,
-        }
-    }
-
     fn user_msg(text: &str) -> ChatMessage {
         ChatMessage::User {
             text: text.to_string(),
         }
-    }
-
-    #[test]
-    fn tool_result_emits_role_tool_with_tool_call_id() {
-        let req = LlmRequest {
-            model: "m".into(),
-            messages: vec![
-                ChatMessage::Assistant {
-                    text: String::new(),
-                    tool_calls: vec![ToolCall {
-                        id: "call_1".into(),
-                        name: "cap_x".into(),
-                        arguments: serde_json::json!({}),
-                    }],
-                },
-                tool_result_msg("call_1", "plain result"),
-            ],
-            ..Default::default()
-        };
-        let body = serde_json::to_value(build_openai_request(&req, false)).unwrap();
-        let m = &body["messages"][1];
-        assert_eq!(m["role"], "tool");
-        assert_eq!(m["content"], "plain result");
-        assert_eq!(m["tool_call_id"], "call_1");
-    }
-
-    #[test]
-    fn assistant_tool_calls_emit_openai_shape() {
-        let req = LlmRequest {
-            model: "m".into(),
-            messages: vec![
-                ChatMessage::Assistant {
-                    text: "我来读文件".into(),
-                    tool_calls: vec![ToolCall {
-                        id: "call_1".into(),
-                        name: "cap_file_read".into(),
-                        arguments: serde_json::json!({"path": "a.txt"}),
-                    }],
-                },
-                tool_result_msg("call_1", "file body"),
-            ],
-            ..Default::default()
-        };
-        let body = serde_json::to_value(build_openai_request(&req, false)).unwrap();
-        let a = &body["messages"][0];
-        assert_eq!(a["role"], "assistant");
-        assert_eq!(a["content"], "我来读文件");
-        assert_eq!(a["tool_calls"][0]["id"], "call_1");
-        assert_eq!(a["tool_calls"][0]["type"], "function");
-        assert_eq!(a["tool_calls"][0]["function"]["name"], "cap_file_read");
-        assert_eq!(
-            a["tool_calls"][0]["function"]["arguments"],
-            r#"{"path":"a.txt"}"#
-        );
-        let t = &body["messages"][1];
-        assert_eq!(t["role"], "tool");
-        assert_eq!(t["tool_call_id"], "call_1");
     }
 
     #[test]
@@ -580,19 +341,16 @@ mod tests {
     }
 
     #[test]
-    fn openai_request_serializes_minimal() {
+    fn openai_request_serializes_minimal_without_tools() {
         let req = OpenAiRequest {
             model: "gpt-4o",
             messages: vec![OpenAiMessage {
                 role: "user".to_string(),
                 content: "hi".to_string(),
-                tool_call_id: None,
-                tool_calls: vec![],
             }],
             temperature: None,
             top_p: None,
             max_tokens: None,
-            tools: vec![],
             response_format: None,
             stream: false,
         };
@@ -610,40 +368,14 @@ mod tests {
             messages: vec![OpenAiMessage {
                 role: "user".to_string(),
                 content: "hi".to_string(),
-                tool_call_id: None,
-                tool_calls: vec![],
             }],
             temperature: None,
             top_p: None,
             max_tokens: None,
-            tools: vec![],
             response_format: None,
             stream: true,
         };
         let j = serde_json::to_string(&req).unwrap();
-        assert!(
-            j.contains("\"stream\":true"),
-            "streaming request body must contain stream:true, got {j}"
-        );
-    }
-
-    #[test]
-    fn openai_request_carries_provider_tools() {
-        let request = LlmRequest {
-            model: "gpt-4o".to_string(),
-            tools: vec![serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": "cap_echo_1234",
-                    "description": "Echo",
-                    "parameters": {"type": "object"}
-                }
-            })],
-            ..Default::default()
-        };
-
-        let body = serde_json::to_value(build_openai_request(&request, false)).unwrap();
-        assert_eq!(body["tools"], serde_json::Value::Array(request.tools));
-        assert_eq!(body["tools"][0]["function"]["name"], "cap_echo_1234");
+        assert!(j.contains("\"stream\":true"), "got {j}");
     }
 }

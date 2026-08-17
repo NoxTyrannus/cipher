@@ -1,10 +1,4 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolResult {
-    pub tool_call_id: String,
-    pub content: serde_json::Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamChunk {
     Delta(String),
 
@@ -18,14 +12,6 @@ pub enum StreamChunk {
     Cancelled,
 
     Error(String),
-
-    ToolCallStart {
-        iteration: u32,
-    },
-
-    ToolCallResult {
-        results: Vec<ToolResult>,
-    },
 }
 
 pub(crate) fn find_double_newline(buf: &[u8]) -> Option<usize> {

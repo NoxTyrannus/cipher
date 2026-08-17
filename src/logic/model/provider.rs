@@ -20,8 +20,6 @@ pub struct LlmRequest {
 
     pub max_tokens: Option<u32>,
 
-    pub tools: Vec<serde_json::Value>,
-
     pub response_format: Option<serde_json::Value>,
 
     pub stream: bool,
@@ -58,7 +56,6 @@ impl LlmRequest {
             temperature,
             top_p,
             max_tokens,
-            tools: vec![],
             response_format: if model_row.api_type.eq_ignore_ascii_case("openai") {
                 Some(serde_json::json!({"type": "json_object"}))
             } else {
@@ -76,28 +73,10 @@ impl LlmRequest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ToolCall {
-    pub id: String,
-
-    pub name: String,
-
-    pub arguments: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ToolCallFormat {
-    OpenAI,
-
-    Anthropic,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmResponse {
     pub content: String,
 
-    #[serde(default)]
-    pub tool_calls: Vec<ToolCall>,
     #[serde(default)]
     pub usage: Option<Usage>,
 }
@@ -114,10 +93,6 @@ pub trait LlmProvider: Send + Sync {
     fn id(&self) -> &'static str;
 
     fn name(&self) -> &'static str;
-
-    fn tool_call_format(&self) -> ToolCallFormat {
-        ToolCallFormat::OpenAI
-    }
 
     async fn call(&self, _req: &LlmRequest) -> Result<LlmResponse> {
         Err(AgentError::NotImplemented(format!(
@@ -154,77 +129,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stub_provider_returns_not_implemented() {
-        let p = StubProvider;
-        let req = LlmRequest {
-            model: "x".to_string(),
-            messages: vec![ChatMessage::User {
-                text: "hi".to_string(),
-            }],
-            ..Default::default()
-        };
-        let r = p.call(&req).await;
-        assert!(matches!(r, Err(AgentError::NotImplemented(_))));
-    }
-
-    #[test]
-    fn request_keeps_optional_fields() {
-        let req = LlmRequest {
-            model: "gpt-4o".to_string(),
-            messages: vec![],
-            temperature: Some(0.7),
-            max_tokens: Some(1024),
-            ..Default::default()
-        };
-        assert_eq!(req.model, "gpt-4o");
-        assert_eq!(req.temperature, Some(0.7));
-        assert_eq!(req.max_tokens, Some(1024));
-        assert!(req.messages.is_empty());
-    }
-
-    #[test]
-    fn tool_call_struct_construction() {
-        let tc = ToolCall {
-            id: "call_1".to_string(),
-            name: "get_weather".to_string(),
-            arguments: serde_json::json!({"location": "SF"}),
-        };
-        assert_eq!(tc.id, "call_1");
-        assert_eq!(tc.name, "get_weather");
-        assert_eq!(tc.arguments, serde_json::json!({"location": "SF"}));
-    }
-
-    #[test]
-    fn tool_call_format_enum_2_variants() {
-        let a = ToolCallFormat::OpenAI;
-        let b = ToolCallFormat::Anthropic;
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn tool_call_json_round_trip() {
-        let tc = ToolCall {
-            id: "x".to_string(),
-            name: "y".to_string(),
-            arguments: serde_json::json!({"k": 1}),
-        };
-        let j = serde_json::to_string(&tc).unwrap();
-        let back: ToolCall = serde_json::from_str(&j).unwrap();
-        assert_eq!(tc, back);
-    }
-
-    #[tokio::test]
-    async fn default_call_stream_returns_not_implemented() {
-        let p = StubProvider;
-        let req = LlmRequest {
-            model: "x".to_string(),
-            messages: vec![ChatMessage::User {
-                text: "hi".to_string(),
-            }],
-            ..Default::default()
-        };
-        let mut on_chunk = |_c: StreamChunk| {};
-        let r = p.call_stream(&req, &mut on_chunk).await;
-        assert!(matches!(r, Err(AgentError::NotImplemented(_))));
+    async fn provider_default_call_returns_not_implemented() {
+        let provider = StubProvider;
+        let req = LlmRequest::default();
+        let err = provider.call(&req).await.unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("not implemented"));
     }
 }

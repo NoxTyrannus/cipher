@@ -374,7 +374,7 @@ impl ModeManager {
 mod tests {
     use super::*;
     use crate::agent::thought::{ThinkingInput, ThinkingTerminalState};
-    use crate::logic::model::provider::{LlmProvider, LlmRequest, LlmResponse, ToolCall};
+    use crate::logic::model::provider::{LlmProvider, LlmRequest, LlmResponse};
     use crate::logic::model::registry::ProviderRegistry;
     use std::fs;
     use std::path::Path;
@@ -401,7 +401,6 @@ mod tests {
         ) -> std::result::Result<LlmResponse, AgentError> {
             Ok(LlmResponse {
                 content: r#"{"think":"durable work","say":"durable reply"}"#.to_string(),
-                tool_calls: vec![],
                 usage: None,
             })
         }
@@ -421,7 +420,6 @@ mod tests {
             Ok(LlmResponse {
                 content: r#"{"think":"durable stream work","say":"durable stream reply"}"#
                     .to_string(),
-                tool_calls: vec![],
                 usage: None,
             })
         }
@@ -466,7 +464,6 @@ mod tests {
         ) -> std::result::Result<LlmResponse, AgentError> {
             Ok(LlmResponse {
                 content: INVALID_RAW_OUTPUT.to_string(),
-                tool_calls: vec![],
                 usage: None,
             })
         }
@@ -507,55 +504,8 @@ mod tests {
             };
             Ok(LlmResponse {
                 content: content.to_string(),
-                tool_calls: vec![],
                 usage: None,
             })
-        }
-    }
-
-    struct UnsolicitedToolProvider {
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl UnsolicitedToolProvider {
-        fn response() -> LlmResponse {
-            LlmResponse {
-                content: r#"{"think":"ignored tool call","say":"durable reply"}"#.to_string(),
-                tool_calls: vec![ToolCall {
-                    id: "unsolicited-call".to_string(),
-                    name: "guessed_tool".to_string(),
-                    arguments: serde_json::json!({}),
-                }],
-                usage: None,
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl LlmProvider for UnsolicitedToolProvider {
-        fn id(&self) -> &'static str {
-            "openai"
-        }
-
-        fn name(&self) -> &'static str {
-            "unsolicited tool test provider"
-        }
-
-        async fn call(
-            &self,
-            _request: &LlmRequest,
-        ) -> std::result::Result<LlmResponse, AgentError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Self::response())
-        }
-
-        async fn call_stream(
-            &self,
-            _request: &LlmRequest,
-            _on_chunk: &mut (dyn FnMut(StreamChunk) + Send),
-        ) -> std::result::Result<LlmResponse, AgentError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Self::response())
         }
     }
 
@@ -801,32 +751,6 @@ mod tests {
         assert_eq!(
             context.output.as_ref().unwrap().terminal_state,
             ThinkingTerminalState::Completed
-        );
-    }
-
-    #[tokio::test]
-    async fn blocking_unsolicited_tool_call_is_ignored_with_warning() {
-        let temporary = tempfile::tempdir().unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let mut providers = ProviderRegistry::new();
-        providers.register(Arc::new(UnsolicitedToolProvider {
-            calls: Arc::clone(&calls),
-        }));
-        let mut manager = make_mgr_at(temporary.path(), providers);
-
-        let response = manager
-            .handle_input("do not expose thinking tools")
-            .await
-            .unwrap();
-        assert_eq!(response.text, "durable reply");
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        let timeline = manager.thought_store().recover().unwrap();
-        let output = timeline.groups[0].contexts[0].output.as_ref().unwrap();
-        assert_eq!(
-            output.terminal_state,
-            ThinkingTerminalState::Completed,
-            "thinking engine has no tools: tool_calls are warned and ignored"
         );
     }
 
@@ -1147,62 +1071,6 @@ mod tests {
         }
         assert!(routed_ids.contains(&first_completed.thought_id.to_string()));
         assert!(routed_ids.contains(&second_completed.thought_id.to_string()));
-    }
-
-    #[tokio::test]
-    async fn streaming_unsolicited_tool_call_is_ignored_with_warning() {
-        let temporary = tempfile::tempdir().unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let mut providers = ProviderRegistry::new();
-        providers.register(Arc::new(UnsolicitedToolProvider {
-            calls: Arc::clone(&calls),
-        }));
-        let mut manager = make_mgr_at(temporary.path(), providers);
-        let (mut stream_rx, mut outcome_rx) = manager.take_channels();
-
-        let thought_id = manager
-            .spawn("ignore streaming tool call".to_string())
-            .await
-            .unwrap();
-
-        let (signal_id, signal) =
-            tokio::time::timeout(std::time::Duration::from_secs(1), stream_rx.recv())
-                .await
-                .expect("think signal should arrive")
-                .expect("stream channel should remain open");
-        assert_eq!(signal_id, thought_id);
-        assert_eq!(signal, StreamChunk::Think("ignored tool call".to_string()));
-
-        let (signal_id, signal) =
-            tokio::time::timeout(std::time::Duration::from_secs(1), stream_rx.recv())
-                .await
-                .expect("say signal should arrive")
-                .expect("stream channel should remain open");
-        assert_eq!(signal_id, thought_id);
-        assert_eq!(signal, StreamChunk::Delta("durable reply".to_string()));
-
-        let (signal_id, signal) =
-            tokio::time::timeout(std::time::Duration::from_secs(1), stream_rx.recv())
-                .await
-                .expect("done signal should arrive")
-                .expect("stream channel should remain open");
-        assert_eq!(signal_id, thought_id);
-        assert_eq!(signal, StreamChunk::Done);
-
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), outcome_rx.recv())
-            .await
-            .expect("outcome should arrive")
-            .expect("outcome channel should remain open");
-        assert_eq!(outcome.id, thought_id);
-        assert!(
-            outcome.result.is_ok(),
-            "thinking engine has no tools: tool_calls are warned and ignored"
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        let timeline = manager.thought_store().recover().unwrap();
-        let output = timeline.groups[0].contexts[0].output.as_ref().unwrap();
-        assert_eq!(output.terminal_state, ThinkingTerminalState::Completed);
     }
 
     #[tokio::test]
