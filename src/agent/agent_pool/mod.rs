@@ -210,6 +210,8 @@ impl AgentPool {
             identity,
             status: AgentStatus::Idle,
             created_at: std::time::Instant::now(),
+            last_heartbeat: std::time::Instant::now(),
+            heartbeat_source: None,
         };
         self.registry.write().await.register(entry);
     }

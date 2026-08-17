@@ -237,6 +237,8 @@ mod tests {
                 AgentStatus::Idle
             },
             created_at: std::time::Instant::now(),
+            last_heartbeat: std::time::Instant::now(),
+            heartbeat_source: None,
         }
     }
 
