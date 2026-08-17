@@ -30,6 +30,13 @@ pub const BUILTIN_EXECUTORS: &[&str] = &[
     "builtin:memory.preference.write",
     "builtin:memory.cognitive.update",
     "builtin:memory.evidence.lookup",
+    "builtin:subagent.create",
+    "builtin:subagent.update",
+    "builtin:subagent.run",
+    "builtin:subagent.sleep",
+    "builtin:subagent.wake",
+    "builtin:subagent.delete",
+    "builtin:usage_method.observe",
 ];
 
 fn fail(msg: impl Into<String>) -> Result<Value, String> {
