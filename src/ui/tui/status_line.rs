@@ -1,5 +1,6 @@
 use crate::agent::agent_pool::registry::{AgentIdentity, AgentStatus};
 use crate::agent::agent_pool::AgentPoolSnapshot;
+use crate::agent::execution_types::SubagentLifecycle;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -136,6 +137,20 @@ pub(crate) fn segments_from_snapshot(s: &AgentPoolSnapshot) -> Vec<Segment> {
         });
     }
 
+    // subagent 运行中数量展示（最小适配：仅在有运行中 subagent 时显示）。
+    let running_subagents = s
+        .subagent_states
+        .iter()
+        .filter(|s| s.lifecycle == SubagentLifecycle::Running)
+        .count();
+    if running_subagents > 0 {
+        segments.push(Segment {
+            name: "subagent",
+            status: format!("运行:{running_subagents}"),
+            status_style: Style::default().fg(Color::Cyan),
+        });
+    }
+
     segments
 }
 
@@ -213,6 +228,7 @@ mod tests {
     fn stub_snapshot() -> AgentPoolSnapshot {
         AgentPoolSnapshot {
             entries: Vec::new(),
+            subagent_states: Vec::new(),
             execution_pending_depth: 0,
             insight_pending_depth: 0,
             memory_pending_depth: 0,
@@ -400,6 +416,43 @@ mod tests {
         let segs = full_segments();
         let line = fit_to_width(&segs, 0);
         assert_eq!(line_text(&line), "");
+    }
+
+    #[test]
+    fn running_subagents_shows_segment_only_when_present() {
+        let s = stub_snapshot();
+        assert!(!segments_from_snapshot(&s)
+            .iter()
+            .any(|g| g.name == "subagent"));
+
+        let mut s = stub_snapshot();
+        s.subagent_states
+            .push(crate::agent::execution_types::SubagentRuntimeState {
+                subagent_id: "sg_1".to_string(),
+                lifecycle: crate::agent::execution_types::SubagentLifecycle::Running,
+                last_output_truncated: None,
+                trigger: None,
+                startup: crate::agent::execution_types::SubagentStartup::Normal,
+                lifecycle_kind: crate::agent::execution_types::SubagentLifecycleKind::Temporary,
+            });
+        let segs = segments_from_snapshot(&s);
+        assert!(segs
+            .iter()
+            .any(|g| g.name == "subagent" && g.status == "运行:1"));
+
+        s.subagent_states
+            .push(crate::agent::execution_types::SubagentRuntimeState {
+                subagent_id: "sg_2".to_string(),
+                lifecycle: crate::agent::execution_types::SubagentLifecycle::Idle,
+                last_output_truncated: None,
+                trigger: None,
+                startup: crate::agent::execution_types::SubagentStartup::Normal,
+                lifecycle_kind: crate::agent::execution_types::SubagentLifecycleKind::Resident,
+            });
+        // 只有 Running 生命周期计入运行中数量。
+        assert!(segments_from_snapshot(&s)
+            .iter()
+            .any(|g| g.name == "subagent" && g.status == "运行:1"));
     }
 
     #[test]
