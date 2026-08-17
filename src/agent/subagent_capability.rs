@@ -1231,6 +1231,7 @@ fn lifecycle_name(lifecycle: SubagentLifecycle) -> &'static str {
         SubagentLifecycle::Created => "created",
         SubagentLifecycle::Running => "running",
         SubagentLifecycle::Idle => "idle",
+        SubagentLifecycle::Sleeping => "sleeping",
         SubagentLifecycle::Failed => "failed",
         SubagentLifecycle::Tombstoned => "tombstoned",
     }
