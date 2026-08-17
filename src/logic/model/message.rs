@@ -1,7 +1,5 @@
 //! 统一消息 IR：provider 无关的内部消息结构 + 共享规整 pass（normalize）。
-//! 出站前统一走 `normalize`，三端适配器只做机械映射、不拍板语义决策。
-
-use super::provider::ToolCall;
+//! 业务链路使用文本能力协议，不再保留 provider 原生工具消息形态。
 
 /// 内部统一消息 IR（与任何 API 无关，不落盘）。
 #[derive(Debug, Clone, PartialEq)]
@@ -14,17 +12,8 @@ pub enum ChatMessage {
     User {
         text: String,
     },
-    /// tool_calls 常态为空，保留扩展位。
     Assistant {
         text: String,
-        tool_calls: Vec<ToolCall>,
-    },
-    /// 工具结果（envelope 语义内生化，替代 JSON 字符串约定）。
-    ToolResult {
-        id: String,
-        name: String,
-        text: String,
-        is_error: bool,
     },
 }
 
@@ -82,14 +71,10 @@ fn memory_index(kind: &MemoryKind) -> usize {
 
 /// 共享规整 pass（规则严格按序）：
 /// 1. Primary System 按序 `\n\n` 拼接为主 system 基底
-/// 2. Memory 按 cognitive→attention→experience→preference 固定顺序分组，
-///    每组一节 `## 认知记忆`/`## 注意力`/`## 经验`/`## 偏好`，节内逐条一行，
-///    合并拼到主 system 后（`\n\n` 分隔）；无记忆条目则不加
-/// 3. Meta System 转 User（保留原文含 `[xxx]` 前缀），保持序列相对位置
-/// 4. User/Assistant/ToolResult 原样保留顺序；剔除全空白文本消息
-/// 5. 孤儿 ToolResult（前一条不是含对应 tool_call id 的 Assistant）替换为
-///    合成错误结果并打 warn
-/// 6. cache_after_system 恒 true
+/// 2. Memory 按 cognitive→attention→experience→preference 固定顺序分组
+/// 3. Meta System 转 User，保持序列相对位置
+/// 4. User/Assistant 原样保留；剔除全空白文本消息
+/// 5. cache_after_system 恒 true
 pub fn normalize(messages: Vec<ChatMessage>) -> Normalized {
     let mut primary_parts: Vec<String> = Vec::new();
     let mut memory_groups: [Vec<String>; 4] = Default::default();
@@ -117,43 +102,11 @@ pub fn normalize(messages: Vec<ChatMessage>) -> Normalized {
                     history.push(ChatMessage::User { text });
                 }
             }
-            ChatMessage::Assistant { text, tool_calls } => {
-                if !text.trim().is_empty() || !tool_calls.is_empty() {
-                    history.push(ChatMessage::Assistant { text, tool_calls });
+            ChatMessage::Assistant { text } => {
+                if !text.trim().is_empty() {
+                    history.push(ChatMessage::Assistant { text });
                 }
             }
-            other @ ChatMessage::ToolResult { .. } => history.push(other),
-        }
-    }
-
-    let mut synthesized: Vec<(usize, String)> = Vec::new();
-    for i in 0..history.len() {
-        let current_id = match &history[i] {
-            ChatMessage::ToolResult { id, .. } => id,
-            _ => continue,
-        };
-        let mut paired = false;
-        let mut j = i;
-        while j > 0 {
-            j -= 1;
-            match &history[j] {
-                ChatMessage::ToolResult { .. } => continue,
-                ChatMessage::Assistant { tool_calls, .. } => {
-                    paired = tool_calls.iter().any(|tc| &tc.id == current_id);
-                    break;
-                }
-                _ => break,
-            }
-        }
-        if !paired {
-            synthesized.push((i, current_id.clone()));
-        }
-    }
-    for (i, id) in synthesized {
-        if let ChatMessage::ToolResult { text, is_error, .. } = &mut history[i] {
-            *text = "No result provided（孤儿工具结果合成）".to_string();
-            *is_error = true;
-            tracing::warn!("normalize: 孤儿 ToolResult 合成错误结果 id={id}");
         }
     }
 
@@ -200,10 +153,9 @@ pub fn normalize_with_system(system: Option<&str>, messages: &[ChatMessage]) -> 
 impl ChatMessage {
     pub fn text(&self) -> &str {
         match self {
-            ChatMessage::System { text, .. } => text,
-            ChatMessage::User { text } => text,
-            ChatMessage::Assistant { text, .. } => text,
-            ChatMessage::ToolResult { text, .. } => text,
+            ChatMessage::System { text, .. }
+            | ChatMessage::User { text }
+            | ChatMessage::Assistant { text } => text,
         }
     }
 }
@@ -239,27 +191,9 @@ mod tests {
         }
     }
 
-    fn assistant(text: &str, tool_calls: Vec<ToolCall>) -> ChatMessage {
+    fn assistant(text: &str) -> ChatMessage {
         ChatMessage::Assistant {
             text: text.to_string(),
-            tool_calls,
-        }
-    }
-
-    fn tool_result(id: &str, text: &str) -> ChatMessage {
-        ChatMessage::ToolResult {
-            id: id.to_string(),
-            name: "cap_x".to_string(),
-            text: text.to_string(),
-            is_error: false,
-        }
-    }
-
-    fn tool_call(id: &str) -> ToolCall {
-        ToolCall {
-            id: id.to_string(),
-            name: "cap_x".to_string(),
-            arguments: serde_json::json!({}),
         }
     }
 
@@ -323,54 +257,20 @@ mod tests {
             })
             .collect();
         assert_eq!(roles, vec!["user", "user", "user"]);
-        assert!(n.messages[1].to_debug_contains("[capability result: file.read]"));
-        assert!(matches!(&n.messages[1], ChatMessage::User { text } if text.contains("file.read")));
+        assert!(n.messages[1].text().contains("file.read"));
         assert_eq!(n.system, "");
     }
 
     #[test]
     fn blank_text_messages_are_dropped() {
-        let n = normalize(vec![user("   "), assistant("", vec![]), user("real")]);
+        let n = normalize(vec![user("   "), assistant(""), user("real")]);
         assert_eq!(n.messages.len(), 1);
         assert!(matches!(&n.messages[0], ChatMessage::User { text } if text == "real"));
     }
 
     #[test]
-    fn blank_assistant_with_tool_calls_is_kept() {
-        let n = normalize(vec![assistant("", vec![tool_call("c1")])]);
-        assert_eq!(n.messages.len(), 1);
-        assert!(matches!(
-            &n.messages[0],
-            ChatMessage::Assistant { tool_calls, .. } if tool_calls.len() == 1
-        ));
-    }
-
-    #[test]
-    fn orphan_tool_result_is_synthesized_with_error() {
-        let n = normalize(vec![user("u"), tool_result("c9", "raw")]);
-        assert!(matches!(
-            &n.messages[1],
-            ChatMessage::ToolResult { id, text, is_error, .. }
-                if id == "c9" && text.contains("孤儿工具结果合成") && *is_error
-        ));
-    }
-
-    #[test]
-    fn paired_tool_result_is_kept_unchanged() {
-        let n = normalize(vec![
-            assistant("我来读文件", vec![tool_call("c1")]),
-            tool_result("c1", "file body"),
-        ]);
-        assert!(matches!(
-            &n.messages[1],
-            ChatMessage::ToolResult { id, text, is_error, .. }
-                if id == "c1" && text == "file body" && !*is_error
-        ));
-    }
-
-    #[test]
     fn plain_dialogue_unchanged() {
-        let input = vec![user("q1"), assistant("a1", vec![]), user("q2")];
+        let input = vec![user("q1"), assistant("a1"), user("q2")];
         let n = normalize(input.clone());
         assert_eq!(n.system, "");
         assert_eq!(n.messages, input);
@@ -390,11 +290,5 @@ mod tests {
         assert_eq!(n.messages.len(), 1);
         let n2 = normalize_with_system(None, &[user("hi")]);
         assert_eq!(n2.system, "");
-    }
-
-    impl ChatMessage {
-        fn to_debug_contains(&self, needle: &str) -> bool {
-            format!("{self:?}").contains(needle)
-        }
     }
 }

@@ -697,7 +697,6 @@ mod tests {
         async fn call(&self, _req: &LlmRequest) -> Result<LlmResponse> {
             Ok(LlmResponse {
                 content: String::new(),
-                tool_calls: vec![],
                 usage: None,
             })
         }

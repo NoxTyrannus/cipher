@@ -199,7 +199,6 @@ pub(super) fn chat_message_of(parsed: &ParsedMessage) -> ChatMessage {
         },
         "assistant" => ChatMessage::Assistant {
             text: parsed.content.clone(),
-            tool_calls: Vec::new(),
         },
         "system" => ChatMessage::System {
             text: parsed.content.clone(),
@@ -216,7 +215,6 @@ pub(super) fn message_text(m: &ChatMessage) -> &str {
         ChatMessage::System { text, .. } => text,
         ChatMessage::User { text } => text,
         ChatMessage::Assistant { text, .. } => text,
-        ChatMessage::ToolResult { text, .. } => text,
     }
 }
 

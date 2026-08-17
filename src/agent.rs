@@ -2,7 +2,6 @@ pub mod agent_pool;
 pub mod capability_protocol;
 pub mod communication;
 pub mod context_assembler;
-pub mod dispatcher;
 pub mod execution_platform;
 pub mod execution_types;
 pub mod insight_platform;

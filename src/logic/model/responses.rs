@@ -1,6 +1,6 @@
 use super::error::map_reqwest_error;
 use super::message::{normalize_with_system, ChatMessage};
-use super::provider::{LlmProvider, LlmRequest, LlmResponse, ToolCallFormat, Usage};
+use super::provider::{LlmProvider, LlmRequest, LlmResponse, Usage};
 use super::stream::{find_double_newline, StreamChunk};
 use crate::common::{AgentError, Result};
 use async_trait::async_trait;
@@ -44,8 +44,6 @@ struct ResponsesRequest<'a> {
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
 }
@@ -89,13 +87,6 @@ fn build_responses_request(req: &LlmRequest, stream: bool) -> ResponsesRequest<'
                 call_id: None,
                 output: None,
             }),
-            ChatMessage::ToolResult { id, text, .. } => input.push(ResponsesInputItem {
-                item_type: "function_call_output".to_string(),
-                role: None,
-                content: None,
-                call_id: Some(id.clone()),
-                output: Some(text.clone()),
-            }),
             ChatMessage::System { .. } => unreachable!("normalize 已抽取全部 System"),
         }
     }
@@ -107,7 +98,6 @@ fn build_responses_request(req: &LlmRequest, stream: bool) -> ResponsesRequest<'
         temperature: req.temperature,
         top_p: req.top_p,
         max_output_tokens: req.max_tokens,
-        tools: req.tools.clone(),
         stream,
     }
 }
@@ -278,10 +268,6 @@ impl LlmProvider for ResponsesProvider {
         "Responses API"
     }
 
-    fn tool_call_format(&self) -> ToolCallFormat {
-        ToolCallFormat::OpenAI
-    }
-
     async fn call(&self, req: &LlmRequest) -> Result<LlmResponse> {
         if req.api_url.is_empty() {
             return Err(crate::common::AgentError::Llm(
@@ -345,11 +331,7 @@ impl LlmProvider for ResponsesProvider {
             total_tokens: u.total_tokens,
         });
 
-        Ok(LlmResponse {
-            content,
-            tool_calls: vec![],
-            usage,
-        })
+        Ok(LlmResponse { content, usage })
     }
 
     async fn call_stream(
@@ -440,7 +422,6 @@ impl LlmProvider for ResponsesProvider {
 
         Ok(LlmResponse {
             content: accumulated,
-            tool_calls: vec![],
             usage: stream_usage,
         })
     }
@@ -492,35 +473,6 @@ mod tests {
         assert!(instructions.contains("## 认知记忆"));
         assert!(instructions.contains("[COGNITIVE] user likes rust"));
         assert_eq!(body["input"].as_array().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn tool_result_emits_function_call_output_item() {
-        let req = make_request(vec![
-            ChatMessage::Assistant {
-                text: "I'll read it".to_string(),
-                tool_calls: vec![crate::logic::model::provider::ToolCall {
-                    id: "fc_1".into(),
-                    name: "file.read".into(),
-                    arguments: serde_json::json!({"path": "a.txt"}),
-                }],
-            },
-            ChatMessage::ToolResult {
-                id: "fc_1".into(),
-                name: "file.read".into(),
-                text: "file body".into(),
-                is_error: false,
-            },
-        ]);
-        let body = serde_json::to_value(build_responses_request(&req, false)).unwrap();
-        let input = body["input"].as_array().unwrap();
-        assert_eq!(input.len(), 2);
-        assert_eq!(input[0]["type"], "message");
-        assert_eq!(input[0]["role"], "assistant");
-        assert_eq!(input[1]["type"], "function_call_output");
-        assert_eq!(input[1]["call_id"], "fc_1");
-        assert_eq!(input[1]["output"], "file body");
-        assert!(input[1].get("role").is_none());
     }
 
     #[test]
@@ -691,6 +643,5 @@ mod tests {
         let p = ResponsesProvider::new();
         assert_eq!(p.id(), "responses");
         assert_eq!(p.name(), "Responses API");
-        assert_eq!(p.tool_call_format(), ToolCallFormat::OpenAI);
     }
 }

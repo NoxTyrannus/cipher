@@ -19,7 +19,7 @@ pub use message::{
     normalize, normalize_with_system, ChatMessage, MemoryKind, Normalized, SystemKind,
 };
 pub use openai::OpenAiProvider;
-pub use provider::{LlmProvider, LlmRequest, LlmResponse, ToolCall, ToolCallFormat, Usage};
+pub use provider::{LlmProvider, LlmRequest, LlmResponse, Usage};
 pub use registry::ProviderRegistry;
 pub use responses::ResponsesProvider;
 pub use stream::StreamChunk;

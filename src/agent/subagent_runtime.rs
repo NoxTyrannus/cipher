@@ -396,7 +396,7 @@ async fn execute_one(
         match resolve_capability_identity(&params.registry, invocation) {
             Ok(identity) => identity,
             Err(e) => {
-                logs.push(format!("INVALID tool: {e}"));
+                logs.push(format!("INVALID capability: {e}"));
                 messages.push(ChatMessage::User {
                     text: format!("能力调用被拒绝: {e}\n请使用可用能力并重试，或输出 done 结束。"),
                 });
@@ -437,7 +437,6 @@ async fn execute_one(
                     }
                 })
                 .to_string(),
-                tool_calls: vec![],
             });
             messages.push(ChatMessage::User {
                 text: format!("能力 {capability_id} 执行结果: {truncated}"),
@@ -750,7 +749,6 @@ mod tests {
                 .unwrap_or_else(|| r#"{"done": true, "summary": "ok"}"#.to_string());
             Ok(LlmResponse {
                 content,
-                tool_calls: vec![],
                 usage: None,
             })
         }

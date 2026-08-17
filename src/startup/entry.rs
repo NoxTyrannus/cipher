@@ -1188,8 +1188,6 @@ pub async fn run_streaming_loop(
 
 
 
-                    StreamChunk::ToolCallStart { .. } => {}
-                    StreamChunk::ToolCallResult { .. } => {}
                 }
             }
 

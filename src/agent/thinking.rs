@@ -468,13 +468,6 @@ impl ThinkingInstance {
 
         let resp = provider.call(&req).await?;
 
-        if !resp.tool_calls.is_empty() {
-            tracing::warn!(
-                "run: thinking engine has no tools; ignoring {} unexpected tool_call(s)",
-                resp.tool_calls.len()
-            );
-        }
-
         self.state = ThinkState::Design;
         Ok(resp)
     }
@@ -739,14 +732,6 @@ impl ThinkingInstance {
                 }
                 return;
             };
-
-            if !resp.tool_calls.is_empty() {
-                tracing::warn!(
-                    "spawn_streaming: thinking engine has no tools; ignoring {} unexpected tool_call(s) thought_id={}",
-                    resp.tool_calls.len(),
-                    id2
-                );
-            }
 
             let final_response = resp;
             let final_content = final_response.content.clone();

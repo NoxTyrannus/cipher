@@ -1,13 +1,12 @@
 //! 服务层能力调用式的文本 JSON 协议（capability_protocol）。
 //!
-//! 模型不直接产生 provider 原生 tool_calls，而是按固定格式能力协议输出：
+//! 模型不直接产生 provider 原生函数调用，而是按固定格式能力协议输出：
 //! - `{"capability_call": {"capability_id":"...", "capability_name":"可选", "arguments":{...}}}`：调用一个能力；
 //! - `{"capability_calls": [{...}, ...]}`：按数组声明顺序调用多个能力；
 //! - `{"done": true, "summary": "..."}`：结束本轮能力循环。
 //!
 //! 协议字段只使用 `capability_id`（最小许可）/ 可选 `capability_name` / `arguments`；
-//! 旧文本协议（`{"tool_call":{"name":...}}` / `{"arguments":{...}}`）短期兼容解析，
-//! 新 prompt / 新测试 / 新领域类型一律使用新名。
+//! `{"arguments":{...}}` 单能力历史形态仅作为兼容分支保留。
 
 /// 单条能力调用声明（协议最小单位）。
 #[derive(Debug, Clone, PartialEq)]
@@ -23,7 +22,7 @@ pub struct CapabilityInvocation {
 /// 单轮模型输出的解析结果。
 #[derive(Debug, Clone, PartialEq)]
 pub enum CapabilityAction {
-    /// 单能力场景：`{"capability_call": {...}}`（或旧协议 `{"tool_call": {...}}`）。
+    /// 单能力场景：`{"capability_call": {...}}`。
     CapabilityCall(CapabilityInvocation),
     /// 多能力场景：`{"capability_calls": [...]}`，按数组顺序执行。
     CapabilityCalls(Vec<CapabilityInvocation>),
@@ -133,26 +132,6 @@ fn parse_capability_action_json(
             }
         }
         return Ok(CapabilityAction::CapabilityCalls(parsed));
-    }
-    // 旧协议兼容：具名单能力调用。
-    if value.get("tool_call").is_some() {
-        let tc = value.get("tool_call").unwrap();
-        let capability_id = tc
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if capability_id.trim().is_empty() {
-            return Err(CapabilityParseError::ArgumentsNotObject(
-                "tool_call.name 必须是非空字符串".to_string(),
-            ));
-        }
-        let arguments = parse_arguments_object(tc.get("arguments"), "tool_call.arguments")?;
-        return Ok(CapabilityAction::CapabilityCall(CapabilityInvocation {
-            capability_id,
-            capability_name: None,
-            arguments,
-        }));
     }
     // 旧协议兼容：无具名单能力调用（无 capability_id）。
     if value.get("arguments").is_some() {
@@ -285,16 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_legacy_tool_call_and_arguments_for_compat() {
-        let content =
-            r#"{"tool_call":{"name":"memory.list","arguments":{"memory_type":"attention"}}}"#;
-        match parse_capability_output(content) {
-            CapabilityAction::CapabilityCall(invocation) => {
-                assert_eq!(invocation.capability_id, "memory.list");
-                assert_eq!(invocation.arguments["memory_type"], "attention");
-            }
-            other => panic!("expected CapabilityCall(legacy), got {other:?}"),
-        }
+    fn parses_legacy_arguments_for_compat() {
         assert!(matches!(
             parse_capability_output(r#"{"arguments": {"command": "ls"}}"#),
             CapabilityAction::LegacyArguments { .. }

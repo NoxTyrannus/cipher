@@ -68,7 +68,7 @@ mod tests {
         let mut ctx = ModeContext::default();
         let factory = crate::agent::thinking::ThinkingFactory::new();
         let r = m
-            .handle_input("build a CLI tool", &mut ctx, &factory)
+            .handle_input("build a CLI capability", &mut ctx, &factory)
             .await
             .unwrap();
         assert!(!r.awaiting_confirmation);
