@@ -64,10 +64,13 @@ pub(super) fn estimate_tokens(text: &str) -> usize {
     tokens.max(1)
 }
 
-pub(super) fn build_pool_snapshot_text(snapshot: &[AgentEntry]) -> String {
+pub(super) fn build_pool_snapshot_text(
+    snapshot: &[AgentEntry],
+    subagent_states: &[crate::agent::execution_types::SubagentRuntimeState],
+) -> String {
     use std::collections::HashMap;
 
-    if snapshot.is_empty() {
+    if snapshot.is_empty() && subagent_states.is_empty() {
         return String::new();
     }
 
@@ -144,7 +147,40 @@ pub(super) fn build_pool_snapshot_text(snapshot: &[AgentEntry]) -> String {
         lines.push(format!("- Subagents: {}", sub_str));
     }
 
+    if !subagent_states.is_empty() {
+        lines.push("## Subagent Status".to_string());
+        for state in subagent_states {
+            lines.push(format!(
+                "- {} lifecycle={:?} startup={:?} kind={:?} last_output={}",
+                state.subagent_id,
+                state.lifecycle,
+                state.startup,
+                state.lifecycle_kind,
+                state.last_output_truncated.as_deref().unwrap_or("(none)"),
+            ));
+        }
+    }
+
     lines.join("\n")
+}
+
+/// 按 token 估算预算截断文本（UTF-8 安全，超出预算时丢弃末尾）。
+pub(super) fn truncate_by_token_budget(text: &str, max_tokens: usize) -> String {
+    let mut used = 0usize;
+    let mut end = text.len();
+    for (index, ch) in text.char_indices() {
+        let tokens = if ch.is_ascii() { 1 } else { 2 };
+        if used + tokens > max_tokens {
+            end = index;
+            break;
+        }
+        used += tokens;
+    }
+    if end >= text.len() {
+        text.to_string()
+    } else {
+        text[..end].to_string()
+    }
 }
 
 pub(super) fn memory_kind_of(memory_type: &str) -> MemoryKind {

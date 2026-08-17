@@ -51,7 +51,9 @@ pub struct CapabilityExecutor {
     /// `<storage_root>`（全局 invocation 日志与 subagent 记忆文件的根目录）。
     storage_root: Option<PathBuf>,
     /// subagent spawn hook（TC 接线安装 TB runtime）。
-    subagent_spawn_hook: Option<Arc<dyn SubagentSpawnHook>>,
+    ///
+    /// 使用读写锁共享引用：TC 在把 executor 包装为 Arc 之后仍可安装 runtime hook。
+    subagent_spawn_hook: std::sync::RwLock<Option<Arc<dyn SubagentSpawnHook>>>,
 }
 
 const ALLOWED_TABLES: &[&str] = &[
@@ -123,7 +125,7 @@ impl CapabilityExecutor {
             thought_store: None,
             reload_tx: None,
             storage_root: None,
-            subagent_spawn_hook: None,
+            subagent_spawn_hook: std::sync::RwLock::new(None),
         }
     }
 
@@ -136,9 +138,11 @@ impl CapabilityExecutor {
         self.storage_root = Some(storage_root.to_path_buf());
     }
 
-    /// 安装 subagent spawn hook（TC 接线安装 TB runtime；未安装时分子仍完成持久化）。
-    pub fn set_subagent_spawn_hook(&mut self, hook: Arc<dyn SubagentSpawnHook>) {
-        self.subagent_spawn_hook = Some(hook);
+    /// 安装 subagent spawn hook（Arc 共享安装入口；未安装时分子仍完成持久化）。
+    pub fn set_subagent_spawn_hook(&self, hook: Arc<dyn SubagentSpawnHook>) {
+        if let Ok(mut slot) = self.subagent_spawn_hook.write() {
+            *slot = Some(hook);
+        }
     }
 
     pub fn set_triviumdb(&mut self, db: Arc<std::sync::Mutex<TriviumDb>>) {
@@ -200,12 +204,17 @@ impl CapabilityExecutor {
         let guard = db.lock().map_err(|error| {
             AgentError::Script(format!("{builtin_name}: duckdb lock poisoned: {error}"))
         })?;
+        let hook = self
+            .subagent_spawn_hook
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone());
         crate::agent::subagent_capability::execute_subagent_capability(
             &guard,
             storage_root,
             builtin_name,
             input,
-            self.subagent_spawn_hook.as_deref(),
+            hook.as_deref(),
         )
     }
 

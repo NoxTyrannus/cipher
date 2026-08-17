@@ -1,3 +1,9 @@
+use crate::agent::agent_pool::registry::{AgentEntry, AgentIdentity, AgentStatus};
+use crate::agent::agent_pool::AgentPool;
+use crate::agent::communication::{
+    AgentMessage, CapabilityLifecycleRecord, CapabilityLifecycleState, ExecutionOutput,
+    InsightOutput, InsightResult, UsageObservation,
+};
 use crate::common::Result;
 use crate::data::ModelRow;
 use crate::logic::model::message::{ChatMessage, SystemKind};
@@ -9,21 +15,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, Notify};
 
-use super::agent_pool::registry::{AgentEntry, AgentIdentity, AgentStatus};
-use super::agent_pool::AgentPool;
-use super::communication::{
-    AgentMessage, ExecutionOutput, InsightOutput, InsightResult, NodeResult, NodeStatus,
-    ToolMemoryUpdate,
-};
-
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct InsightRawOutput {
     #[serde(default)]
     insight: Option<String>,
-
     #[serde(default)]
-    tool_memory: Vec<ToolMemoryUpdate>,
+    usage_observations: Vec<UsageObservation>,
 }
 
 fn parse_insight_output(content: &str) -> Result<InsightRawOutput> {
@@ -42,18 +40,16 @@ fn parse_insight_output(content: &str) -> Result<InsightRawOutput> {
     }
 
     tracing::warn!(
-        "insight_platform: failed to parse InsightRawOutput from LLM content: {}",
+        "insight_platform: failed to parse insight output: {}",
         crate::common::json_util::truncate_utf8_boundary(content, 200)
     );
     Ok(InsightRawOutput {
         insight: None,
-        tool_memory: vec![],
+        usage_observations: vec![],
     })
 }
 
-/// 从尚未闭合的 JSON 流中提取 `"insight"` 字符串字段。
-/// 输出格式保证 insight 排在 tool_memory 之前，因此 insight 的闭合引号一出现
-/// 就可以先驱动下一环，而不必等待整个 JSON 对象完成。
+/// 从尚未闭合的 JSON 流中提取 `"insight"` 字符串字段，使 insight 闭合即可先驱动下游。
 fn extract_json_string_field_prefix(text: &str, field: &str) -> Option<String> {
     let key = format!("\"{field}\"");
     let key_start = text.find(&key)?;
@@ -65,9 +61,7 @@ fn extract_json_string_field_prefix(text: &str, field: &str) -> Option<String> {
     let mut index = value_start + 1;
     while index < bytes.len() {
         match bytes[index] {
-            b'\\' => {
-                index += 2;
-            }
+            b'\\' => index += 2,
             b'"' => {
                 let candidate = &after_colon[value_start..=index];
                 if let Ok(value) = serde_json::from_str::<String>(candidate) {
@@ -90,17 +84,11 @@ fn extract_json_block(text: &str) -> Option<String> {
 
 pub struct InsightPlatform {
     insight_rx: mpsc::Receiver<AgentMessage>,
-
     pool: Arc<AgentPool>,
-
     provider: Arc<dyn LlmProvider>,
-
     model_row: ModelRow,
-
     api_key: SecretString,
-
-    tool_memory_tx: mpsc::Sender<Vec<ToolMemoryUpdate>>,
-
+    usage_observation_tx: mpsc::Sender<Vec<UsageObservation>>,
     prompts_dir: Option<PathBuf>,
 }
 
@@ -111,7 +99,7 @@ impl InsightPlatform {
         provider: Arc<dyn LlmProvider>,
         model_row: ModelRow,
         api_key: SecretString,
-        tool_memory_tx: mpsc::Sender<Vec<ToolMemoryUpdate>>,
+        usage_observation_tx: mpsc::Sender<Vec<UsageObservation>>,
         prompts_dir: Option<PathBuf>,
     ) -> Self {
         Self {
@@ -120,7 +108,7 @@ impl InsightPlatform {
             provider,
             model_row,
             api_key,
-            tool_memory_tx,
+            usage_observation_tx,
             prompts_dir,
         }
     }
@@ -136,7 +124,6 @@ impl InsightPlatform {
                     .await;
                 match msg {
                     AgentMessage::ExecutionDone { turn_id } => {
-                        tracing::debug!("insight_platform: received ExecutionDone({turn_id})");
                         self.pool
                             .update_platform_status(|s| s.insight_active = Some(turn_id.clone()))
                             .await;
@@ -145,20 +132,12 @@ impl InsightPlatform {
                             .update_platform_status(|s| s.insight_active = None)
                             .await;
                     }
-                    AgentMessage::MessageDeliver { turn_id, message } => {
-                        tracing::debug!(
-                            "insight_platform: received MessageDeliver(turn_id={turn_id}, message_len={})",
-                            message.len()
-                        );
-                    }
-                    AgentMessage::Cancel { turn_id } => {
-                        tracing::debug!("insight_platform: received Cancel({turn_id}), ignoring (insight runs after execution)");
-                    }
+                    AgentMessage::Cancel { .. } => {}
+                    AgentMessage::MessageDeliver { .. } => {}
                     other => {
-                        tracing::warn!("insight_platform: unexpected message: {:?}", other);
+                        tracing::warn!("insight_platform: unexpected message: {other:?}");
                     }
                 }
-
                 self.pool.snapshot_detailed().await;
             }
 
@@ -167,30 +146,12 @@ impl InsightPlatform {
     }
 
     async fn handle_insight(&self, turn_id: &str) {
-        let ctx = match self.pool.get_turn_context(turn_id).await {
-            Some(ctx) => ctx,
-            None => {
-                tracing::warn!("insight_platform: TurnContext not found for turn_id={turn_id}");
-                return;
-            }
+        let Some(ctx) = self.pool.get_turn_context(turn_id).await else {
+            tracing::warn!("insight_platform: TurnContext not found for turn_id={turn_id}");
+            return;
         };
-
         let execution = ctx.execution.as_ref();
-
-        if execution.is_none() {
-            tracing::debug!(
-                "insight_platform: no execution output for turn_id={turn_id} (say-only round), \
-                 proceeding with fallback insight"
-            );
-        }
-
         let pool_snapshot = self.pool.snapshot().await;
-
-        tracing::debug!(
-            "insight_platform: analyzing turn_id={turn_id}, has_execution={}, pool_agents={}",
-            execution.is_some(),
-            pool_snapshot.len()
-        );
 
         let prompt = build_insight_prompt(
             turn_id,
@@ -207,7 +168,7 @@ impl InsightPlatform {
                 kind: SystemKind::Primary,
             },
             ChatMessage::User {
-                text: "Review the execution evidence now. Output ONLY the JSON.".to_string(),
+                text: "判断本轮方向是否仍然正确，并输出 JSON。".to_string(),
             },
         ];
         let req = match LlmRequest::from_model_row(&self.model_row, messages, self.api_key.clone())
@@ -217,7 +178,7 @@ impl InsightPlatform {
                 tracing::error!(
                     "insight_platform: request build failed for turn_id={turn_id}: {e}"
                 );
-                publish_insight(&self.pool, turn_id, fallback_insight(execution), vec![]).await;
+                publish_insight(&self.pool, turn_id, fallback_insight(execution)).await;
                 return;
             }
         };
@@ -225,10 +186,9 @@ impl InsightPlatform {
         let used_capabilities = execution_capability_ids(execution);
         let state = Arc::new(Mutex::new(InsightStreamState::default()));
         let notify = Arc::new(Notify::new());
-
         let parser = tokio::spawn(run_insight_stream_parser(
             Arc::clone(&self.pool),
-            self.tool_memory_tx.clone(),
+            self.usage_observation_tx.clone(),
             turn_id.to_string(),
             used_capabilities,
             execution.cloned(),
@@ -269,8 +229,6 @@ impl InsightPlatform {
                 "insight_platform: stream parser task failed for turn_id={turn_id}: {join_error}"
             );
         }
-
-        tracing::debug!("insight_platform: turn_id={turn_id} insight streaming finished");
     }
 }
 
@@ -278,13 +236,13 @@ impl InsightPlatform {
 struct InsightStreamState {
     text: String,
     insight_sent: bool,
-    tool_memory_done: bool,
+    usage_done: bool,
     finished: bool,
 }
 
 async fn run_insight_stream_parser(
     pool: Arc<AgentPool>,
-    tool_memory_tx: mpsc::Sender<Vec<ToolMemoryUpdate>>,
+    usage_observation_tx: mpsc::Sender<Vec<UsageObservation>>,
     turn_id: String,
     used_capabilities: Vec<String>,
     execution: Option<ExecutionOutput>,
@@ -302,13 +260,13 @@ async fn run_insight_stream_parser(
             (
                 guard.text.clone(),
                 guard.insight_sent,
-                guard.tool_memory_done,
+                guard.usage_done,
                 guard.finished,
             )
         };
 
         let mut insight_text = extract_json_string_field_prefix(&snapshot.0, "insight");
-        let mut tool_memory_updates = Vec::new();
+        let mut observations = Vec::new();
 
         if snapshot.3 {
             match parse_insight_output(&snapshot.0) {
@@ -316,7 +274,7 @@ async fn run_insight_stream_parser(
                     if insight_text.is_none() {
                         insight_text = raw.insight;
                     }
-                    tool_memory_updates = raw.tool_memory;
+                    observations = raw.usage_observations;
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -334,7 +292,7 @@ async fn run_insight_stream_parser(
 
         if !snapshot.1 {
             if let Some(text) = insight_text {
-                publish_insight(&pool, &turn_id, InsightResult { insight: text }, vec![]).await;
+                publish_insight(&pool, &turn_id, InsightResult { insight: text }).await;
                 if let Ok(mut guard) = state.lock() {
                     guard.insight_sent = true;
                 }
@@ -342,23 +300,23 @@ async fn run_insight_stream_parser(
         }
 
         if snapshot.3 && !snapshot.2 {
-            let dropped = filter_tool_memory_updates(&mut tool_memory_updates, &used_capabilities);
+            let dropped = filter_usage_observations(&mut observations, &used_capabilities);
             if dropped > 0 {
                 tracing::warn!(
                     dropped,
                     allowed = ?used_capabilities,
-                    "insight_platform: dropped hallucinated tool_memory capability_id(s)"
+                    "insight_platform: dropped usage_observations for capability_id(s) not used this turn"
                 );
             }
-            if !tool_memory_updates.is_empty() {
-                if let Err(e) = tool_memory_tx.try_send(tool_memory_updates) {
+            if !observations.is_empty() {
+                if let Err(e) = usage_observation_tx.try_send(observations) {
                     tracing::warn!(
-                        "insight_platform: tool_memory_tx send error turn_id={turn_id}, error={e}"
+                        "insight_platform: usage_observation_tx send error turn_id={turn_id}, error={e}"
                     );
                 }
             }
             if let Ok(mut guard) = state.lock() {
-                guard.tool_memory_done = true;
+                guard.usage_done = true;
             }
         }
 
@@ -367,7 +325,7 @@ async fn run_insight_stream_parser(
                 Ok(guard) => guard,
                 Err(_) => return,
             };
-            guard.insight_sent && guard.tool_memory_done
+            guard.insight_sent && guard.usage_done
         };
         if complete {
             return;
@@ -375,28 +333,23 @@ async fn run_insight_stream_parser(
     }
 }
 
-fn filter_tool_memory_updates(
-    updates: &mut Vec<ToolMemoryUpdate>,
+fn filter_usage_observations(
+    observations: &mut Vec<UsageObservation>,
     used_capabilities: &[String],
 ) -> usize {
-    let before = updates.len();
-    updates.retain(|update| {
+    let before = observations.len();
+    observations.retain(|observation| {
         used_capabilities
             .iter()
-            .any(|id| id == &update.capability_id)
+            .any(|id| id == &observation.capability_id)
     });
-    before - updates.len()
+    before - observations.len()
 }
 
-async fn publish_insight(
-    pool: &AgentPool,
-    turn_id: &str,
-    insight: InsightResult,
-    tool_memory: Vec<ToolMemoryUpdate>,
-) {
+async fn publish_insight(pool: &AgentPool, turn_id: &str, insight: InsightResult) {
     let output = InsightOutput {
         insight,
-        tool_memory,
+        usage_observations: vec![],
     };
     pool.set_insight(turn_id, output).await;
     if let Err(e) = pool.send_insight_done(turn_id).await {
@@ -419,7 +372,9 @@ fn build_insight_prompt(
     let base = if let Some(dir) = prompts_dir {
         read_platform_prompt(dir, "insight_platform.md")
     } else {
-        String::from("You are the Insight Platform. Perform a three-question self-check on the execution results.")
+        String::from(
+            "You are the Insight Platform. Judge whether the current direction is still correct.",
+        )
     };
     let constraints_str = if constraints.is_empty() {
         "none".to_string()
@@ -434,53 +389,53 @@ fn build_insight_prompt(
 
     let execution_section = match execution {
         Some(exec) => {
-            let nodes_summary = exec
-                .node_results
+            let actions = exec
+                .lifecycle_actions
                 .iter()
-                .map(format_node_result)
+                .map(format_lifecycle_record)
                 .collect::<Vec<_>>()
                 .join("\n---\n");
-
-            let failed_nodes: Vec<&NodeResult> = exec
-                .node_results
+            let failed: Vec<&CapabilityLifecycleRecord> = exec
+                .lifecycle_actions
                 .iter()
-                .filter(|nr| nr.status == NodeStatus::Failed)
+                .filter(|record| {
+                    matches!(
+                        record.lifecycle_state,
+                        CapabilityLifecycleState::Failed | CapabilityLifecycleState::Rejected
+                    )
+                })
                 .collect();
-
-            let failure_summary = if failed_nodes.is_empty() {
-                "No failures detected.".to_string()
+            let failure_summary = if failed.is_empty() {
+                "No failed or rejected lifecycle actions.".to_string()
             } else {
-                let mut lines = vec![format!("{} node(s) failed:", failed_nodes.len())];
-                for nr in &failed_nodes {
+                let mut lines = vec![format!(
+                    "{} lifecycle action(s) failed/rejected:",
+                    failed.len()
+                )];
+                for record in &failed {
                     lines.push(format!(
-                        "  - node_id={}, error={}",
-                        nr.node_id,
-                        nr.error.as_deref().unwrap_or("unknown")
+                        "  - capability_id={}, error={}",
+                        record.capability_id,
+                        record.error.as_deref().unwrap_or("unknown")
                     ));
                 }
                 lines.join("\n")
             };
-
-            let dag_design = serde_json::to_string_pretty(&exec.dag)
-                .unwrap_or_else(|_| format!("{:?}", exec.dag));
-
             format!(
-                "## Execution Design (DAG)\n\n{}\n\n## Execution Results\n\n**Overall Status:** {:?}\n\n**Node Results:**\n{}\n\n## Failure Summary\n\n{}",
-                dag_design,
-                exec.status,
-                nodes_summary,
+                "## Execution Direction\n\n**task_design:** {}\n\n**task_status:** {}\n\n## Lifecycle Actions\n\n{}\n\n## Failure Summary\n\n{}",
+                exec.task_design,
+                exec.task_status,
+                actions,
                 failure_summary,
             )
         }
-        None => {
-            "## Execution\n\n(本轮无执行——say-only 轮，无工具调用。请基于 Goal 与对话内容做三问自检。)"
-                .to_string()
-        }
+        None => "## Execution\n\n(本轮无执行——say-only 轮。请基于 Goal 与对话内容判断方向。)"
+            .to_string(),
     };
 
     let used_capabilities = execution_capability_ids(execution);
     let capability_section = if used_capabilities.is_empty() {
-        "## Actual Capability IDs Used This Turn\n\n(none — 执行中台没有记录到任何能力调用；tool_memory 必须为空)"
+        "## Actual Capability IDs Used This Turn\n\n(none — 没有能力调用证据；usage_observations 必须为空)"
             .to_string()
     } else {
         let lines = used_capabilities
@@ -489,29 +444,19 @@ fn build_insight_prompt(
             .collect::<Vec<_>>()
             .join("\n");
         format!(
-            "## Actual Capability IDs Used This Turn\n\n{lines}\n\n规则：tool_memory 中的 capability_id 只能是上述 id 之一。禁止使用上述列表之外的能力名。"
+            "## Actual Capability IDs Used This Turn\n\n{lines}\n\n规则：usage_observations 中的 capability_id 只能是上述 id 之一。禁止使用上述列表之外的能力名。"
         )
     };
 
     let trace_hint = format!(
-        "## Trace Access\n\n\
-         本轮的完整执行记录已落盘，可按索引查证：\n\
-         - 索引格式: `turn_id={turn_id}` + `node_id=<节点id>`\n\
-         - 通过执行记录读取能力获取单个节点的原始工具调用、参数与输出\n\
-         - 需要核对某个节点的细节（原始参数/输出/错误堆栈）时，先按节点 id 查证，再作判断\n"
+        "## Trace Access\n\n本轮能力调用日志已落盘。判断方向时以 lifecycle_actions 中的 START/OK/FAIL 证据为准，不把计划或总结当作完成事实。turn_id={turn_id}\n"
     );
 
     let pool_summary = build_pool_snapshot_summary(pool_snapshot);
 
     format!(
         "{}\n\n## Task Input\n\n**Goal:** {}\n\n**Constraints:**\n{}\n\n{}\n\n{}\n\n{}\n\n## Agent Pool Status\n\n{}",
-        base,
-        goal,
-        constraints_str,
-        execution_section,
-        capability_section,
-        trace_hint,
-        pool_summary,
+        base, goal, constraints_str, execution_section, capability_section, trace_hint, pool_summary,
     )
 }
 
@@ -520,29 +465,23 @@ fn execution_capability_ids(execution: Option<&ExecutionOutput>) -> Vec<String> 
         return Vec::new();
     };
     let mut ids = Vec::new();
-
-    // 以执行中台节点日志里的真实调用证据为准，而不是以执行设计（DAG/Single）
-    // 声明的能力为准：设计里的能力可能被跳过或从未执行，若把它们列入
-    // tool_memory 允许列表，仍然会给幻觉写入留口子。
-    for node_result in &execution.node_results {
-        for log in &node_result.tool_call_logs {
-            if let Some(id) = capability_id_from_tool_log(log) {
+    for record in &execution.lifecycle_actions {
+        if !record.capability_id.is_empty() {
+            ids.push(record.capability_id.clone());
+        }
+        for log in &record.capability_call_logs {
+            if let Some(id) = capability_id_from_call_log(log) {
                 ids.push(id);
             }
         }
     }
-
     ids.sort();
     ids.dedup();
     ids
 }
 
-fn capability_id_from_tool_log(line: &str) -> Option<String> {
+fn capability_id_from_call_log(line: &str) -> Option<String> {
     let trimmed = line.trim();
-    if let Some(rest) = trimmed.strip_prefix("prefilled_call: ") {
-        let id = rest.split_whitespace().next().unwrap_or("").trim();
-        return (!id.is_empty()).then(|| id.to_string());
-    }
     for prefix in ["START ", "OK ", "FAIL "] {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
             let id = rest.split(':').next().unwrap_or("").trim();
@@ -554,13 +493,72 @@ fn capability_id_from_tool_log(line: &str) -> Option<String> {
     None
 }
 
+fn format_lifecycle_record(record: &CapabilityLifecycleRecord) -> String {
+    let mut lines = vec![
+        format!("  capability_id: {}", record.capability_id),
+        format!("  lifecycle_state: {:?}", record.lifecycle_state),
+        format!("  arguments_summary: {}", record.arguments_summary),
+    ];
+    if let Some(error) = &record.error {
+        lines.push(format!("  error: {error}"));
+    }
+    if let Some(invocation_ref) = &record.invocation_ref {
+        lines.push(format!("  invocation_ref: {invocation_ref}"));
+    }
+    if !record.capability_call_logs.is_empty() {
+        lines.push("  capability_call_logs:".to_string());
+        for log in &record.capability_call_logs {
+            lines.push(format!("    - {log}"));
+        }
+    }
+    lines.join("\n")
+}
+
+fn fallback_insight(execution: Option<&ExecutionOutput>) -> InsightResult {
+    let text = match execution {
+        None => {
+            "本轮无执行，属于纯对话轮；没有能力调用证据需要复核，也不产生能力使用观察。".to_string()
+        }
+        Some(execution) => {
+            let failed: Vec<&CapabilityLifecycleRecord> = execution
+                .lifecycle_actions
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.lifecycle_state,
+                        CapabilityLifecycleState::Failed | CapabilityLifecycleState::Rejected
+                    )
+                })
+                .collect();
+            if failed.is_empty() {
+                "本轮生命周期动作已受理或完成；方向是否真正正确仍需以实际产物和下一轮 subagent 结果为最终证据。".to_string()
+            } else {
+                let ids = failed
+                    .iter()
+                    .map(|record| record.capability_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if failed.len() == execution.lifecycle_actions.len() {
+                    format!(
+                        "本轮全部生命周期动作失败/被拒绝（{ids}），应先修正原因再继续，不把计划或总结当作完成。"
+                    )
+                } else {
+                    format!(
+                        "本轮部分生命周期动作失败/被拒绝（{ids}）。已受理/完成的事实可保留，失败项需在下一轮修正。"
+                    )
+                }
+            }
+        }
+    };
+    InsightResult { insight: text }
+}
+
 fn build_pool_snapshot_summary(snapshot: &[AgentEntry]) -> String {
     if snapshot.is_empty() {
         return "Agent pool is empty (no agents registered).".to_string();
     }
 
     let mut lines = vec![format!("Total agents in pool: {}", snapshot.len())];
-
     let mut thinking_count = 0;
     let mut execution_count = 0;
     let mut insight_count = 0;
@@ -582,13 +580,11 @@ fn build_pool_snapshot_summary(snapshot: &[AgentEntry]) -> String {
     }
 
     lines.push(format!(
-        "  Platforms: execution={}, insight={}, memory={}",
-        execution_count, insight_count, memory_count
+        "  Platforms: execution={execution_count}, insight={insight_count}, memory={memory_count}"
     ));
-    lines.push(format!("  Thinking engines (active): {}", thinking_count));
+    lines.push(format!("  Thinking engines (active): {thinking_count}"));
     lines.push(format!(
-        "  Subagents: running={}, pending={}, resident={}",
-        subagent_running, subagent_pending, subagent_resident
+        "  Subagents: running={subagent_running}, pending={subagent_pending}, resident={subagent_resident}"
     ));
 
     let idle = snapshot
@@ -604,8 +600,7 @@ fn build_pool_snapshot_summary(snapshot: &[AgentEntry]) -> String {
         .filter(|e| e.status == AgentStatus::Pending)
         .count();
     lines.push(format!(
-        "  By status: idle={}, running={}, pending={}",
-        idle, running, pending
+        "  By status: idle={idle}, running={running}, pending={pending}"
     ));
 
     for entry in snapshot {
@@ -635,69 +630,13 @@ fn build_pool_snapshot_summary(snapshot: &[AgentEntry]) -> String {
     lines.join("\n")
 }
 
-fn format_node_result(nr: &NodeResult) -> String {
-    let mut lines = vec![
-        format!("  node_id: {}", nr.node_id),
-        format!("  status: {:?}", nr.status),
-        format!("  summary: {}", nr.summary),
-        format!("  tool_call_count: {}", nr.tool_call_count),
-    ];
-
-    if let Some(ref err) = nr.error {
-        lines.push(format!("  error: {}", err));
-    }
-
-    if !nr.tool_call_logs.is_empty() {
-        lines.push("  tool_call_logs:".to_string());
-        for log in &nr.tool_call_logs {
-            lines.push(format!("    - {}", log));
-        }
-    }
-
-    lines.join("\n")
-}
-
-fn fallback_insight(execution: Option<&ExecutionOutput>) -> InsightResult {
-    let text = match execution {
-        None => {
-            "本轮无执行，属于纯对话轮；没有执行证据需要复核，也没有可沉淀的工具经验。".to_string()
-        }
-        Some(execution) => {
-            let failed: Vec<&NodeResult> = execution
-                .node_results
-                .iter()
-                .filter(|node| node.status == NodeStatus::Failed)
-                .collect();
-            if failed.is_empty() {
-                "执行平台所有节点均完成，节点状态与工具日志一致；目标是否真正达成仍需以实际产物为最终证据。".to_string()
-            } else {
-                let ids = failed
-                    .iter()
-                    .map(|node| node.node_id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                if failed.len() == execution.node_results.len() {
-                    format!(
-                        "执行平台所有节点失败（{ids}），本轮没有可用的执行证据；应先修正失败原因再继续，不把计划或总结当作完成。"
-                    )
-                } else {
-                    format!(
-                        "执行平台部分失败（{ids}）。已完成节点可保留证据，失败节点需在下一轮修正后重试；本轮不能视为最终完成。"
-                    )
-                }
-            }
-        }
-    };
-    InsightResult { insight: text }
-}
-
 pub async fn run(
     pool: Arc<AgentPool>,
     rx: mpsc::Receiver<AgentMessage>,
     provider: Arc<dyn LlmProvider>,
     model_row: ModelRow,
     api_key: SecretString,
-    tool_memory_tx: mpsc::Sender<Vec<ToolMemoryUpdate>>,
+    usage_observation_tx: mpsc::Sender<Vec<UsageObservation>>,
     prompts_dir: Option<PathBuf>,
 ) {
     let platform = InsightPlatform::new(
@@ -706,7 +645,7 @@ pub async fn run(
         provider,
         model_row,
         api_key,
-        tool_memory_tx,
+        usage_observation_tx,
         prompts_dir,
     );
     let handle = platform.spawn();
@@ -720,82 +659,59 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::super::communication::{
-        ExecutionDag, ExecutionOutput, ExecutionStatus, NodeResult, NodeStatus,
-    };
     use super::*;
-    use std::time::Instant;
+    use crate::agent::communication::CapabilityLifecycleRecord;
 
-    fn make_agent_entry(id: &str, identity: AgentIdentity, status: AgentStatus) -> AgentEntry {
-        AgentEntry {
-            id: id.into(),
-            identity,
-            status,
-            created_at: Instant::now(),
-            last_heartbeat: Instant::now(),
-            heartbeat_source: None,
+    fn record(
+        capability_id: &str,
+        state: CapabilityLifecycleState,
+        logs: Vec<String>,
+        error: Option<String>,
+    ) -> CapabilityLifecycleRecord {
+        CapabilityLifecycleRecord {
+            capability_id: capability_id.into(),
+            capability_name: String::new(),
+            arguments_summary: "{}".into(),
+            lifecycle_state: state,
+            invocation_ref: Some("inv_1".into()),
+            error,
+            capability_call_logs: logs,
         }
     }
 
-    fn execution(status: ExecutionStatus, nodes: Vec<NodeResult>) -> ExecutionOutput {
+    fn execution_with(actions: Vec<CapabilityLifecycleRecord>) -> ExecutionOutput {
         ExecutionOutput {
-            dag: ExecutionDag::Single {
-                template_kind: "normal".into(),
-                capability_ids: vec![],
-                task_context: "test".into(),
-            },
-            node_results: nodes,
-            status,
-        }
-    }
-
-    fn node(id: &str, status: NodeStatus) -> NodeResult {
-        NodeResult {
-            node_id: id.into(),
-            status,
-            summary: String::new(),
-            error: None,
-            tool_call_count: 0,
-            tool_call_logs: vec![],
+            task_design: "设计".into(),
+            task_status: "等待".into(),
+            lifecycle_actions: actions,
+            subagent_states: vec![],
         }
     }
 
     #[test]
     fn parse_valid_insight_raw_output() {
-        let json = r#"{"insight":"执行证据已核对：文件真实存在且内容符合目标。","tool_memory":[]}"#;
-        let raw = parse_insight_output(json).unwrap();
-        assert_eq!(
-            raw.insight.as_deref(),
-            Some("执行证据已核对：文件真实存在且内容符合目标。")
-        );
-        assert!(raw.tool_memory.is_empty());
+        let raw =
+            parse_insight_output(r#"{"insight":"方向正确","usage_observations":[]}"#).unwrap();
+        assert_eq!(raw.insight.as_deref(), Some("方向正确"));
+        assert!(raw.usage_observations.is_empty());
     }
 
     #[test]
-    fn parse_insight_raw_with_tool_memory() {
-        let json = r#"{"insight":"file.read 本轮超时，需要沉淀失败经验。","tool_memory":[{"capability_id":"file.read","description_patch":"add: handles timeout","rating":"degraded","note":"timed out on large file"}]}"#;
-        let raw = parse_insight_output(json).unwrap();
-        assert_eq!(
-            raw.insight.as_deref(),
-            Some("file.read 本轮超时，需要沉淀失败经验。")
-        );
-        assert_eq!(raw.tool_memory.len(), 1);
-        assert_eq!(raw.tool_memory[0].capability_id, "file.read");
-        assert_eq!(raw.tool_memory[0].rating, "degraded");
-    }
-
-    #[test]
-    fn parse_insight_in_code_block() {
-        let text = "前缀\n```json\n{\"insight\":\"目标未达成，缺验证文件。\",\"tool_memory\":[]}\n```\n后缀";
-        let raw = parse_insight_output(text).unwrap();
-        assert_eq!(raw.insight.as_deref(), Some("目标未达成，缺验证文件。"));
+    fn parse_insight_raw_with_usage_observation() {
+        let raw = parse_insight_output(
+            r#"{"insight":"file.read 大文件超时","usage_observations":[{"capability_id":"file.read","observation":"大文件超时","suggestion":"分块读取"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(raw.usage_observations.len(), 1);
+        assert_eq!(raw.usage_observations[0].capability_id, "file.read");
+        assert_eq!(raw.usage_observations[0].suggestion, "分块读取");
     }
 
     #[test]
     fn parse_insight_output_invalid_returns_none_insight() {
         let raw = parse_insight_output("garbage").unwrap();
         assert!(raw.insight.is_none());
-        assert!(raw.tool_memory.is_empty());
+        assert!(raw.usage_observations.is_empty());
     }
 
     #[test]
@@ -805,280 +721,94 @@ mod tests {
             Some("判断完成")
         );
         assert_eq!(
-            extract_json_string_field_prefix(
-                r#"{"insight":"判断完成","tool_memory":[]}"#,
-                "insight"
-            )
-            .as_deref(),
-            Some("判断完成")
-        );
-        assert_eq!(
             extract_json_string_field_prefix(r#"{"insight":"判"#, "insight"),
             None
         );
-        assert_eq!(
-            extract_json_string_field_prefix(r#"{"other":1}"#, "insight"),
-            None
-        );
     }
 
     #[test]
-    fn filter_tool_memory_updates_keeps_only_used_capabilities() {
-        let mut updates = vec![
-            ToolMemoryUpdate {
+    fn filter_usage_observations_keeps_only_used_capabilities() {
+        let mut observations = vec![
+            UsageObservation {
                 capability_id: "file.read".into(),
-                description_patch: "keep".into(),
-                rating: "good".into(),
-                note: String::new(),
+                observation: "keep".into(),
+                suggestion: "keep".into(),
             },
-            ToolMemoryUpdate {
+            UsageObservation {
                 capability_id: "ghost.cap".into(),
-                description_patch: "drop".into(),
-                rating: "good".into(),
-                note: String::new(),
+                observation: "drop".into(),
+                suggestion: "drop".into(),
             },
         ];
-        let dropped = filter_tool_memory_updates(&mut updates, &["file.read".to_string()]);
+        let dropped = filter_usage_observations(&mut observations, &["file.read".to_string()]);
         assert_eq!(dropped, 1);
-        assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].capability_id, "file.read");
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].capability_id, "file.read");
     }
 
     #[test]
-    fn format_node_result_includes_error_and_logs() {
-        let nr = NodeResult {
-            node_id: "n1".into(),
-            status: NodeStatus::Failed,
-            summary: "failed".into(),
-            error: Some("timeout".into()),
-            tool_call_count: 3,
-            tool_call_logs: vec!["call 1: failed".into(), "call 2: timeout".into()],
-        };
-        let formatted = format_node_result(&nr);
-        assert!(formatted.contains("n1"));
-        assert!(formatted.contains("Failed"));
-        assert!(formatted.contains("timeout"));
-        assert!(formatted.contains("tool_call_logs"));
-        assert!(formatted.contains("call 1: failed"));
-    }
-
-    #[test]
-    fn build_insight_prompt_contains_failure_info() {
-        let execution = execution(
-            ExecutionStatus::Failure,
-            vec![NodeResult {
-                node_id: "n1".into(),
-                status: NodeStatus::Failed,
-                summary: "".into(),
-                error: Some("connection refused".into()),
-                tool_call_count: 1,
-                tool_call_logs: vec!["HTTP GET /api → connection refused".into()],
-            }],
-        );
-
-        let prompt = build_insight_prompt("turn-1", "test goal", &[], Some(&execution), &[], None);
-        assert!(prompt.contains("test goal"));
-        assert!(prompt.contains("Failure"));
-        assert!(prompt.contains("n1"));
-        assert!(prompt.contains("connection refused"));
-        assert!(prompt.contains("HTTP GET"));
-        assert!(prompt.contains("Execution Design (DAG)"));
-        assert!(prompt.contains("turn_id=turn-1"));
-        assert!(prompt.contains("Trace Access"));
-    }
-
-    #[test]
-    fn build_insight_prompt_includes_pool_snapshot() {
-        let execution = execution(
-            ExecutionStatus::Success,
-            vec![node("n1", NodeStatus::Completed)],
-        );
-        let snapshot = vec![
-            make_agent_entry(
-                "exec-plat",
-                AgentIdentity::ExecutionPlatform,
-                AgentStatus::Running,
-            ),
-            make_agent_entry(
-                "insight-plat",
-                AgentIdentity::InsightPlatform,
-                AgentStatus::Idle,
-            ),
-            make_agent_entry(
-                "sub-1",
-                AgentIdentity::SubagentRunning {
-                    agent_id: "sub-1".into(),
-                },
-                AgentStatus::Running,
-            ),
-        ];
-
-        let prompt = build_insight_prompt(
-            "turn-1",
-            "test goal",
-            &[],
-            Some(&execution),
-            &snapshot,
+    fn execution_capability_ids_reads_lifecycle_evidence() {
+        let execution = execution_with(vec![record(
+            "subagent.run",
+            CapabilityLifecycleState::Accepted,
+            vec!["START subagent.run: accepted".into()],
             None,
+        )]);
+        assert_eq!(
+            execution_capability_ids(Some(&execution)),
+            vec!["subagent.run"]
         );
-        assert!(prompt.contains("Agent Pool Status"));
-        assert!(prompt.contains("Total agents in pool: 3"));
-        assert!(prompt.contains("execution=1"));
-        assert!(prompt.contains("insight=1"));
-        assert!(prompt.contains("Subagents: running=1"));
     }
 
     #[test]
-    fn build_pool_snapshot_summary_empty() {
-        assert!(build_pool_snapshot_summary(&[]).contains("empty"));
+    fn build_insight_prompt_contains_lifecycle_failure() {
+        let execution = execution_with(vec![record(
+            "subagent.create",
+            CapabilityLifecycleState::Rejected,
+            vec!["FAIL subagent.create: bad template".into()],
+            Some("bad template".into()),
+        )]);
+        let prompt = build_insight_prompt("turn-1", "goal", &[], Some(&execution), &[], None);
+        assert!(prompt.contains("goal"));
+        assert!(prompt.contains("task_design"));
+        assert!(prompt.contains("task_status"));
+        assert!(prompt.contains("subagent.create"));
+        assert!(prompt.contains("bad template"));
+        assert!(prompt.contains("Actual Capability IDs Used This Turn"));
     }
 
     #[test]
-    fn build_pool_snapshot_summary_with_agents() {
-        let snapshot = vec![
-            make_agent_entry(
-                "t1",
-                AgentIdentity::ThinkingEngine {
-                    instance_id: "inst-1".into(),
-                },
-                AgentStatus::Running,
-            ),
-            make_agent_entry("e1", AgentIdentity::ExecutionPlatform, AgentStatus::Running),
-        ];
-        let summary = build_pool_snapshot_summary(&snapshot);
-        assert!(summary.contains("Total agents in pool: 2"));
-        assert!(summary.contains("ThinkingEngine(inst-1)"));
-        assert!(summary.contains("ExecutionPlatform"));
-        assert!(summary.contains("By status: idle=0, running=2, pending=0"));
+    fn build_insight_prompt_none_execution_marks_say_only() {
+        let prompt = build_insight_prompt("turn-1", "用户说你好", &[], None, &[], None);
+        assert!(prompt.contains("say-only"));
+        assert!(prompt.contains("用户说你好"));
     }
 
     #[test]
-    fn fallback_insight_all_success() {
-        let result = fallback_insight(Some(&execution(
-            ExecutionStatus::Success,
-            vec![node("n1", NodeStatus::Completed)],
-        )));
-        assert!(result.insight.contains("所有节点均完成"));
+    fn fallback_insight_reports_rejected() {
+        let result = fallback_insight(Some(&execution_with(vec![record(
+            "subagent.run",
+            CapabilityLifecycleState::Rejected,
+            vec![],
+            Some("sleeping".into()),
+        )])));
+        assert!(result.insight.contains("失败/被拒绝"));
     }
 
     #[test]
-    fn fallback_insight_all_failed() {
-        let result = fallback_insight(Some(&execution(
-            ExecutionStatus::Failure,
-            vec![node("n1", NodeStatus::Failed)],
-        )));
-        assert!(result.insight.contains("所有节点失败"));
-        assert!(result.insight.contains("n1"));
-    }
-
-    #[test]
-    fn fallback_insight_partial_failure() {
-        let result = fallback_insight(Some(&execution(
-            ExecutionStatus::PartialFailure,
-            vec![
-                node("n1", NodeStatus::Completed),
-                node("n2", NodeStatus::Failed),
-            ],
-        )));
-        assert!(result.insight.contains("部分失败"));
-        assert!(result.insight.contains("n2"));
+    fn fallback_insight_accepted_is_not_success_claim() {
+        let result = fallback_insight(Some(&execution_with(vec![record(
+            "subagent.run",
+            CapabilityLifecycleState::Accepted,
+            vec![],
+            None,
+        )])));
+        assert!(result.insight.contains("受理或完成"));
     }
 
     #[test]
     fn fallback_insight_none_execution_say_only() {
         let result = fallback_insight(None);
         assert!(result.insight.contains("纯对话轮"));
-    }
-
-    #[test]
-    fn build_insight_prompt_none_execution_marks_say_only() {
-        let prompt = build_insight_prompt("turn-1", "用户说你好", &[], None, &[], None);
-        assert!(prompt.contains("say-only"), "应标注无执行轮: {prompt}");
-        assert!(prompt.contains("用户说你好"), "goal 应包含 say 内容");
-    }
-
-    #[test]
-    fn capability_id_from_tool_log_parses_evidence_lines() {
-        assert_eq!(
-            capability_id_from_tool_log("START file.read: args={...}"),
-            Some("file.read".to_string())
-        );
-        assert_eq!(
-            capability_id_from_tool_log("  OK shell.exec: done"),
-            Some("shell.exec".to_string())
-        );
-        assert_eq!(
-            capability_id_from_tool_log("FAIL code.exec: boom"),
-            Some("code.exec".to_string())
-        );
-        assert_eq!(
-            capability_id_from_tool_log("prefilled_call: text.grep"),
-            Some("text.grep".to_string())
-        );
-        assert_eq!(capability_id_from_tool_log("DONE: all good"), None);
-        assert_eq!(capability_id_from_tool_log("noise"), None);
-    }
-
-    #[test]
-    fn execution_capability_ids_extracts_actual_tool_evidence() {
-        let execution = ExecutionOutput {
-            dag: ExecutionDag::Single {
-                template_kind: "normal".into(),
-                capability_ids: vec!["file.read".into()],
-                task_context: "test".into(),
-            },
-            node_results: vec![NodeResult {
-                node_id: "n1".into(),
-                status: NodeStatus::Completed,
-                summary: "done".into(),
-                error: None,
-                tool_call_count: 2,
-                tool_call_logs: vec![
-                    "START shell.exec: args={\"command\":\"ls\"}".into(),
-                    "OK file.write: wrote 1 byte".into(),
-                    "FAIL path.exists: denied".into(),
-                    "DONE: finished".into(),
-                ],
-            }],
-            status: ExecutionStatus::Success,
-        };
-
-        assert_eq!(
-            execution_capability_ids(Some(&execution)),
-            vec![
-                "file.write".to_string(),
-                "path.exists".to_string(),
-                "shell.exec".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn build_insight_prompt_lists_allowed_capability_ids() {
-        let execution = ExecutionOutput {
-            dag: ExecutionDag::Dag {
-                nodes: vec![super::super::communication::DagNode {
-                    id: "n1".into(),
-                    template_kind: "dag".into(),
-                    capability_ids: vec!["file.read".into()],
-                    task_context: "read".into(),
-                    depends_on: vec![],
-                }],
-            },
-            node_results: vec![NodeResult {
-                node_id: "n1".into(),
-                status: NodeStatus::Completed,
-                summary: "done".into(),
-                error: None,
-                tool_call_count: 1,
-                tool_call_logs: vec!["START file.read: args={\"path\":\"a.txt\"}".into()],
-            }],
-            status: ExecutionStatus::Success,
-        };
-
-        let prompt = build_insight_prompt("turn-1", "goal", &[], Some(&execution), &[], None);
-        assert!(prompt.contains("Actual Capability IDs Used This Turn"));
-        assert!(prompt.contains("- file.read"));
-        assert!(prompt.contains("tool_memory 中的 capability_id 只能是上述 id 之一"));
     }
 }

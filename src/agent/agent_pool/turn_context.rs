@@ -122,7 +122,8 @@ pub type SharedTurnContextStore = Arc<RwLock<TurnContextStore>>;
 #[cfg(test)]
 mod tests {
     use super::super::super::communication::{
-        ExecutionDag, ExecutionStatus, ThinkDecision, ThinkingOutput,
+        CapabilityLifecycleRecord, CapabilityLifecycleState, ExecutionOutput, ThinkDecision,
+        ThinkingOutput,
     };
     use super::*;
 
@@ -206,13 +207,18 @@ mod tests {
         store.create(make_ctx("t1"));
 
         let output = ExecutionOutput {
-            dag: ExecutionDag::Single {
-                template_kind: "normal".into(),
-                capability_ids: vec![],
-                task_context: "test".into(),
-            },
-            node_results: vec![],
-            status: ExecutionStatus::Success,
+            task_design: "test".into(),
+            task_status: "waiting".into(),
+            lifecycle_actions: vec![CapabilityLifecycleRecord {
+                capability_id: "subagent.run".into(),
+                capability_name: "Run Subagent".into(),
+                arguments_summary: "{}".into(),
+                lifecycle_state: CapabilityLifecycleState::Accepted,
+                invocation_ref: None,
+                error: None,
+                capability_call_logs: vec![],
+            }],
+            subagent_states: vec![],
         };
         store.set_execution("t1", output);
         assert_eq!(store.get("t1").unwrap().status, TurnStatus::Insighting);
@@ -227,13 +233,10 @@ mod tests {
         store.set_execution(
             "t1",
             ExecutionOutput {
-                dag: ExecutionDag::Single {
-                    template_kind: "normal".into(),
-                    capability_ids: vec![],
-                    task_context: "test".into(),
-                },
-                node_results: vec![],
-                status: ExecutionStatus::Success,
+                task_design: "test".into(),
+                task_status: "waiting".into(),
+                lifecycle_actions: vec![],
+                subagent_states: vec![],
             },
         );
         assert_eq!(store.get("t1").unwrap().status, TurnStatus::Insighting);
@@ -244,7 +247,7 @@ mod tests {
                 insight: super::super::super::communication::InsightResult {
                     insight: "ok".into(),
                 },
-                tool_memory: vec![],
+                usage_observations: vec![],
             },
         );
         assert_eq!(store.get("t1").unwrap().status, TurnStatus::Memorizing);

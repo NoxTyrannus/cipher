@@ -92,11 +92,22 @@ impl ContextAssembler {
         match &self.agent_pool {
             Some(pool) => {
                 let snapshot = pool.snapshot().await;
-                let text = build_pool_snapshot_text(&snapshot);
+                let subagent_states = pool.subagent_states().await;
+                let text = build_pool_snapshot_text(&snapshot, &subagent_states);
                 if text.is_empty() {
                     String::new()
                 } else {
-                    format!("## Agent Pool Status\n{text}")
+                    // Subagent Status 作为固定开销计入上下文预算，再计算历史动态预算。
+                    let budget = self
+                        .config
+                        .context_window
+                        .saturating_mul(10)
+                        .saturating_div(100)
+                        .max(256);
+                    let bounded = crate::agent::context_assembler::reader::truncate_by_token_budget(
+                        &text, budget,
+                    );
+                    format!("## Agent Pool Status\n{bounded}")
                 }
             }
             None => String::new(),
