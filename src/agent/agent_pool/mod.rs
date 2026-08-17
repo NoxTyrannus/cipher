@@ -9,6 +9,7 @@ use tokio::sync::{watch, RwLock};
 use super::communication::{
     AgentMessage, ExecutionOutput, InsightOutput, MemoryOutput, TurnContext, TurnStatus,
 };
+use super::execution_types::{SubagentLifecycle, SubagentRuntimeState};
 use channels::{create_message_bus, MessageBus, MessageReceivers, TriggerEvent};
 use registry::{AgentEntry, AgentIdentity, AgentStatus, InstanceRegistry, SharedRegistry};
 use scheduler::Scheduler;
@@ -17,6 +18,9 @@ use turn_context::{SharedTurnContextStore, TurnContextStore};
 #[derive(Debug)]
 pub struct AgentPoolSnapshot {
     pub entries: Vec<AgentEntry>,
+    /// subagent 展示状态（持久生命周期 / trigger / startup / last_output 截断）。
+    /// 思考引擎自感知的 subagent 来源（与 entries 的运行时身份分离）。
+    pub subagent_states: Vec<SubagentRuntimeState>,
     pub execution_pending_depth: usize,
     pub insight_pending_depth: usize,
     pub memory_pending_depth: usize,
@@ -32,6 +36,7 @@ impl Clone for AgentPoolSnapshot {
     fn clone(&self) -> Self {
         Self {
             entries: self.entries.clone(),
+            subagent_states: self.subagent_states.clone(),
             execution_pending_depth: self.execution_pending_depth,
             insight_pending_depth: self.insight_pending_depth,
             memory_pending_depth: self.memory_pending_depth,
@@ -91,6 +96,7 @@ impl AgentPool {
 
         let initial_snapshot = AgentPoolSnapshot {
             entries: vec![],
+            subagent_states: vec![],
             execution_pending_depth: 0,
             insight_pending_depth: 0,
             memory_pending_depth: 0,
@@ -204,7 +210,17 @@ impl AgentPool {
         self.message_bus.clone()
     }
 
+    /// 注册核心平台身份（思考引擎实例 / 执行 / 洞察 / 记忆中台），仅启动装配使用。
+    ///
+    /// 业务操作禁止触碰四组核心身份：本方法拒绝 subagent 身份，subagent 只能经
+    /// `register_subagent` / `update_subagent_status` / `remove_subagent` 操作。
     pub async fn register_platform(&self, id: &str, identity: AgentIdentity) {
+        if identity.is_subagent() {
+            tracing::warn!(
+                "agent_pool: register_platform 拒绝 subagent 身份（请走 register_subagent）: {id}"
+            );
+            return;
+        }
         let entry = AgentEntry {
             id: id.to_string(),
             identity,
@@ -214,6 +230,53 @@ impl AgentPool {
             heartbeat_source: None,
         };
         self.registry.write().await.register(entry);
+    }
+
+    /// 注册 subagent 运行时身份 + 展示状态（业务侧唯一注册入口）。
+    pub async fn register_subagent(&self, state: SubagentRuntimeState, status: AgentStatus) {
+        self.registry.write().await.register_subagent(state, status);
+    }
+
+    /// 更新 subagent 运行身份状态（idle/running/pending）。
+    pub async fn update_subagent_status(&self, id: &str, status: AgentStatus) {
+        self.registry
+            .write()
+            .await
+            .update_subagent_status(id, status);
+    }
+
+    /// 更新 subagent 持久生命周期（展示状态）。
+    pub async fn update_subagent_lifecycle(&self, id: &str, lifecycle: SubagentLifecycle) {
+        self.registry
+            .write()
+            .await
+            .set_subagent_lifecycle(id, lifecycle);
+    }
+
+    /// 更新 subagent last_output 有界截断文本（供快照/思考引擎异步感知）。
+    pub async fn set_subagent_last_output(&self, id: &str, truncated: Option<String>) {
+        self.registry
+            .write()
+            .await
+            .set_subagent_last_output(id, truncated);
+    }
+
+    /// subagent 主动心跳上报（1 秒频率由 subagent 实例侧保证；AgentPool 不轮询业务文件）。
+    pub async fn touch_subagent_heartbeat(&self, subagent_id: &str, source: &str) {
+        self.registry
+            .write()
+            .await
+            .touch_subagent_heartbeat(subagent_id, source);
+    }
+
+    /// 移除 subagent（tombstoned 移出池）。
+    pub async fn remove_subagent(&self, id: &str) {
+        self.registry.write().await.remove_subagent(id);
+    }
+
+    /// subagent 展示状态快照（思考引擎自感知来源）。
+    pub async fn subagent_states(&self) -> Vec<SubagentRuntimeState> {
+        self.registry.read().await.subagent_snapshot()
     }
 
     pub async fn snapshot(&self) -> Vec<AgentEntry> {
@@ -228,15 +291,10 @@ impl AgentPool {
 
     pub async fn snapshot_detailed(&self) -> AgentPoolSnapshot {
         let status = self.platform_status.read().await;
+        let reg = self.registry.read().await;
         let snapshot = AgentPoolSnapshot {
-            entries: self
-                .registry
-                .read()
-                .await
-                .snapshot()
-                .into_iter()
-                .cloned()
-                .collect(),
+            entries: reg.snapshot().into_iter().cloned().collect(),
+            subagent_states: reg.subagent_snapshot(),
             execution_pending_depth: status.execution_pending,
             insight_pending_depth: status.insight_pending,
             memory_pending_depth: status.memory_pending,
@@ -248,6 +306,7 @@ impl AgentPool {
             captured_at: std::time::Instant::now(),
         };
         drop(status);
+        drop(reg);
         let _ = self.state_tx.send(snapshot.clone());
         snapshot
     }
@@ -336,5 +395,163 @@ mod tests {
 
         let msg = receivers.execution_rx.try_recv().unwrap();
         assert!(matches!(msg, AgentMessage::Cancel { .. }));
+    }
+
+    #[tokio::test]
+    async fn pool_register_subagent_and_heartbeat_observable() {
+        let (pool, _receivers) = AgentPool::new();
+        let state = SubagentRuntimeState {
+            subagent_id: "sg_pool".to_string(),
+            lifecycle: SubagentLifecycle::Running,
+            last_output_truncated: None,
+            trigger: Some(serde_json::json!({"type": "schedule"})),
+            startup: super::super::execution_types::SubagentStartup::Scheduled,
+            lifecycle_kind: super::super::execution_types::SubagentLifecycleKind::Resident,
+        };
+        pool.register_subagent(state, AgentStatus::Running).await;
+
+        let before = pool
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|e| e.id == "sg_pool")
+            .expect("entry present")
+            .last_heartbeat;
+        pool.touch_subagent_heartbeat("sg_pool", "subagent-runtime")
+            .await;
+        let after = pool
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|e| e.id == "sg_pool")
+            .expect("entry present")
+            .last_heartbeat;
+        assert!(after >= before);
+        assert_eq!(
+            pool.snapshot()
+                .await
+                .into_iter()
+                .find(|e| e.id == "sg_pool")
+                .unwrap()
+                .heartbeat_source
+                .as_deref(),
+            Some("subagent-runtime")
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_detailed_snapshot_exposes_subagent_display_fields() {
+        let (pool, _receivers) = AgentPool::new();
+        let state = SubagentRuntimeState {
+            subagent_id: "sg_disp".to_string(),
+            lifecycle: SubagentLifecycle::Failed,
+            last_output_truncated: Some("failed: timeout".to_string()),
+            trigger: Some(serde_json::json!({"type": "condition"})),
+            startup: super::super::execution_types::SubagentStartup::Condition,
+            lifecycle_kind: super::super::execution_types::SubagentLifecycleKind::Temporary,
+        };
+        pool.register_subagent(state, AgentStatus::Idle).await;
+
+        let snapshot = pool.snapshot_detailed().await;
+        assert_eq!(snapshot.subagent_states.len(), 1);
+        assert_eq!(snapshot.subagent_states[0].subagent_id, "sg_disp");
+        assert_eq!(
+            snapshot.subagent_states[0].lifecycle,
+            SubagentLifecycle::Failed
+        );
+        assert_eq!(
+            snapshot.subagent_states[0].startup,
+            super::super::execution_types::SubagentStartup::Condition
+        );
+        assert_eq!(
+            snapshot.subagent_states[0].trigger,
+            Some(serde_json::json!({"type": "condition"}))
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_core_four_not_operable_via_subagent_or_business_paths() {
+        let (pool, _receivers) = AgentPool::new();
+        pool.register_platform("execution-platform", AgentIdentity::ExecutionPlatform)
+            .await;
+        pool.register_platform("insight-platform", AgentIdentity::InsightPlatform)
+            .await;
+        pool.register_platform("memory-platform", AgentIdentity::MemoryPlatform)
+            .await;
+
+        // register_platform 拒绝 subagent 身份（subagent 不能伪装成核心身份注册）。
+        pool.register_platform(
+            "fake-subagent",
+            AgentIdentity::SubagentRunning {
+                agent_id: "fake".to_string(),
+            },
+        )
+        .await;
+        let entries = pool.snapshot().await;
+        assert!(entries.iter().all(|e| e.id != "fake-subagent"));
+
+        // 核心身份无法经 subagent 专用方法被修改/移除。
+        pool.update_subagent_status("execution-platform", AgentStatus::Running)
+            .await;
+        pool.touch_subagent_heartbeat("execution-platform", "business")
+            .await;
+        pool.remove_subagent("execution-platform").await;
+        let entries = pool.snapshot().await;
+        assert!(entries.iter().any(|e| e.id == "execution-platform"));
+        assert_eq!(
+            entries
+                .iter()
+                .find(|e| e.id == "execution-platform")
+                .unwrap()
+                .status,
+            AgentStatus::Idle,
+            "核心身份状态不应被业务路径改动"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_subagent_run_status_and_remove() {
+        let (pool, _receivers) = AgentPool::new();
+        let state = SubagentRuntimeState {
+            subagent_id: "sg_run".to_string(),
+            lifecycle: SubagentLifecycle::Created,
+            last_output_truncated: None,
+            trigger: None,
+            startup: super::super::execution_types::SubagentStartup::Normal,
+            lifecycle_kind: super::super::execution_types::SubagentLifecycleKind::Temporary,
+        };
+        pool.register_subagent(state, AgentStatus::Idle).await;
+        pool.update_subagent_status("sg_run", AgentStatus::Running)
+            .await;
+        pool.update_subagent_lifecycle("sg_run", SubagentLifecycle::Running)
+            .await;
+        assert_eq!(
+            pool.snapshot()
+                .await
+                .into_iter()
+                .find(|e| e.id == "sg_run")
+                .unwrap()
+                .status,
+            AgentStatus::Running
+        );
+        assert_eq!(
+            pool.subagent_states().await[0].lifecycle,
+            SubagentLifecycle::Running
+        );
+
+        // failed 实例回 idle 身份但保留在池。
+        pool.update_subagent_lifecycle("sg_run", SubagentLifecycle::Failed)
+            .await;
+        pool.update_subagent_status("sg_run", AgentStatus::Idle)
+            .await;
+        assert_eq!(
+            pool.subagent_states().await[0].lifecycle,
+            SubagentLifecycle::Failed
+        );
+
+        // tombstoned 移出池。
+        pool.remove_subagent("sg_run").await;
+        assert!(pool.subagent_states().await.is_empty());
+        assert!(pool.snapshot().await.iter().all(|e| e.id != "sg_run"));
     }
 }
