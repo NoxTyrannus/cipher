@@ -8,7 +8,7 @@ use crate::data::triviumdb::TriviumDb;
 use crate::logic::builtin::host_context::HostContext;
 #[cfg(test)]
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -16,6 +16,28 @@ use tokio::sync::mpsc;
 pub enum ReloadEvent {
     CapabilityTable(String),
     Agent,
+}
+
+/// subagent spawn hook（v0.3.1 §4.3）：TB runtime 由 TC 安装到 executor。
+///
+/// 执行中台受理 `subagent.create / subagent.run` 后通过本 hook 通知外部 runtime；
+/// hook 未安装时分子仍完成持久化并正常返回。
+pub trait SubagentSpawnHook: Send + Sync {
+    /// 同步通知（runtime 侧如需异步，自行 spawn）。
+    fn notify(&self, event: SubagentSpawnEvent);
+}
+
+/// spawn hook 事件。
+#[derive(Debug, Clone)]
+pub enum SubagentSpawnEvent {
+    /// `subagent.create` 完成，实例已持久化并初始化记忆文件。
+    Created { subagent_id: String },
+    /// `subagent.run` 受理：携带冻结定义快照、本轮输入与 invocation 事实引用。
+    RunAccepted {
+        definition: crate::agent::execution_types::SubagentDefinition,
+        task_input: String,
+        invocation_id: String,
+    },
 }
 
 pub struct CapabilityExecutor {
@@ -26,6 +48,10 @@ pub struct CapabilityExecutor {
     triviumdb: Option<Arc<std::sync::Mutex<TriviumDb>>>,
     thought_store: Option<Arc<ThoughtStore>>,
     reload_tx: Option<mpsc::Sender<ReloadEvent>>,
+    /// `<storage_root>`（全局 invocation 日志与 subagent 记忆文件的根目录）。
+    storage_root: Option<PathBuf>,
+    /// subagent spawn hook（TC 接线安装 TB runtime）。
+    subagent_spawn_hook: Option<Arc<dyn SubagentSpawnHook>>,
 }
 
 const ALLOWED_TABLES: &[&str] = &[
@@ -76,6 +102,9 @@ impl CapabilityExecutor {
             "db.delete" => return self.builtin_db_delete(input),
             "db.query" => return self.builtin_db_query(input),
             name if name.starts_with("memory.") => return self.execute_memory(name, input),
+            name if name.starts_with("subagent.") || name == "usage_method.observe" => {
+                return self.execute_subagent_molecule(name, input)
+            }
             _ => {
                 return Err(AgentError::NotFound(format!(
                     "builtin executor: {builtin_name}"
@@ -93,11 +122,23 @@ impl CapabilityExecutor {
             triviumdb: None,
             thought_store: None,
             reload_tx: None,
+            storage_root: None,
+            subagent_spawn_hook: None,
         }
     }
 
     pub fn set_duckdb(&mut self, db: Arc<std::sync::Mutex<duckdb::Connection>>) {
         self.duckdb = Some(db);
+    }
+
+    /// 设置全局 invocation 日志与 subagent 记忆文件的根目录（`<storage_root>`）。
+    pub fn set_storage_root(&mut self, storage_root: &Path) {
+        self.storage_root = Some(storage_root.to_path_buf());
+    }
+
+    /// 安装 subagent spawn hook（TC 接线安装 TB runtime；未安装时分子仍完成持久化）。
+    pub fn set_subagent_spawn_hook(&mut self, hook: Arc<dyn SubagentSpawnHook>) {
+        self.subagent_spawn_hook = Some(hook);
     }
 
     pub fn set_triviumdb(&mut self, db: Arc<std::sync::Mutex<TriviumDb>>) {
@@ -146,6 +187,26 @@ impl CapabilityExecutor {
             return cap.execute(input);
         }
         Err(AgentError::NotFound(format!("base capability: {}", id)))
+    }
+
+    /// 分发六个 `subagent.*` 分子与 `usage_method.observe` 到 `subagent_capability` 模块。
+    fn execute_subagent_molecule(&self, builtin_name: &str, input: &Schema) -> Result<Schema> {
+        let db = self.duckdb.as_ref().ok_or_else(|| {
+            AgentError::NotFound(format!("{builtin_name}: duckdb not configured"))
+        })?;
+        let storage_root = self.storage_root.as_ref().ok_or_else(|| {
+            AgentError::NotFound(format!("{builtin_name}: storage_root not configured"))
+        })?;
+        let guard = db.lock().map_err(|error| {
+            AgentError::Script(format!("{builtin_name}: duckdb lock poisoned: {error}"))
+        })?;
+        crate::agent::subagent_capability::execute_subagent_capability(
+            &guard,
+            storage_root,
+            builtin_name,
+            input,
+            self.subagent_spawn_hook.as_deref(),
+        )
     }
 
     fn execute_memory(&self, builtin_name: &str, input: &Schema) -> Result<Schema> {
