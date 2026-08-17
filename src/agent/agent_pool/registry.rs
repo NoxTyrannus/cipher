@@ -32,6 +32,18 @@ pub struct AgentEntry {
     pub identity: AgentIdentity,
     pub status: AgentStatus,
     pub created_at: std::time::Instant,
+    /// 最近一次主动上报心跳的时刻（subagent 实例 1 秒一次）。
+    pub last_heartbeat: std::time::Instant,
+    /// 心跳来源标识（如 subagent runtime 的 worker 标识）。
+    pub heartbeat_source: Option<String>,
+}
+
+impl AgentEntry {
+    /// 记录一次主动心跳（1 秒频率由 subagent 实例侧保证，AgentPool 不轮询业务文件）。
+    pub fn touch_heartbeat(&mut self, source: Option<&str>) {
+        self.last_heartbeat = std::time::Instant::now();
+        self.heartbeat_source = source.map(str::to_string);
+    }
 }
 
 pub struct InstanceRegistry {
@@ -104,6 +116,8 @@ mod tests {
             },
             status: AgentStatus::Running,
             created_at: std::time::Instant::now(),
+            last_heartbeat: std::time::Instant::now(),
+            heartbeat_source: None,
         }
     }
 
@@ -151,5 +165,16 @@ mod tests {
         reg.register(make_entry("a1"));
         reg.register(make_entry("a2"));
         assert_eq!(reg.snapshot().len(), 2);
+    }
+
+    #[test]
+    fn registry_entry_heartbeat_fields_and_touch() {
+        let mut entry = make_entry("a1");
+        let before = entry.last_heartbeat;
+        assert_eq!(entry.heartbeat_source, None);
+
+        entry.touch_heartbeat(Some("runtime-worker-1"));
+        assert_eq!(entry.heartbeat_source.as_deref(), Some("runtime-worker-1"));
+        assert!(entry.last_heartbeat >= before);
     }
 }

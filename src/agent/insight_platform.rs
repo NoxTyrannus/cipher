@@ -732,6 +732,8 @@ mod tests {
             identity,
             status,
             created_at: Instant::now(),
+            last_heartbeat: Instant::now(),
+            heartbeat_source: None,
         }
     }
 

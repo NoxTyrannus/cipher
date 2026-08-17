@@ -20,6 +20,39 @@ pub const MEMORY_EXPERIENCE_DEFAULT: &str = include_str!("../../../prompts/memor
 pub const MEMORY_PREFERENCE_DEFAULT: &str = include_str!("../../../prompts/memory_preference.md");
 pub const MEMORY_COGNITIVE_DEFAULT: &str = include_str!("../../../prompts/memory_cognitive.md");
 
+/// 能力调用规范统一片段（v0.3.1 §8）。
+///
+/// **不纳入 DEFAULT_PROMPTS 全局拼接**：仅当 agent 的 available_capabilities 非空时，
+/// 通过 `compose_agent_capability_prompt` 按需拼接到记忆 agent / subagent 模板 prompt。
+pub const CAPABILITY_CALL_DEFAULT: &str = include_str!("../../../prompts/capability_call.md");
+
+/// 能力表注入条目（LLM 可见的能力元信息：id / name / description）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityPromptEntry {
+    pub capability_id: String,
+    pub capability_name: String,
+    pub description: String,
+}
+
+/// 按需组装能力调用提示词片段。
+///
+/// 仅当 `available` 非空时把 `prompts/capability_call.md` 的固定片段与可用能力表拼接到
+/// `base` 之后；`available` 为空时原样返回 `base`（不加载片段）。
+/// 记忆 agent 与 subagent 模板 prompt 必须通过本函数统一拼接，不得复制第二套协议文本。
+pub fn compose_agent_capability_prompt(base: &str, available: &[CapabilityPromptEntry]) -> String {
+    if available.is_empty() {
+        return base.to_string();
+    }
+    let mut table = String::new();
+    for entry in available {
+        table.push_str(&format!(
+            "- `{}` / {}: {}\n",
+            entry.capability_id, entry.capability_name, entry.description
+        ));
+    }
+    format!("{base}\n\n## 可用能力\n{table}{CAPABILITY_CALL_DEFAULT}")
+}
+
 pub const DEFAULT_PROMPTS: [(&str, &str); 11] = [
     ("system.md", SYSTEM_DEFAULT),
     ("SOUL.md", SOUL_DEFAULT),
@@ -140,6 +173,38 @@ mod tests {
         assert_ne!(unni, keep, "UNNI == KEEP 提示词 (per P1.5 应互不相同)");
         assert_ne!(unni, loop_p, "UNNI == LOOP 提示词 (per P1.5 应互不相同)");
         assert_ne!(keep, loop_p, "KEEP == LOOP 提示词 (per P1.5 应互不相同)");
+    }
+
+    #[test]
+    fn capability_call_prompt_is_not_part_of_default_prompts() {
+        assert!(
+            !DEFAULT_PROMPTS
+                .iter()
+                .any(|(name, _)| *name == "capability_call.md"),
+            "capability_call.md 必须按需加载，不得进入 DEFAULT_PROMPTS 全局拼接"
+        );
+        assert!(!CAPABILITY_CALL_DEFAULT.trim().is_empty());
+    }
+
+    #[test]
+    fn compose_agent_capability_prompt_only_loads_when_available_non_empty() {
+        let base = "角色提示词";
+        let empty = compose_agent_capability_prompt(base, &[]);
+        assert_eq!(empty, base);
+        assert!(!empty.contains("可用能力"));
+
+        let available = vec![CapabilityPromptEntry {
+            capability_id: "file.read".to_string(),
+            capability_name: "Read File".to_string(),
+            description: "读取文件".to_string(),
+        }];
+        let composed = compose_agent_capability_prompt(base, &available);
+        assert!(composed.contains("file.read"));
+        assert!(composed.contains("Read File"));
+        assert!(composed.contains("capability_call"));
+        assert!(composed.contains("capability_calls"));
+        assert!(composed.contains("done"));
+        assert!(composed.starts_with(base));
     }
 
     #[test]
