@@ -62,7 +62,7 @@ CREATE TABLE agent (
     name TEXT NOT NULL,
     mode TEXT NOT NULL,
     prompt TEXT,
-    tool_caps JSON NOT NULL DEFAULT '[]',
+    capability_allowlist JSON NOT NULL DEFAULT '[]',
     config JSON,
     display_name TEXT,
     is_default BOOLEAN NOT NULL DEFAULT FALSE,
@@ -125,6 +125,7 @@ const MODEL_COLUMNS: &[&str] = &[
     "updated_at",
 ];
 const AGENT_COLUMNS: &[&str] = &[
+    "capability_allowlist",
     "config",
     "created_at",
     "display_name",
@@ -133,7 +134,6 @@ const AGENT_COLUMNS: &[&str] = &[
     "mode",
     "name",
     "prompt",
-    "tool_caps",
     "updated_at",
 ];
 const BASE_COLUMNS: &[&str] = &[
@@ -188,7 +188,7 @@ pub enum DuckdbMigrationReason {
     MissingCompositeSchemaIn,
     MissingCompositeSchemaOut,
     MissingCompositeExecutor,
-    InvalidToolAuthorization,
+    InvalidCapabilityAuthorization,
     MissingCapabilityId,
     UnknownCapabilityId,
     DuplicateCapabilityId,
@@ -892,7 +892,7 @@ fn migrate_agents(
     for row in rows {
         let (id, name, mode, prompt, tools, config, display_name, is_default, created, updated) =
             row.map_err(|error| migration_error(format!("cannot decode agent row: {error}")))?;
-        let tool_caps = migrate_tool_caps(
+        let capability_allowlist = migrate_capability_allowlist(
             &id,
             tools.as_deref(),
             capability_ids,
@@ -902,7 +902,7 @@ fn migrate_agents(
         target
             .execute(
                 "INSERT INTO agent \
-                 (id, name, mode, prompt, tool_caps, config, display_name, is_default, created_at, updated_at) \
+                 (id, name, mode, prompt, capability_allowlist, config, display_name, is_default, created_at, updated_at) \
                  VALUES (?, ?, ?, ?, CAST(? AS JSON), CAST(? AS JSON), ?, ?, \
                          TRY_CAST(? AS TIMESTAMP), TRY_CAST(? AS TIMESTAMP))",
                 duckdb::params![
@@ -910,7 +910,7 @@ fn migrate_agents(
                     name,
                     mode,
                     prompt,
-                    tool_caps,
+                    capability_allowlist,
                     config,
                     display_name,
                     is_default,
@@ -923,7 +923,7 @@ fn migrate_agents(
     Ok(())
 }
 
-fn migrate_tool_caps(
+fn migrate_capability_allowlist(
     agent_id: &str,
     tools: Option<&str>,
     capability_ids: &CapabilityIds,
@@ -938,7 +938,7 @@ fn migrate_tool_caps(
             issues,
             "agent",
             agent_id,
-            DuckdbMigrationReason::InvalidToolAuthorization,
+            DuckdbMigrationReason::InvalidCapabilityAuthorization,
         );
         return "[]".to_string();
     };
@@ -949,7 +949,7 @@ fn migrate_tool_caps(
                 issues,
                 "agent",
                 agent_id,
-                DuckdbMigrationReason::InvalidToolAuthorization,
+                DuckdbMigrationReason::InvalidCapabilityAuthorization,
             );
             return "[]".to_string();
         };
@@ -966,7 +966,7 @@ fn migrate_tool_caps(
                     issues,
                     "agent",
                     agent_id,
-                    DuckdbMigrationReason::InvalidToolAuthorization,
+                    DuckdbMigrationReason::InvalidCapabilityAuthorization,
                 );
                 return "[]".to_string();
             }
@@ -1535,7 +1535,7 @@ mod tests {
             DuckdbMigrationReason::MissingCompositeSchemaIn,
             DuckdbMigrationReason::MissingCompositeSchemaOut,
             DuckdbMigrationReason::MissingCompositeExecutor,
-            DuckdbMigrationReason::InvalidToolAuthorization,
+            DuckdbMigrationReason::InvalidCapabilityAuthorization,
             DuckdbMigrationReason::MissingCapabilityId,
             DuckdbMigrationReason::UnknownCapabilityId,
             DuckdbMigrationReason::DuplicateCapabilityId,
@@ -1548,7 +1548,7 @@ mod tests {
                 "missing_composite_schema_in",
                 "missing_composite_schema_out",
                 "missing_composite_executor",
-                "invalid_tool_authorization",
+                "invalid_capability_authorization",
                 "missing_capability_id",
                 "unknown_capability_id",
                 "duplicate_capability_id"
@@ -1596,7 +1596,7 @@ mod tests {
 
         let connection = duckdb::Connection::open(staging.join(CANDIDATE_DUCKDB_FILE)).unwrap();
         let agent_columns = column_set(&connection, "agent").unwrap();
-        assert!(agent_columns.contains("tool_caps"));
+        assert!(agent_columns.contains("capability_allowlist"));
         assert!(!agent_columns.contains("tools"));
     }
 
@@ -1630,7 +1630,7 @@ mod tests {
 
         let valid_tools: String = candidate
             .query_row(
-                "SELECT CAST(tool_caps AS VARCHAR) FROM agent WHERE id='agent-valid'",
+                "SELECT CAST(capability_allowlist AS VARCHAR) FROM agent WHERE id='agent-valid'",
                 [],
                 |row| row.get(0),
             )
@@ -1641,7 +1641,7 @@ mod tests {
         );
         let invalid_tools: String = candidate
             .query_row(
-                "SELECT CAST(tool_caps AS VARCHAR) FROM agent WHERE id='agent-invalid'",
+                "SELECT CAST(capability_allowlist AS VARCHAR) FROM agent WHERE id='agent-invalid'",
                 [],
                 |row| row.get(0),
             )

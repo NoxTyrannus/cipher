@@ -306,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn authorized_dispatch_uses_actor_tool_caps_and_authority_name() {
+    fn authorized_dispatch_uses_actor_capability_allowlist_and_authority_name() {
         let mut reg = make_registry_with_echo();
         reg.agents.insert(
             "agent-1".to_string(),
@@ -315,7 +315,7 @@ mod tests {
                 name: "Agent 1".to_string(),
                 mode: "unni".to_string(),
                 prompt: None,
-                tool_caps: vec!["echo".to_string()],
+                capability_allowlist: vec!["echo".to_string()],
                 config: None,
                 display_name: None,
                 is_default: false,
@@ -335,90 +335,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(output, serde_json::json!({"authorized": true}));
-    }
-
-    #[test]
-    fn provider_alias_normalizes_then_dispatch_authorized() {
-        let mut reg = make_registry_with_echo();
-        reg.agents.insert(
-            "agent-1".to_string(),
-            crate::data::duckdb::loader::AgentRow {
-                id: "agent-1".to_string(),
-                name: "Agent 1".to_string(),
-                mode: "unni".to_string(),
-                prompt: None,
-                tool_caps: vec!["echo".to_string()],
-                config: None,
-                display_name: None,
-                is_default: false,
-            },
-        );
-        let exec = make_executor_with_echo();
-        let dispatcher = CapabilityDispatcher::new(&reg, &exec);
-        let service = CapabilityService::new(&reg, &exec).unwrap();
-        let tool_set = service.provider_tools_for_agent("agent-1").unwrap();
-        let alias = tool_set.tools()[0]["function"]["name"]
-            .as_str()
-            .unwrap()
-            .to_string();
-
-        let normalized = tool_set
-            .normalize(&alias, serde_json::json!({"normalized": true}))
-            .unwrap();
-        let output = dispatcher
-            .dispatch_authorized("agent-1", &normalized)
-            .unwrap();
-        assert_eq!(output, serde_json::json!({"normalized": true}));
-
-        let error = tool_set
-            .normalize("echo", serde_json::json!({}))
-            .unwrap_err();
-        assert!(matches!(error, AgentError::NotFound(_)));
-    }
-
-    #[test]
-    fn provider_tool_set_carries_request_tools_and_normalizes() {
-        let mut reg = make_registry_with_echo();
-        reg.agents.insert(
-            "agent-1".to_string(),
-            crate::data::duckdb::loader::AgentRow {
-                id: "agent-1".to_string(),
-                name: "Agent 1".to_string(),
-                mode: "unni".to_string(),
-                prompt: None,
-                tool_caps: vec!["echo".to_string()],
-                config: None,
-                display_name: None,
-                is_default: true,
-            },
-        );
-        let exec = make_executor_with_echo();
-        let dispatcher = CapabilityDispatcher::new(&reg, &exec);
-        let service = CapabilityService::new(&reg, &exec).unwrap();
-        let tool_set = service.provider_tools_for_agent("agent-1").unwrap();
-
-        assert_eq!(tool_set.tools().len(), 1);
-        let alias = tool_set.tools()[0]["function"]["name"]
-            .as_str()
-            .unwrap()
-            .to_string();
-
-        let call = ToolCall {
-            id: "provider-call".to_string(),
-            name: alias,
-            arguments: serde_json::json!({"bound": true}),
-        };
-        let normalized = tool_set
-            .normalize(&call.name, call.arguments.clone())
-            .unwrap();
-        assert_eq!(normalized.capability_id, "echo");
-        assert_eq!(normalized.capability_name, "Echo");
-        assert_eq!(
-            dispatcher
-                .dispatch_authorized("agent-1", &normalized)
-                .unwrap(),
-            serde_json::json!({"bound": true})
-        );
     }
 
     fn make_registry_with_composite(dag: serde_json::Value) -> Registry {

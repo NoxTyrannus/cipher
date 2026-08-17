@@ -6,7 +6,6 @@ use crate::data::duckdb::loader::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,30 +34,6 @@ pub struct CapabilityDefinition {
     pub output_schema: Value,
 }
 
-#[derive(Debug, Clone)]
-pub struct ProviderToolSet {
-    tools: Vec<Value>,
-    aliases: HashMap<String, (String, String)>,
-}
-
-impl ProviderToolSet {
-    pub fn tools(&self) -> &[Value] {
-        &self.tools
-    }
-
-    pub fn normalize(&self, alias: &str, arguments: Value) -> Result<CapabilityCall> {
-        let (capability_id, capability_name) = self
-            .aliases
-            .get(alias)
-            .ok_or_else(|| AgentError::NotFound(format!("provider tool alias: {alias}")))?;
-        Ok(CapabilityCall {
-            capability_id: capability_id.clone(),
-            capability_name: capability_name.clone(),
-            arguments,
-        })
-    }
-}
-
 pub struct CapabilityService<'a> {
     registry: &'a Registry,
     executor: &'a CapabilityExecutor,
@@ -82,7 +57,7 @@ impl<'a> CapabilityService<'a> {
                 AgentError::NotFound(format!("capability actor agent: {agent_id}"))
             })?;
         agent
-            .tool_caps
+            .capability_allowlist
             .iter()
             .map(
                 |capability_id| match self.resolve_contract(capability_id)? {
@@ -125,41 +100,6 @@ impl<'a> CapabilityService<'a> {
             .collect()
     }
 
-    pub fn provider_tools_for_agent(&self, agent_id: &str) -> Result<ProviderToolSet> {
-        let definitions = self.definitions_for_agent(agent_id)?;
-        let mut tools = Vec::with_capacity(definitions.len());
-        let mut aliases = HashMap::with_capacity(definitions.len());
-        for definition in definitions {
-            let alias = provider_alias(&definition);
-            if aliases
-                .insert(
-                    alias.clone(),
-                    (
-                        definition.capability_id.clone(),
-                        definition.capability_name.clone(),
-                    ),
-                )
-                .is_some()
-            {
-                return Err(AgentError::Bootstrap(
-                    "provider capability alias collision".to_string(),
-                ));
-            }
-            tools.push(serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": alias,
-                    "description": format!(
-                        "[capability_id={}] {}",
-                        definition.capability_id, definition.description
-                    ),
-                    "parameters": definition.input_schema,
-                }
-            }));
-        }
-        Ok(ProviderToolSet { tools, aliases })
-    }
-
     pub fn execute_for_agent(
         &self,
         agent_id: &str,
@@ -188,7 +128,7 @@ impl<'a> CapabilityService<'a> {
             )));
         }
         if !agent
-            .tool_caps
+            .capability_allowlist
             .iter()
             .any(|capability_id| capability_id == authority_id)
         {
@@ -341,32 +281,6 @@ fn validate_base_authority(row: &BaseCapabilityRow) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-fn provider_alias(definition: &CapabilityDefinition) -> String {
-    let mut prefix: String = definition
-        .capability_name
-        .chars()
-        .filter_map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
-                Some(character)
-            } else if character.is_whitespace() || character == '.' {
-                Some('_')
-            } else {
-                None
-            }
-        })
-        .take(40)
-        .collect();
-    if prefix.is_empty() {
-        prefix.push_str("capability");
-    }
-    let digest = Sha256::digest(definition.capability_id.as_bytes());
-    let suffix: String = digest[..6]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    format!("{prefix}_{suffix}")
 }
 
 fn validate_composite_authority(row: &CompositeCapabilityRow) -> Result<()> {
@@ -713,13 +627,16 @@ mod tests {
         }
     }
 
-    fn agent(id: &str, tool_caps: &[&str]) -> AgentRow {
+    fn agent(id: &str, capability_allowlist: &[&str]) -> AgentRow {
         AgentRow {
             id: id.to_string(),
             name: id.to_string(),
             mode: "unni".to_string(),
             prompt: None,
-            tool_caps: tool_caps.iter().map(|value| (*value).to_string()).collect(),
+            capability_allowlist: capability_allowlist
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
             config: None,
             display_name: None,
             is_default: false,
@@ -1016,28 +933,5 @@ mod tests {
         let serialized = serde_json::to_string(&definitions).unwrap();
         assert!(!serialized.contains("executor"));
         assert!(!serialized.contains(ECHO_EXECUTOR));
-    }
-
-    #[test]
-    fn provider_alias_normalizes_to_authoritative_dual_identity() {
-        let registry = registry_with_echo(&[BASE_ID]);
-        let executor = executor_with_echo();
-        let service = CapabilityService::new(&registry, &executor).unwrap();
-        let tool_set = service.provider_tools_for_agent("actor").unwrap();
-
-        assert_eq!(tool_set.tools().len(), 1);
-        let alias = tool_set.tools()[0]["function"]["name"].as_str().unwrap();
-        assert!(alias.starts_with("echo_"));
-        assert!(alias
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-')));
-
-        let call = tool_set
-            .normalize(alias, serde_json::json!({"value": "ok"}))
-            .unwrap();
-        assert_eq!(call.capability_id, BASE_ID);
-        assert_eq!(call.capability_name, "echo");
-        assert_eq!(call.arguments, serde_json::json!({"value": "ok"}));
-        assert!(tool_set.normalize(BASE_ID, serde_json::json!({})).is_err());
     }
 }

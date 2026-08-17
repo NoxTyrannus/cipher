@@ -39,7 +39,7 @@ pub struct AgentRow {
     pub mode: String,
     #[serde(default)]
     pub prompt: Option<String>,
-    pub tool_caps: Vec<String>,
+    pub capability_allowlist: Vec<String>,
     #[serde(default)]
     pub config: Option<serde_json::Value>,
     #[serde(default)]
@@ -157,7 +157,7 @@ impl Registry {
             }
         }
         for agent in self.agents.values() {
-            for capability_id in &agent.tool_caps {
+            for capability_id in &agent.capability_allowlist {
                 if !capability_ids.contains(capability_id.as_str()) {
                     return Err(AgentError::Bootstrap(format!(
                         "agent '{}' authorizes unknown or non-executable capability_id '{}'",
@@ -368,7 +368,7 @@ fn load_models(conn: &duckdb::Connection, registry: &mut Registry) -> Result<(),
 fn load_agents(conn: &duckdb::Connection, registry: &mut Registry) -> Result<(), AgentError> {
     let mut statement = conn
         .prepare(
-            "SELECT id, name, mode, prompt, CAST(tool_caps AS VARCHAR), \
+            "SELECT id, name, mode, prompt, CAST(capability_allowlist AS VARCHAR), \
              CAST(config AS VARCHAR), display_name, is_default FROM agent",
         )
         .map_err(|error| AgentError::Bootstrap(format!("prepare agent: {error}")))?;
@@ -388,9 +388,12 @@ fn load_agents(conn: &duckdb::Connection, registry: &mut Registry) -> Result<(),
         .map_err(|error| AgentError::Bootstrap(format!("query agent: {error}")))?;
 
     for row in rows {
-        let (id, name, mode, prompt, tool_caps, config, display_name, is_default) =
+        let (id, name, mode, prompt, capability_allowlist, config, display_name, is_default) =
             row.map_err(|error| AgentError::Bootstrap(format!("row agent: {error}")))?;
-        let tool_caps = parse_capability_ids(tool_caps, &format!("agent '{id}'.tool_caps"))?;
+        let capability_allowlist = parse_capability_ids(
+            capability_allowlist,
+            &format!("agent '{id}'.capability_allowlist"),
+        )?;
         let config = parse_optional_json(config, &format!("agent '{id}'.config"))?;
         registry.agents.insert(
             id.clone(),
@@ -399,7 +402,7 @@ fn load_agents(conn: &duckdb::Connection, registry: &mut Registry) -> Result<(),
                 name,
                 mode,
                 prompt,
-                tool_caps,
+                capability_allowlist,
                 config,
                 display_name,
                 is_default,
@@ -794,13 +797,16 @@ mod tests {
         }
     }
 
-    fn agent(id: &str, tool_caps: &[&str]) -> AgentRow {
+    fn agent(id: &str, capability_allowlist: &[&str]) -> AgentRow {
         AgentRow {
             id: id.to_string(),
             name: id.to_string(),
             mode: "unni".to_string(),
             prompt: None,
-            tool_caps: tool_caps.iter().map(|id| (*id).to_string()).collect(),
+            capability_allowlist: capability_allowlist
+                .iter()
+                .map(|id| (*id).to_string())
+                .collect(),
             config: None,
             display_name: None,
             is_default: false,
@@ -871,7 +877,7 @@ mod tests {
 
         let error = registry
             .validate()
-            .expect_err("unknown tool authorization must fail");
+            .expect_err("unknown capability authorization must fail");
         assert!(error.to_string().contains("disabled-or-unknown"));
     }
 

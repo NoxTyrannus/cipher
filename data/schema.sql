@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS agent (
     name TEXT NOT NULL,
     mode TEXT NOT NULL,
     prompt TEXT,
-    tool_caps JSON NOT NULL DEFAULT '[]',
+    capability_allowlist JSON NOT NULL DEFAULT '[]',
     config JSON,
     display_name TEXT,
     is_default BOOLEAN NOT NULL DEFAULT FALSE,

@@ -193,7 +193,7 @@ pub fn capability_import(
                     .map(|s| s.to_string())
             }))
             .collect();
-        for cap in load_agent_tool_caps(conn, agent_id)? {
+        for cap in load_agent_capability_allowlist(conn, agent_id)? {
             if !caps.iter().any(|c| c == &cap) {
                 caps.push(cap);
             }
@@ -201,7 +201,7 @@ pub fn capability_import(
         let caps_json = serde_json::to_string(&caps)
             .map_err(|e| format!("capability.import: serialize grants: {e}"))?;
         conn.execute(
-            "UPDATE agent SET tool_caps = CAST(? AS JSON) WHERE id = ?",
+            "UPDATE agent SET capability_allowlist = CAST(? AS JSON) WHERE id = ?",
             duckdb::params![caps_json, agent_id],
         )
         .map_err(|e| format!("capability.import: grant to {agent_id}: {e}"))?;
@@ -251,9 +251,12 @@ fn existing_executable_ids(conn: &duckdb::Connection) -> Result<HashSet<String>,
     Ok(ids)
 }
 
-fn load_agent_tool_caps(conn: &duckdb::Connection, agent_id: &str) -> Result<Vec<String>, String> {
+fn load_agent_capability_allowlist(
+    conn: &duckdb::Connection,
+    agent_id: &str,
+) -> Result<Vec<String>, String> {
     let mut stmt = conn
-        .prepare("SELECT CAST(tool_caps AS VARCHAR) FROM agent WHERE id = ?")
+        .prepare("SELECT CAST(capability_allowlist AS VARCHAR) FROM agent WHERE id = ?")
         .map_err(|e| format!("capability.import prepare agent caps: {e}"))?;
     let mut rows = stmt
         .query_map([agent_id], |row| row.get::<_, String>(0))
@@ -449,7 +452,7 @@ mod tests {
         let conn = duckdb::Connection::open_in_memory().unwrap();
         crate::data::duckdb::schema::create_all_tables(&conn).unwrap();
         conn.execute_batch(
-            "INSERT INTO agent (id,name,mode,tool_caps,is_default) VALUES ('agent','Agent','unni','[]',true);",
+            "INSERT INTO agent (id,name,mode,capability_allowlist,is_default) VALUES ('agent','Agent','unni','[]',true);",
         )
         .unwrap();
         let out = capability_import(
@@ -470,7 +473,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out["success"], true);
-        let caps = load_agent_tool_caps(&conn, "agent").unwrap();
+        let caps = load_agent_capability_allowlist(&conn, "agent").unwrap();
         assert!(caps.contains(&"echo.test".to_string()));
     }
 }
