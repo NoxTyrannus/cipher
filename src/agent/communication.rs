@@ -37,15 +37,18 @@ pub struct TurnContext {
     pub user_message: String,
 
     pub input_kind: String,
+
+    /// 该轮洞察中台输入组装时是否含 subagent 结果段（依据 AgentPool subagent 状态变化，
+    /// 中间/最终结果均计）。由洞察中台在组装输入时记录，触发链据此决定 UNNI 回环轮执行权。
+    pub has_subagent_result: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct ThinkingOutput {
     pub decision: ThinkDecision,
-    pub goal: String,
+    /// 思考引擎 think 全文（合并后的单一字段：目标指示段 vs 思考引擎输出段的语义由各消费端组装处自行决定）。
+    pub think_message: String,
     pub constraints: Vec<String>,
-
-    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,9 +150,8 @@ mod tests {
             turn_id: "t1".into(),
             thinking: ThinkingOutput {
                 decision: ThinkDecision::Execute,
-                goal: "test".into(),
+                think_message: "test".into(),
                 constraints: vec![],
-                message: String::new(),
             },
             execution: None,
             insight: None,
@@ -157,6 +159,7 @@ mod tests {
             status: TurnStatus::Executing,
             user_message: String::new(),
             input_kind: "user".into(),
+            has_subagent_result: false,
         };
         assert_eq!(ctx.status, TurnStatus::Executing);
         assert!(ctx.execution.is_none());

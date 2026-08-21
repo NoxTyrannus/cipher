@@ -14,7 +14,7 @@ pub fn map_reqwest_error(e: reqwest::Error, provider: &str) -> AgentError {
 
 /// 从 LLM 错误消息中提取 HTTP 状态码。
 ///
-/// 各 provider 统一把状态码嵌入消息（如 `HTTP 429 at ...` / `anthropic HTTP 429: ...`），
+/// 各 provider 统一把状态码嵌入消息（如 `HTTP 429 at ...` / `responses HTTP 429: ...`），
 /// 这里做一次宽松提取；提取不到视为“非 HTTP 错误”（解析/参数类，不可重试）。
 pub fn extract_http_status(msg: &str) -> Option<u16> {
     let bytes = msg.as_bytes();
@@ -83,7 +83,7 @@ mod tests {
             extract_http_status("openai HTTP 429 at http://x/"),
             Some(429)
         );
-        assert_eq!(extract_http_status("anthropic HTTP 500: boom"), Some(500));
+        assert_eq!(extract_http_status("responses HTTP 500: boom"), Some(500));
         assert_eq!(extract_http_status("HTTP 404 at ..."), Some(404));
         assert_eq!(extract_http_status("no status here"), None);
         assert_eq!(

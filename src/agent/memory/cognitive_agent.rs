@@ -245,7 +245,7 @@ impl CognitiveAgent {
             .map(|ctx| {
                 let input = match &ctx.input {
                     crate::agent::thought::ThinkingInput::User { text } => truncate_text(text, 60),
-                    crate::agent::thought::ThinkingInput::PlatformEcho { summary, .. } => {
+                    crate::agent::thought::ThinkingInput::PlatformInsight { summary, .. } => {
                         truncate_text(summary, 60)
                     }
                     crate::agent::thought::ThinkingInput::CapabilityResult { summary, .. } => {
@@ -254,8 +254,8 @@ impl CognitiveAgent {
                     crate::agent::thought::ThinkingInput::ModeTrigger { reason, .. } => {
                         truncate_text(reason, 60)
                     }
-                    crate::agent::thought::ThinkingInput::ReflectOnly { summary } => {
-                        truncate_text(summary, 60)
+                    crate::agent::thought::ThinkingInput::LegacyInternal => {
+                        "[legacy internal round]".to_string()
                     }
                 };
                 let output = ctx

@@ -57,6 +57,13 @@ impl TurnContextStore {
         Some(())
     }
 
+    /// 记录该轮洞察中台输入组装时是否含 subagent 结果段（2.0.8 UNNI 动态执行权依据）。
+    pub fn set_has_subagent_result(&mut self, turn_id: &str, has: bool) -> Option<()> {
+        let ctx = self.contexts.get_mut(turn_id)?;
+        ctx.has_subagent_result = has;
+        Some(())
+    }
+
     pub fn cancel(&mut self, turn_id: &str) -> Option<()> {
         let ctx = self.contexts.get_mut(turn_id)?;
         ctx.status = TurnStatus::Cancelled;
@@ -132,9 +139,8 @@ mod tests {
             turn_id: turn_id.into(),
             thinking: ThinkingOutput {
                 decision: ThinkDecision::Execute,
-                goal: "test".into(),
+                think_message: "test".into(),
                 constraints: vec![],
-                message: String::new(),
             },
             execution: None,
             insight: None,
@@ -142,6 +148,7 @@ mod tests {
             status: TurnStatus::Executing,
             user_message: String::new(),
             input_kind: "user".into(),
+            has_subagent_result: false,
         }
     }
 

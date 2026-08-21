@@ -801,10 +801,9 @@ mod tests {
         let thought_id = manager
             .spawn_with_override(
                 String::new(),
-                Some(ThinkingInput::PlatformEcho {
-                    platform: crate::agent::thought::InternalPlatform::Execution,
-                    summary: "internal echo".to_string(),
-                    artifact_refs: vec![],
+                Some(ThinkingInput::PlatformInsight {
+                    summary: "internal insight".to_string(),
+                    has_subagent_result: false,
                 }),
             )
             .await

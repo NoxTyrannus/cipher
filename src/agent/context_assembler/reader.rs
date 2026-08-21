@@ -1,6 +1,6 @@
 use super::budget::ParsedMessage;
 use crate::agent::agent_pool::registry::{AgentEntry, AgentIdentity, AgentStatus};
-use crate::agent::thought::{InternalPlatform, ThinkingInput};
+use crate::agent::thought::ThinkingInput;
 use crate::common::{AgentError, Result};
 use crate::logic::model::message::{ChatMessage, MemoryKind, SystemKind};
 use std::path::Path;
@@ -16,28 +16,19 @@ pub(super) fn parsed_message(role: &str, content: String) -> ParsedMessage {
 pub(super) fn parsed_thinking_input(input: ThinkingInput) -> ParsedMessage {
     match input {
         ThinkingInput::User { text } => parsed_message("user", text),
-        ThinkingInput::PlatformEcho {
-            platform,
+        ThinkingInput::PlatformInsight {
             summary,
-            artifact_refs,
+            has_subagent_result,
         } => {
-            let platform = match platform {
-                InternalPlatform::Execution => "execution",
-                InternalPlatform::Insight => "insight",
-                InternalPlatform::Memory => "memory",
+            let result_flag = if has_subagent_result {
+                " (含 subagent 结果段)"
+            } else {
+                ""
             };
-            let mut content = format!("[{platform} echo]\n{summary}");
-            if !artifact_refs.is_empty() {
-                content.push_str("\nartifact refs: ");
-                content.push_str(&artifact_refs.join(", "));
-            }
-            parsed_message("system", content)
+            parsed_message("system", format!("[洞察回环轮{result_flag}]\n{summary}"))
         }
         ThinkingInput::ModeTrigger { mode, reason } => {
             parsed_message("system", format!("[mode trigger: {mode}]\n{reason}"))
-        }
-        ThinkingInput::ReflectOnly { summary } => {
-            parsed_message("system", format!("[融合思考反思]\n{summary}"))
         }
         ThinkingInput::CapabilityResult {
             capability_id,
@@ -52,6 +43,9 @@ pub(super) fn parsed_thinking_input(input: ThinkingInput) -> ParsedMessage {
                 content.push_str(&artifact_refs.join(", "));
             }
             parsed_message("system", content)
+        }
+        ThinkingInput::LegacyInternal => {
+            parsed_message("system", "[legacy internal round]".to_string())
         }
     }
 }

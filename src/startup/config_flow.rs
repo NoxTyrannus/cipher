@@ -8,22 +8,14 @@ use crate::data::workspace_store::{WorkspaceRow, WorkspaceStore};
 use dialoguer::{Input, Password, Select};
 use secrecy::SecretString;
 
-use super::config::{Config, TriggerNode};
+use super::config::Config;
 
-const PRESET_TEMPLATES: &[(&str, &str, &str, &str)] = &[
-    (
-        "OpenAI 官方",
-        "openai",
-        "https://api.openai.com/v1",
-        "OpenAI",
-    ),
-    (
-        "Anthropic 官方",
-        "anthropic",
-        "https://api.anthropic.com",
-        "Anthropic",
-    ),
-];
+const PRESET_TEMPLATES: &[(&str, &str, &str, &str)] = &[(
+    "OpenAI 官方",
+    "openai",
+    "https://api.openai.com/v1",
+    "OpenAI",
+)];
 
 pub fn run(app: &AppState) -> Result<(), AgentError> {
     loop {
@@ -32,7 +24,7 @@ pub fn run(app: &AppState) -> Result<(), AgentError> {
             "工作区管理",
             "agent 改名",
             "切默认 workspace/agent",
-            "协作设置 (节点/Mix/预算)",
+            "协作设置 (KEEP 预算)",
             "退出 /config",
         ];
         let sel = Select::new()
@@ -52,7 +44,7 @@ pub fn run(app: &AppState) -> Result<(), AgentError> {
     }
 }
 
-/// 全局协作设置：协同节点 / Mix Thinking / KEEP 预算。
+/// 全局协作设置：KEEP 预算（放弃项 1/2/10：协同节点固定洞察 + mix 机制删除，只沉淀不触发）。
 fn manage_mode_styles() -> Result<(), AgentError> {
     let config_path = Config::default_path();
     let Some(mut config) = Config::load(&config_path)? else {
@@ -60,77 +52,24 @@ fn manage_mode_styles() -> Result<(), AgentError> {
         return Ok(());
     };
     loop {
-        let node = config.collaboration.node;
         let keep = config.mode_styles.keep;
-        let mix_display = if node == TriggerNode::Execution {
-            "自动关闭 (节点=执行中台)".to_string()
-        } else if config.collaboration.mix_thinking {
-            "开".to_string()
-        } else {
-            "关".to_string()
-        };
         let items = vec![
-            format!("协同节点 (当前: {})", node.as_str()),
-            format!("Mix 思考 (当前: {mix_display})"),
             format!("KEEP Token 预算 (当前: {}K)", keep.token_budget / 1000),
             format!("KEEP 时间预算 (当前: {}min)", keep.time_budget_secs / 60),
             "返回 /config 主菜单".to_string(),
         ];
         let sel = Select::new()
-            .with_prompt("协作设置 — 选择管理项 (UNNI/KEEP/LOOP 共用)")
+            .with_prompt("协作设置 — 选择管理项 (KEEP 预算)")
             .items(&items)
             .default(0)
             .interact()
             .map_err(|e| AgentError::Parse(format!("collaboration select: {e}")))?;
         match sel {
-            0 => manage_collaboration_node(&mut config, &config_path)?,
-            1 => manage_mix_thinking(&mut config, &config_path)?,
-            2 => manage_keep_token(&mut config, &config_path)?,
-            3 => manage_keep_time(&mut config, &config_path)?,
+            0 => manage_keep_token(&mut config, &config_path)?,
+            1 => manage_keep_time(&mut config, &config_path)?,
             _ => return Ok(()),
         }
     }
-}
-
-fn manage_collaboration_node(
-    config: &mut Config,
-    config_path: &std::path::Path,
-) -> Result<(), AgentError> {
-    let current = config.collaboration.node;
-    let items = vec![
-        TriggerNode::Execution.label(),
-        TriggerNode::Insight.label(),
-        TriggerNode::Memory.label(),
-    ];
-    let default_index = match current {
-        TriggerNode::Execution => 0,
-        TriggerNode::Insight => 1,
-        TriggerNode::Memory => 2,
-    };
-    let sel = Select::new()
-        .with_prompt(format!("协同节点 (当前: {})", current.as_str()))
-        .items(&items)
-        .default(default_index)
-        .interact()
-        .map_err(|e| AgentError::Parse(format!("collaboration node select: {e}")))?;
-    let next = match sel {
-        0 => TriggerNode::Execution,
-        1 => TriggerNode::Insight,
-        _ => TriggerNode::Memory,
-    };
-    if next == current {
-        println!("协同节点未变, 保持 {}", current.as_str());
-        return Ok(());
-    }
-    config.collaboration.node = next;
-    if next == TriggerNode::Execution {
-        config.collaboration.mix_thinking = false;
-        println!("协同节点已切换为 execution；Mix 思考自动关闭");
-    } else {
-        println!("协同节点已切换为 {} (config.toml)", next.as_str());
-    }
-    config.save(config_path)?;
-    Ok(())
 }
 
 fn manage_keep_token(config: &mut Config, config_path: &std::path::Path) -> Result<(), AgentError> {
@@ -210,42 +149,6 @@ fn manage_keep_time(config: &mut Config, config_path: &std::path::Path) -> Resul
     );
     Ok(())
 }
-
-fn manage_mix_thinking(
-    config: &mut Config,
-    config_path: &std::path::Path,
-) -> Result<(), AgentError> {
-    let node = config.collaboration.node;
-    let current = config.collaboration.mix_thinking;
-    let items = vec!["关 (顺序触发)", "开 (流水线并行 + 拼接合并)"];
-    let default_index = if current { 1 } else { 0 };
-    let sel = Select::new()
-        .with_prompt(format!(
-            "Mix 思考 (当前: {})",
-            if current { "开" } else { "关" }
-        ))
-        .items(&items)
-        .default(default_index)
-        .interact()
-        .map_err(|e| AgentError::Parse(format!("mix thinking select: {e}")))?;
-    let next = sel == 1;
-    if node == TriggerNode::Execution {
-        println!("协同节点为执行中台时 Mix 思考自动关闭，请先切换协同节点。");
-        return Ok(());
-    }
-    if next == current {
-        println!("Mix 思考未变");
-        return Ok(());
-    }
-    config.collaboration.mix_thinking = next;
-    config.save(config_path)?;
-    println!(
-        "Mix 思考已切换为 {} (config.toml)",
-        if next { "开" } else { "关" }
-    );
-    Ok(())
-}
-
 fn manage_models_and_providers(app: &AppState) -> Result<(), AgentError> {
     loop {
         list_models(app)?;
@@ -316,7 +219,7 @@ fn add_model(app: &AppState) -> Result<(), AgentError> {
             .interact_text()
             .map_err(|e| AgentError::Parse(format!("api_url: {}", e)))?;
         let t = Input::<String>::new()
-            .with_prompt("api_type (OpenAI/Anthropic)")
+            .with_prompt("api_type (OpenAI/Responses)")
             .default("OpenAI".to_string())
             .interact_text()
             .map_err(|e| AgentError::Parse(format!("api_type: {}", e)))?;

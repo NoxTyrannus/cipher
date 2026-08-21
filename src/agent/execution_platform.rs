@@ -301,7 +301,7 @@ impl ExecutionPlatform {
                 text: ctx.user_message.clone(),
             });
             messages.push(ChatMessage::Assistant {
-                text: ctx.thinking.message.clone(),
+                text: ctx.thinking.think_message.clone(),
             });
         }
         messages.push(ChatMessage::System {
@@ -325,15 +325,15 @@ impl ExecutionPlatform {
     }
 
     fn thinking_input_section(ctx: &crate::agent::communication::TurnContext) -> String {
+        // 2.0.4 think_message 合并：think 全文只保留一处 System 段 + Assistant 段（双份消除）。
         format!(
-            "## Thinking Input\n\n**goal:** {}\n\n**constraints:**\n{}\n\n**message:** {}",
-            ctx.thinking.goal,
+            "## Thinking Input\n\n**think_message:** {}\n\n**constraints:**\n{}",
+            ctx.thinking.think_message,
             if ctx.thinking.constraints.is_empty() {
                 "none".to_string()
             } else {
                 ctx.thinking.constraints.join("\n")
             },
-            ctx.thinking.message,
         )
     }
 
@@ -1129,9 +1129,8 @@ mod tests {
             turn_id: id.into(),
             thinking: crate::agent::communication::ThinkingOutput {
                 decision: crate::agent::communication::ThinkDecision::Execute,
-                goal: format!("goal {id}"),
+                think_message: think.into(),
                 constraints: vec![],
-                message: think.into(),
             },
             execution: None,
             insight: None,
@@ -1139,6 +1138,7 @@ mod tests {
             status: crate::agent::communication::TurnStatus::Executing,
             user_message: user.into(),
             input_kind: "user".into(),
+            has_subagent_result: false,
         }
     }
 

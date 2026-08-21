@@ -160,6 +160,14 @@ impl AgentPool {
         }
     }
 
+    /// 记录该轮洞察输入组装时是否含 subagent 结果段（触发链据此决定 UNNI 回环轮执行权）。
+    pub async fn set_turn_has_subagent_result(&self, turn_id: &str, has: bool) {
+        self.turn_contexts
+            .write()
+            .await
+            .set_has_subagent_result(turn_id, has);
+    }
+
     pub async fn cancel_turn(&self, turn_id: &str) {
         self.turn_contexts.write().await.cancel(turn_id);
     }
@@ -387,9 +395,8 @@ mod tests {
             turn_id: "t1".into(),
             thinking: ThinkingOutput {
                 decision: ThinkDecision::Execute,
-                goal: "test".into(),
+                think_message: "test".into(),
                 constraints: vec![],
-                message: String::new(),
             },
             execution: None,
             insight: None,
@@ -397,6 +404,7 @@ mod tests {
             status: TurnStatus::Executing,
             user_message: String::new(),
             input_kind: "user".into(),
+            has_subagent_result: false,
         };
         pool.create_turn_context(ctx).await;
 

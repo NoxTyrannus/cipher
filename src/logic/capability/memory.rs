@@ -631,9 +631,9 @@ fn format_thinking_input_for_evidence(input: &crate::agent::thought::ThinkingInp
     use crate::agent::thought::ThinkingInput;
     match input {
         ThinkingInput::User { text } => text.clone(),
-        ThinkingInput::PlatformEcho { summary, .. }
-        | ThinkingInput::ReflectOnly { summary }
+        ThinkingInput::PlatformInsight { summary, .. }
         | ThinkingInput::CapabilityResult { summary, .. } => summary.clone(),
         ThinkingInput::ModeTrigger { mode, reason } => format!("[{mode}] {reason}"),
+        ThinkingInput::LegacyInternal => "[legacy internal round]".to_string(),
     }
 }

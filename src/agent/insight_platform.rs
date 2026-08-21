@@ -2,7 +2,7 @@ use crate::agent::agent_pool::registry::{AgentEntry, AgentIdentity, AgentStatus}
 use crate::agent::agent_pool::AgentPool;
 use crate::agent::communication::{
     AgentMessage, CapabilityLifecycleRecord, CapabilityLifecycleState, ExecutionOutput,
-    InsightOutput, InsightResult, UsageObservation,
+    InsightOutput, InsightResult, ThinkingOutput, UsageObservation,
 };
 use crate::common::Result;
 use crate::data::ModelRow;
@@ -90,9 +90,12 @@ pub struct InsightPlatform {
     api_key: SecretString,
     usage_observation_tx: mpsc::Sender<Vec<UsageObservation>>,
     prompts_dir: Option<PathBuf>,
+    /// subagent 记忆证据目录（<storage_root>/subagents/<id>/memory.json + last_output.json）。
+    storage_root: Option<PathBuf>,
 }
 
 impl InsightPlatform {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         insight_rx: mpsc::Receiver<AgentMessage>,
         pool: Arc<AgentPool>,
@@ -101,6 +104,7 @@ impl InsightPlatform {
         api_key: SecretString,
         usage_observation_tx: mpsc::Sender<Vec<UsageObservation>>,
         prompts_dir: Option<PathBuf>,
+        storage_root: Option<PathBuf>,
     ) -> Self {
         Self {
             insight_rx,
@@ -110,6 +114,7 @@ impl InsightPlatform {
             api_key,
             usage_observation_tx,
             prompts_dir,
+            storage_root,
         }
     }
 
@@ -162,17 +167,37 @@ impl InsightPlatform {
         let execution = ctx.execution.as_ref();
         let pool_snapshot = self.pool.snapshot().await;
 
+        // 2.0.2 洞察中台输入组装：多段 assistant 原样连续、一次 LLM 调用。
+        // 0~N 个已完成 subagent 结果段（memory.json evidence，代码侧组装）；
+        // 「有结果」判定 = AgentPool subagent 状态变化（结果段数量 > 0，中间/最终结果均计）。
+        let subagent_results = self.build_subagent_result_segments().await;
+        let has_subagent_result = !subagent_results.is_empty();
+        self.pool
+            .set_turn_has_subagent_result(turn_id, has_subagent_result)
+            .await;
+
+        let used_capabilities = execution_capability_ids(execution);
         let prompt = build_insight_prompt(
             turn_id,
-            &ctx.thinking.goal,
             &ctx.thinking.constraints,
-            execution,
+            &used_capabilities,
             &pool_snapshot,
             self.prompts_dir.as_deref(),
         );
 
-        // §8.4.2：洞察中台序列 [System(平台提示词+分析), User(原始用户输入), System(判断指令)]。
-        let messages = build_insight_messages(prompt, &ctx.user_message);
+        // User 段语义：用户输入轮 = 原始用户输入；内部轮（回环轮触发洞察）省略 User 段。
+        let user_segment = if ctx.input_kind == "user" {
+            Some(ctx.user_message.as_str())
+        } else {
+            None
+        };
+        let messages = build_insight_messages(
+            prompt,
+            user_segment,
+            &ctx.thinking,
+            execution,
+            &subagent_results,
+        );
         let req = match LlmRequest::from_model_row(&self.model_row, messages, self.api_key.clone())
         {
             Ok(req) => req,
@@ -363,27 +388,56 @@ async fn publish_insight(pool: &AgentPool, turn_id: &str, insight: InsightResult
     pool.publish_event("insight_complete", turn_id.to_string());
 }
 
-fn build_insight_messages(prompt: String, user_input: &str) -> Vec<ChatMessage> {
-    vec![
-        ChatMessage::System {
-            text: prompt,
-            kind: SystemKind::Primary,
-        },
-        ChatMessage::User {
-            text: user_input.to_string(),
-        },
-        ChatMessage::System {
-            text: "判断本轮方向是否仍然正确，并输出 JSON。".to_string(),
-            kind: SystemKind::Primary,
-        },
-    ]
+/// 2.0.2 洞察中台输入组装（每轮标准；多段 assistant **原样连续、一次 LLM 调用**）：
+/// ```text
+/// [System(平台提示词), (User(原始输入) 仅用户轮),
+///  Assistant(思考引擎输出),              ← 必有
+///  Assistant(执行中台输出),              ← 每轮都有（0 动作也算）
+///  Assistant(subagent1 结果段),          ← 0~N 个（当前已完成的 subagent）
+///  …,
+///  System(指令)]
+/// ```
+fn build_insight_messages(
+    prompt: String,
+    user_segment: Option<&str>,
+    thinking: &ThinkingOutput,
+    execution: Option<&ExecutionOutput>,
+    subagent_results: &[String],
+) -> Vec<ChatMessage> {
+    let mut messages = vec![ChatMessage::System {
+        text: prompt,
+        kind: SystemKind::Primary,
+    }];
+    if let Some(user_text) = user_segment {
+        messages.push(ChatMessage::User {
+            text: user_text.to_string(),
+        });
+    }
+    // 思考引擎输出段（think_message 全文，必有）。
+    messages.push(ChatMessage::Assistant {
+        text: thinking.think_message.clone(),
+    });
+    // 执行中台输出段（每轮都有；无执行输出时以「无执行轮」占位，不做段内包装）。
+    messages.push(ChatMessage::Assistant {
+        text: build_execution_segment(execution),
+    });
+    // 0~N 个 subagent 结果段。
+    for segment in subagent_results {
+        messages.push(ChatMessage::Assistant {
+            text: segment.clone(),
+        });
+    }
+    messages.push(ChatMessage::System {
+        text: "判断本轮方向是否仍然正确，并输出 JSON。".to_string(),
+        kind: SystemKind::Primary,
+    });
+    messages
 }
 
 fn build_insight_prompt(
     turn_id: &str,
-    goal: &str,
     constraints: &[String],
-    execution: Option<&ExecutionOutput>,
+    used_capabilities: &[String],
     pool_snapshot: &[AgentEntry],
     prompts_dir: Option<&std::path::Path>,
 ) -> String {
@@ -405,53 +459,6 @@ fn build_insight_prompt(
             .join("\n")
     };
 
-    let execution_section = match execution {
-        Some(exec) => {
-            let actions = exec
-                .lifecycle_actions
-                .iter()
-                .map(format_lifecycle_record)
-                .collect::<Vec<_>>()
-                .join("\n---\n");
-            let failed: Vec<&CapabilityLifecycleRecord> = exec
-                .lifecycle_actions
-                .iter()
-                .filter(|record| {
-                    matches!(
-                        record.lifecycle_state,
-                        CapabilityLifecycleState::Failed | CapabilityLifecycleState::Rejected
-                    )
-                })
-                .collect();
-            let failure_summary = if failed.is_empty() {
-                "No failed or rejected lifecycle actions.".to_string()
-            } else {
-                let mut lines = vec![format!(
-                    "{} lifecycle action(s) failed/rejected:",
-                    failed.len()
-                )];
-                for record in &failed {
-                    lines.push(format!(
-                        "  - capability_id={}, error={}",
-                        record.capability_id,
-                        record.error.as_deref().unwrap_or("unknown")
-                    ));
-                }
-                lines.join("\n")
-            };
-            format!(
-                "## Execution Direction\n\n**task_design:** {}\n\n**task_status:** {}\n\n## Lifecycle Actions\n\n{}\n\n## Failure Summary\n\n{}",
-                exec.task_design,
-                exec.task_status,
-                actions,
-                failure_summary,
-            )
-        }
-        None => "## Execution\n\n(本轮无执行——say-only 轮。请基于 Goal 与对话内容判断方向。)"
-            .to_string(),
-    };
-
-    let used_capabilities = execution_capability_ids(execution);
     let capability_section = if used_capabilities.is_empty() {
         "## Actual Capability IDs Used This Turn\n\n(none — 没有能力调用证据；usage_observations 必须为空)"
             .to_string()
@@ -473,9 +480,134 @@ fn build_insight_prompt(
     let pool_summary = build_pool_snapshot_summary(pool_snapshot);
 
     format!(
-        "{}\n\n## Task Input\n\n**Goal:** {}\n\n**Constraints:**\n{}\n\n{}\n\n{}\n\n{}\n\n## Agent Pool Status\n\n{}",
-        base, goal, constraints_str, execution_section, capability_section, trace_hint, pool_summary,
+        "{}\n\n## Task Input\n\n**Constraints:**\n{}\n\n{}\n\n{}\n\n## Agent Pool Status\n\n{}",
+        base, constraints_str, capability_section, trace_hint, pool_summary,
     )
+}
+
+/// 执行中台输出段：task_design / task_status / lifecycle actions（含 START/OK/FAIL 证据）。
+/// 无执行输出时输出「无执行轮」占位（2.0.5：不再是 say-only 语义）。
+fn build_execution_segment(execution: Option<&ExecutionOutput>) -> String {
+    let Some(exec) = execution else {
+        return "（本轮无执行——无执行轮。请基于思考引擎输出与对话内容判断方向。）".to_string();
+    };
+    let actions = exec
+        .lifecycle_actions
+        .iter()
+        .map(format_lifecycle_record)
+        .collect::<Vec<_>>()
+        .join("\n---\n");
+    let failed: Vec<&CapabilityLifecycleRecord> = exec
+        .lifecycle_actions
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.lifecycle_state,
+                CapabilityLifecycleState::Failed | CapabilityLifecycleState::Rejected
+            )
+        })
+        .collect();
+    let failure_summary = if failed.is_empty() {
+        "No failed or rejected lifecycle actions.".to_string()
+    } else {
+        let mut lines = vec![format!(
+            "{} lifecycle action(s) failed/rejected:",
+            failed.len()
+        )];
+        for record in &failed {
+            lines.push(format!(
+                "  - capability_id={}, error={}",
+                record.capability_id,
+                record.error.as_deref().unwrap_or("unknown")
+            ));
+        }
+        lines.join("\n")
+    };
+    format!(
+        "## Execution Direction\n\n**task_design:** {}\n\n**task_status:** {}\n\n## Lifecycle Actions\n\n{}\n\n## Failure Summary\n\n{}",
+        exec.task_design,
+        exec.task_status,
+        actions,
+        failure_summary,
+    )
+}
+
+/// subagent 结果段单段最大字符数（整段截断兜底）。
+const MAX_SUBAGENT_RESULT_SEGMENT_CHARS: usize = 3000;
+
+impl InsightPlatform {
+    /// 组装 0~N 个已完成 subagent 的结果段（代码侧组装，不依赖模型自觉）：
+    /// 读取 <storage_root>/subagents/<id>/memory.json（真实 input/actions/evidence/output）
+    /// 与 last_output.json（status + summary）；「有结果」判定 = 该 subagent 至少有一条记忆
+    /// 条目（AgentPool 状态变化已落盘：中间/最终结果均计）。
+    async fn build_subagent_result_segments(&self) -> Vec<String> {
+        let Some(root) = &self.storage_root else {
+            return Vec::new();
+        };
+        let states = self.pool.subagent_states().await;
+        let mut segments = Vec::new();
+        for state in states {
+            let memory = crate::agent::subagent_memory::read_memory(root, &state.subagent_id)
+                .unwrap_or_default();
+            if memory.entries.is_empty() {
+                continue;
+            }
+            let last_output =
+                crate::agent::subagent_memory::read_last_output(root, &state.subagent_id)
+                    .ok()
+                    .flatten();
+            let text = format_subagent_result_segment(&state, &memory, last_output.as_ref());
+            segments.push(crate::common::json_util::truncate_head_tail(
+                &text,
+                MAX_SUBAGENT_RESULT_SEGMENT_CHARS,
+            ));
+        }
+        segments
+    }
+}
+
+fn format_subagent_result_segment(
+    state: &crate::agent::execution_types::SubagentRuntimeState,
+    memory: &crate::agent::subagent_memory::SubagentMemory,
+    last_output: Option<&crate::agent::subagent_memory::LastOutput>,
+) -> String {
+    let mut parts = vec![
+        format!("subagent_id: {}", state.subagent_id),
+        format!("lifecycle: {:?}", state.lifecycle),
+    ];
+    if let Some(lo) = last_output {
+        let summary = crate::common::json_util::truncate_head_tail(
+            &lo.summary,
+            MAX_SUBAGENT_RESULT_SEGMENT_CHARS,
+        );
+        parts.push(format!("last_output: [{}] {}", lo.status, summary));
+    }
+    if !memory.entries.is_empty() {
+        parts.push(format!("memory entries ({}):", memory.entries.len()));
+        for (i, entry) in memory.entries.iter().enumerate() {
+            let mut lines = vec![format!("  [entry {}]", i + 1)];
+            if !entry.input.is_empty() {
+                lines.push(format!(
+                    "    input: {}",
+                    crate::common::json_util::truncate_head_tail(&entry.input, 400)
+                ));
+            }
+            if !entry.actions.is_empty() {
+                lines.push(format!("    actions: {}", entry.actions.join("; ")));
+            }
+            if !entry.evidence.is_empty() {
+                lines.push(format!("    evidence: {}", entry.evidence.join("; ")));
+            }
+            if !entry.output.is_empty() {
+                lines.push(format!(
+                    "    output: {}",
+                    crate::common::json_util::truncate_head_tail(&entry.output, 400)
+                ));
+            }
+            parts.push(lines.join("\n"));
+        }
+    }
+    parts.join("\n")
 }
 
 fn execution_capability_ids(execution: Option<&ExecutionOutput>) -> Vec<String> {
@@ -648,6 +780,7 @@ fn build_pool_snapshot_summary(snapshot: &[AgentEntry]) -> String {
     lines.join("\n")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     pool: Arc<AgentPool>,
     rx: mpsc::Receiver<AgentMessage>,
@@ -656,6 +789,7 @@ pub async fn run(
     api_key: SecretString,
     usage_observation_tx: mpsc::Sender<Vec<UsageObservation>>,
     prompts_dir: Option<PathBuf>,
+    storage_root: Option<PathBuf>,
 ) {
     let platform = InsightPlatform::new(
         rx,
@@ -665,6 +799,7 @@ pub async fn run(
         api_key,
         usage_observation_tx,
         prompts_dir,
+        storage_root,
     );
     let handle = platform.spawn();
     match handle.await {
@@ -779,33 +914,67 @@ mod tests {
     }
 
     #[test]
-    fn build_insight_prompt_contains_lifecycle_failure() {
+    fn build_insight_prompt_contains_constraints_and_capabilities() {
+        let prompt = build_insight_prompt(
+            "turn-1",
+            &["约束1".to_string()],
+            &["subagent.create".to_string()],
+            &[],
+            None,
+        );
+        assert!(prompt.contains("约束1"));
+        assert!(prompt.contains("subagent.create"));
+        assert!(prompt.contains("Actual Capability IDs Used This Turn"));
+    }
+
+    #[test]
+    fn build_execution_segment_carries_lifecycle_failure_evidence() {
         let execution = execution_with(vec![record(
             "subagent.create",
             CapabilityLifecycleState::Rejected,
             vec!["FAIL subagent.create: bad template".into()],
             Some("bad template".into()),
         )]);
-        let prompt = build_insight_prompt("turn-1", "goal", &[], Some(&execution), &[], None);
-        assert!(prompt.contains("goal"));
-        assert!(prompt.contains("task_design"));
-        assert!(prompt.contains("task_status"));
-        assert!(prompt.contains("subagent.create"));
-        assert!(prompt.contains("bad template"));
-        assert!(prompt.contains("Actual Capability IDs Used This Turn"));
+        let segment = build_execution_segment(Some(&execution));
+        assert!(segment.contains("task_design"));
+        assert!(segment.contains("task_status"));
+        assert!(segment.contains("subagent.create"));
+        assert!(segment.contains("bad template"));
     }
 
     #[test]
-    fn build_insight_prompt_none_execution_marks_say_only() {
-        let prompt = build_insight_prompt("turn-1", "用户说你好", &[], None, &[], None);
-        assert!(prompt.contains("say-only"));
-        assert!(prompt.contains("用户说你好"));
+    fn build_execution_segment_none_marks_no_execution_round() {
+        // 2.0.5：say-only 文案 → 「无执行轮」语义（机制保留：0 动作轮的洞察 fallback）。
+        let segment = build_execution_segment(None);
+        assert!(segment.contains("无执行轮"));
+        assert!(!segment.contains("say-only"));
+    }
+
+    fn thinking_output(text: &str) -> ThinkingOutput {
+        ThinkingOutput {
+            decision: crate::agent::communication::ThinkDecision::Execute,
+            think_message: text.to_string(),
+            constraints: vec![],
+        }
     }
 
     #[test]
-    fn insight_messages_include_original_user_input_and_system_instruction() {
-        let messages = build_insight_messages("PLATFORM_PROMPT".to_string(), "用户原始输入");
-        assert_eq!(messages.len(), 3);
+    fn insight_messages_user_round_includes_three_assistant_segments() {
+        // 用户轮：User 段存在；思考引擎输出 + 执行输出两段 assistant + 指令。
+        let execution = execution_with(vec![record(
+            "subagent.run",
+            CapabilityLifecycleState::Accepted,
+            vec!["START subagent.run: accepted".into()],
+            None,
+        )]);
+        let messages = build_insight_messages(
+            "PLATFORM_PROMPT".to_string(),
+            Some("用户原始输入"),
+            &thinking_output("think 全文"),
+            Some(&execution),
+            &[],
+        );
+        assert_eq!(messages.len(), 5);
         assert!(matches!(
             &messages[0],
             ChatMessage::System {
@@ -819,13 +988,142 @@ mod tests {
                 text: "用户原始输入".to_string()
             }
         );
+        assert_eq!(
+            messages[2],
+            ChatMessage::Assistant {
+                text: "think 全文".to_string()
+            }
+        );
+        assert!(matches!(messages[3], ChatMessage::Assistant { .. }));
         assert!(matches!(
-            &messages[2],
+            &messages[4],
             ChatMessage::System {
                 kind: SystemKind::Primary,
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn insight_messages_internal_round_omits_user_segment() {
+        // 内部轮（回环轮触发洞察）：省略 User 段。
+        let messages = build_insight_messages(
+            "PLATFORM_PROMPT".to_string(),
+            None,
+            &thinking_output("think 全文"),
+            None,
+            &[],
+        );
+        assert_eq!(messages.len(), 4);
+        assert!(messages
+            .iter()
+            .all(|m| !matches!(m, ChatMessage::User { .. })));
+        assert_eq!(
+            messages[1],
+            ChatMessage::Assistant {
+                text: "think 全文".to_string()
+            }
+        );
+        assert!(matches!(messages[2], ChatMessage::Assistant { .. }));
+    }
+
+    #[test]
+    fn insight_messages_append_subagent_result_segments_verbatim() {
+        // 0~N subagent 结果段：多段 assistant 原样连续、一次 LLM 调用。
+        let messages = build_insight_messages(
+            "PLATFORM_PROMPT".to_string(),
+            None,
+            &thinking_output("think 全文"),
+            None,
+            &["SEGMENT_A".to_string(), "SEGMENT_B".to_string()],
+        );
+        assert_eq!(messages.len(), 6);
+        assert_eq!(
+            messages[3],
+            ChatMessage::Assistant {
+                text: "SEGMENT_A".to_string()
+            }
+        );
+        assert_eq!(
+            messages[4],
+            ChatMessage::Assistant {
+                text: "SEGMENT_B".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn format_subagent_result_segment_includes_evidence_and_last_output() {
+        use crate::agent::execution_types::{
+            SubagentLifecycle, SubagentRuntimeState, SubagentStartup,
+        };
+        use crate::agent::subagent_memory::{LastOutput, MemoryEntry, SubagentMemory};
+        let state = SubagentRuntimeState {
+            subagent_id: "sg_abc".into(),
+            lifecycle: SubagentLifecycle::Idle,
+            last_output_truncated: None,
+            trigger: None,
+            startup: SubagentStartup::Normal,
+            lifecycle_kind: crate::agent::execution_types::SubagentLifecycleKind::Temporary,
+        };
+        let memory = SubagentMemory {
+            entries: vec![MemoryEntry {
+                t: "t1".into(),
+                input: "统计日志".into(),
+                actions: vec!["capability_id=shell.exec status=OK".into()],
+                evidence: vec!["OK shell.exec: done".into()],
+                output: "共 42 行".into(),
+            }],
+            truncation_records: vec![],
+        };
+        let last_output = LastOutput {
+            subagent_id: "sg_abc".into(),
+            t: "t2".into(),
+            status: "completed".into(),
+            summary: "任务完成".into(),
+        };
+        let text = format_subagent_result_segment(&state, &memory, Some(&last_output));
+        assert!(text.contains("sg_abc"));
+        assert!(text.contains("completed"));
+        assert!(text.contains("任务完成"));
+        assert!(text.contains("统计日志"));
+        assert!(text.contains("shell.exec"));
+        assert!(text.contains("共 42 行"));
+    }
+
+    #[test]
+    fn format_subagent_result_segment_truncates_overlong_segment() {
+        use crate::agent::execution_types::{
+            SubagentLifecycle, SubagentRuntimeState, SubagentStartup,
+        };
+        use crate::agent::subagent_memory::{MemoryEntry, SubagentMemory};
+        let state = SubagentRuntimeState {
+            subagent_id: "sg_big".into(),
+            lifecycle: SubagentLifecycle::Idle,
+            last_output_truncated: None,
+            trigger: None,
+            startup: SubagentStartup::Normal,
+            lifecycle_kind: crate::agent::execution_types::SubagentLifecycleKind::Temporary,
+        };
+        let memory = SubagentMemory {
+            entries: vec![MemoryEntry {
+                t: "t1".into(),
+                input: "x".repeat(10_000),
+                actions: vec![],
+                evidence: vec![],
+                output: String::new(),
+            }],
+            truncation_records: vec![],
+        };
+        let text = format_subagent_result_segment(&state, &memory, None);
+        let truncated =
+            crate::common::json_util::truncate_head_tail(&text, MAX_SUBAGENT_RESULT_SEGMENT_CHARS);
+        assert!(truncated.contains("truncated"));
+        assert!(
+            truncated.chars().count() <= MAX_SUBAGENT_RESULT_SEGMENT_CHARS + 64,
+            "segment must stay near budget, got {}",
+            truncated.chars().count()
+        );
     }
 
     #[test]

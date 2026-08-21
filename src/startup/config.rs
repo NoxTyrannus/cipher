@@ -23,11 +23,8 @@ pub struct Config {
     #[serde(default = "default_mode")]
     pub default_mode: String,
 
-    /// 全局协作配置（UNNI/KEEP/LOOP 共用同一协同节点与 Mix Thinking 开关）。
-    #[serde(default)]
-    pub collaboration: CollaborationSection,
-
-    /// 模式附加配置。unni/r#loop 仅用于旧配置迁移，迁移完成后不落盘。
+    /// 模式附加配置。旧 `[mode_styles.unni]` / `[mode_styles.loop]` 字段在读取时忽略+warn，
+    /// 不迁移落盘（放弃项 3）。
     #[serde(default)]
     pub mode_styles: ModeStyles,
 
@@ -47,72 +44,6 @@ fn default_data_dir() -> PathBuf {
 
 fn default_mode() -> String {
     "unni".to_string()
-}
-
-/// 协同节点：哪个中台完成时触发思考引擎。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum TriggerNode {
-    /// 执行中台。
-    #[default]
-    Execution,
-    /// 洞察中台。
-    Insight,
-    /// 记忆中台。
-    Memory,
-}
-
-impl TriggerNode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TriggerNode::Execution => "execution",
-            TriggerNode::Insight => "insight",
-            TriggerNode::Memory => "memory",
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            TriggerNode::Execution => "执行中台（执行完成即触发，最快）",
-            TriggerNode::Insight => "洞察中台（洞察完成即触发，含执行分析）",
-            TriggerNode::Memory => "记忆中台（记忆完成即触发，洞察+记忆完整沉淀）",
-        }
-    }
-
-    /// 协同节点之后的中台（异步执行，只沉淀记忆不触发）。
-    pub fn async_after(self) -> &'static [TriggerNode] {
-        match self {
-            TriggerNode::Execution => &[TriggerNode::Insight, TriggerNode::Memory],
-            TriggerNode::Insight => &[TriggerNode::Memory],
-            TriggerNode::Memory => &[],
-        }
-    }
-}
-
-/// 全局协作配置：`[collaboration]`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CollaborationSection {
-    #[serde(default = "default_collaboration_node")]
-    pub node: TriggerNode,
-    #[serde(default = "default_collaboration_mix_thinking")]
-    pub mix_thinking: bool,
-}
-
-fn default_collaboration_node() -> TriggerNode {
-    TriggerNode::Execution
-}
-
-fn default_collaboration_mix_thinking() -> bool {
-    true
-}
-
-impl Default for CollaborationSection {
-    fn default() -> Self {
-        Self {
-            node: default_collaboration_node(),
-            mix_thinking: default_collaboration_mix_thinking(),
-        }
-    }
 }
 
 /// KEEP 附加设置：成本护栏。
@@ -142,29 +73,11 @@ impl Default for KeepStyle {
     }
 }
 
-/// 旧 `[mode_styles.unni]` 的迁移载体。`style` 已删除，serde 会忽略旧字段。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyUnniStyle {
-    #[serde(default)]
-    pub node: Option<TriggerNode>,
-}
-
-/// 旧 `[mode_styles.loop]` 的迁移载体。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyLoopStyle {
-    #[serde(default)]
-    pub mix_thinking: bool,
-}
-
-/// 模式附加配置；unni/r#loop 字段仅用于读取旧配置并在 `Config::load` 中迁移。
+/// 模式附加配置；旧 unni/r#loop 字段由 serde 忽略（读取不报错），仅 KEEP 预算生效。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModeStyles {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unni: Option<LegacyUnniStyle>,
     #[serde(default = "default_keep_style")]
     pub keep: KeepStyle,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub r#loop: Option<LegacyLoopStyle>,
 }
 
 fn default_keep_style() -> KeepStyle {
@@ -174,34 +87,22 @@ fn default_keep_style() -> KeepStyle {
 impl Default for ModeStyles {
     fn default() -> Self {
         Self {
-            unni: None,
             keep: default_keep_style(),
-            r#loop: None,
         }
     }
 }
 
-/// 运行期共享的协作配置快照（全局节点 + Mix 开关 + KEEP 预算）。
+/// 运行期共享的协作配置快照（协同节点固定洞察 + mix 机制已删除，仅剩 KEEP 预算）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RuntimeStyles {
-    pub collaboration: CollaborationSection,
     pub keep: KeepStyle,
 }
 
 impl RuntimeStyles {
     pub fn from_config(config: &Config) -> Self {
         Self {
-            collaboration: config.collaboration,
             keep: config.mode_styles.keep,
         }
-    }
-
-    pub fn node(&self) -> TriggerNode {
-        self.collaboration.node
-    }
-
-    pub fn mix_on(&self, node: TriggerNode) -> bool {
-        node != TriggerNode::Execution && self.collaboration.mix_thinking
     }
 }
 
@@ -283,31 +184,10 @@ impl Config {
             api_key: String::new(),
             data_dir: default_data_dir(),
             default_mode: default_mode(),
-            collaboration: CollaborationSection::default(),
             mode_styles: ModeStyles::default(),
             default_model: None,
             context: ContextSection::default(),
         }
-    }
-
-    /// 将旧 `mode_styles.unni.node` / `mode_styles.loop.mix_thinking` 迁移到 `[collaboration]`。
-    /// 旧值优先；node=execution 时 Mix Thinking 自动视为关闭；迁移后清理旧字段。
-    pub fn migrate_collaboration(&mut self) {
-        let mut collaboration = self.collaboration;
-        if let Some(unni) = self.mode_styles.unni {
-            if let Some(node) = unni.node {
-                collaboration.node = node;
-            }
-        }
-        if let Some(r#loop) = self.mode_styles.r#loop {
-            collaboration.mix_thinking = r#loop.mix_thinking;
-        }
-        if collaboration.node == TriggerNode::Execution {
-            collaboration.mix_thinking = false;
-        }
-        self.collaboration = collaboration;
-        self.mode_styles.unni = None;
-        self.mode_styles.r#loop = None;
     }
 
     pub fn default_path() -> PathBuf {
@@ -326,10 +206,12 @@ impl Config {
         crate::data::permissions::secure_existing_file(path)?;
         let content = fs::read_to_string(path)
             .map_err(|e| crate::common::AgentError::Io(format!("read config {:?}: {}", path, e)))?;
-        let mut config: Config = toml::from_str(&content).map_err(|e| {
+        // 放弃项 1-3：旧 `[collaboration] node/mix_thinking` 与 `[mode_styles].unni/loop`
+        // 读取忽略 + warn，不迁移落盘（协同节点固定洞察，mix 机制整体删除）。
+        warn_legacy_collaboration_keys(&content);
+        let config: Config = toml::from_str(&content).map_err(|e| {
             crate::common::AgentError::Parse(format!("parse config {:?}: {}", path, e))
         })?;
-        config.migrate_collaboration();
         Ok(Some(config))
     }
 
@@ -405,6 +287,46 @@ impl Config {
             let _ = fs::remove_file(&temporary_path);
         }
         write_result
+    }
+}
+
+/// 放弃项 1-3：旧配置键读取忽略 + warn（不迁移落盘）。
+/// - `[collaboration] node`（三选一）→ 协同节点固定洞察；
+/// - `[collaboration] mix_thinking` → mix 机制整体删除（LOOP 无 mix）；
+/// - `[mode_styles.unni] node` / `[mode_styles.loop] mix_thinking` → 旧字段迁移已删除。
+fn warn_legacy_collaboration_keys(content: &str) {
+    let Ok(value) = content.parse::<toml::Value>() else {
+        return; // 解析失败交给 Config 反序列化报错处理
+    };
+    let mut legacy_found = false;
+    if let Some(collab) = value.get("collaboration") {
+        if collab.get("node").is_some() {
+            tracing::warn!(
+                "config: 旧键 [collaboration] node 已忽略（协同节点固定洞察，不迁移落盘）"
+            );
+            legacy_found = true;
+        }
+        if collab.get("mix_thinking").is_some() {
+            tracing::warn!("config: 旧键 [collaboration] mix_thinking 已忽略（mix 机制整体删除）");
+            legacy_found = true;
+        }
+    }
+    if let Some(styles) = value.get("mode_styles") {
+        if styles.get("unni").is_some() {
+            tracing::warn!(
+                "config: 旧键 [mode_styles.unni] 已忽略（旧字段迁移已删除，不迁移落盘）"
+            );
+            legacy_found = true;
+        }
+        if styles.get("loop").is_some() {
+            tracing::warn!(
+                "config: 旧键 [mode_styles.loop] 已忽略（旧字段迁移已删除，不迁移落盘）"
+            );
+            legacy_found = true;
+        }
+    }
+    if legacy_found {
+        tracing::info!("config: 已忽略旧协作配置键，未迁移落盘");
     }
 }
 
@@ -513,62 +435,19 @@ mod tests {
     }
 
     #[test]
-    fn collaboration_defaults() {
-        let c = CollaborationSection::default();
-        assert_eq!(c.node, TriggerNode::Execution);
-        assert!(c.mix_thinking);
-    }
-
-    #[test]
     fn mode_styles_defaults_keep_only() {
         let m = ModeStyles::default();
         assert_eq!(m.keep.token_budget, 0);
         assert_eq!(m.keep.time_budget_secs, 0);
-        assert!(m.unni.is_none());
-        assert!(m.r#loop.is_none());
     }
 
     #[test]
-    fn runtime_styles_mix_auto_off_for_execution_node() {
-        let mut c = Config::default_config();
-        c.collaboration.node = TriggerNode::Execution;
-        c.collaboration.mix_thinking = true;
+    fn runtime_styles_carries_keep_budget_only() {
+        // 放弃项 1/2/10：协同节点固定洞察 + mix 删除后，RuntimeStyles 仅剩 KEEP 预算。
+        let c = Config::default_config();
         let styles = RuntimeStyles::from_config(&c);
-        assert!(!styles.mix_on(TriggerNode::Execution));
-
-        c.collaboration.node = TriggerNode::Insight;
-        let styles = RuntimeStyles::from_config(&c);
-        assert!(styles.mix_on(TriggerNode::Insight));
-        assert!(styles.mix_on(TriggerNode::Memory));
-
-        c.collaboration.mix_thinking = false;
-        let styles = RuntimeStyles::from_config(&c);
-        assert!(!styles.mix_on(TriggerNode::Memory));
-    }
-
-    #[test]
-    fn trigger_node_serde_roundtrip_lowercase() {
-        for (node, text) in [
-            (TriggerNode::Execution, "execution"),
-            (TriggerNode::Insight, "insight"),
-            (TriggerNode::Memory, "memory"),
-        ] {
-            let encoded = serde_json::to_string(&node).unwrap();
-            assert_eq!(encoded, format!("\"{text}\""), "encode {text}");
-            let decoded: TriggerNode = serde_json::from_str(&format!("\"{text}\"")).unwrap();
-            assert_eq!(decoded, node, "decode {text}");
-        }
-        assert!(serde_json::from_str::<TriggerNode>("\"quantum\"").is_err());
-    }
-
-    #[test]
-    fn trigger_node_async_after_semantics() {
-        assert_eq!(
-            TriggerNode::Execution.async_after(),
-            &[TriggerNode::Insight, TriggerNode::Memory]
-        );
-        assert_eq!(TriggerNode::Insight.async_after(), &[TriggerNode::Memory]);
-        assert_eq!(TriggerNode::Memory.async_after(), &[]);
+        assert_eq!(styles.keep.token_budget, 0);
+        assert_eq!(styles.keep.time_budget_secs, 0);
     }
 
     #[test]
@@ -595,61 +474,49 @@ mod tests {
     }
 
     #[test]
-    fn mode_styles_unknown_value_fails_parse() {
-        assert!(toml::from_str::<ModeStyles>("unni = { node = \"quantum\" }").is_err());
+    fn mode_styles_keep_negative_token_fails_parse() {
         assert!(toml::from_str::<ModeStyles>("keep = { token_budget = -1 }").is_err());
     }
 
     #[test]
-    fn legacy_unni_node_migrates_to_collaboration_with_old_value_priority() {
+    fn legacy_collaboration_keys_ignored_without_migration() {
+        // 放弃项 1-3：旧 [collaboration] node/mix_thinking 与 [mode_styles].unni/loop
+        // 读取忽略 + warn（不迁移落盘），解析不报错。
         let legacy = r#"
             [collaboration]
             node = "memory"
-            mix_thinking = false
+            mix_thinking = true
 
             [mode_styles.unni]
-            style = "follow"
             node = "insight"
 
             [mode_styles.loop]
             mix_thinking = true
         "#;
-        let mut cfg: Config = toml::from_str(legacy).unwrap();
-        cfg.migrate_collaboration();
-        assert_eq!(cfg.collaboration.node, TriggerNode::Insight);
-        assert!(cfg.collaboration.mix_thinking);
-        assert!(cfg.mode_styles.unni.is_none());
-        assert!(cfg.mode_styles.r#loop.is_none());
+        let cfg: Config = toml::from_str(legacy).unwrap();
+        assert_eq!(cfg.mode_styles.keep, KeepStyle::default());
     }
 
     #[test]
-    fn legacy_execution_node_forces_mix_off() {
-        let legacy = r#"
-            [mode_styles.unni]
-            node = "execution"
-            [mode_styles.loop]
-            mix_thinking = true
-        "#;
-        let mut cfg: Config = toml::from_str(legacy).unwrap();
-        cfg.migrate_collaboration();
-        assert_eq!(cfg.collaboration.node, TriggerNode::Execution);
-        assert!(!cfg.collaboration.mix_thinking);
-    }
-
-    #[test]
-    fn load_migrates_legacy_fields_on_disk() {
+    fn load_ignores_legacy_collaboration_keys_on_disk() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
         std::fs::write(
             &path,
-            "[mode_styles.unni]\nnode = \"memory\"\n[mode_styles.loop]\nmix_thinking = false\n",
+            "[collaboration]\nnode = \"execution\"\nmix_thinking = true\n[mode_styles.unni]\nnode = \"memory\"\n[mode_styles.loop]\nmix_thinking = false\n",
         )
         .unwrap();
         let loaded = Config::load(&path).unwrap().unwrap();
-        assert_eq!(loaded.collaboration.node, TriggerNode::Memory);
-        assert!(!loaded.collaboration.mix_thinking);
-        assert!(loaded.mode_styles.unni.is_none());
-        assert!(loaded.mode_styles.r#loop.is_none());
+        // 协同节点固定洞察 + mix 删除：旧值被忽略，配置仍可正常加载。
+        assert_eq!(loaded.mode_styles.keep, KeepStyle::default());
+        assert_eq!(loaded.default_mode, "unni");
+    }
+
+    #[test]
+    fn legacy_warn_detects_old_keys() {
+        // warn_legacy_collaboration_keys 对无旧键内容静默（不 panic、不产生副作用）。
+        warn_legacy_collaboration_keys("[mode_styles.keep]\ntoken_budget = 200000\n");
+        warn_legacy_collaboration_keys("not toml {{");
     }
 
     #[test]
@@ -680,10 +547,6 @@ mod tests {
             api_key: "sk-test-roundtrip".into(),
             data_dir: PathBuf::from("/tmp/data"),
             default_mode: "keep".into(),
-            collaboration: CollaborationSection {
-                node: TriggerNode::Insight,
-                mix_thinking: true,
-            },
             mode_styles: ModeStyles::default(),
             default_model: None,
             context: ContextSection::default(),
@@ -695,8 +558,6 @@ mod tests {
         assert_eq!(loaded.api_key, "sk-test-roundtrip");
         assert_eq!(loaded.data_dir, PathBuf::from("/tmp/data"));
         assert_eq!(loaded.default_mode, "keep");
-        assert_eq!(loaded.collaboration.node, TriggerNode::Insight);
-        assert!(loaded.collaboration.mix_thinking);
         assert_eq!(loaded.mode_styles.keep, KeepStyle::default());
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -720,7 +581,6 @@ mod tests {
             api_key: "z".into(),
             data_dir: PathBuf::from("."),
             default_mode: "unni".into(),
-            collaboration: CollaborationSection::default(),
             mode_styles: ModeStyles::default(),
             default_model: None,
             context: ContextSection::default(),

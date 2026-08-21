@@ -199,14 +199,11 @@ impl MemoryPlatform {
         )
         .await;
 
-        let attention_prompt = build_attention_prompt(
-            &base_prompt,
-            &ctx.thinking.goal,
-            &ctx.thinking.message,
-            insight,
-            execution,
-            &existing_attention,
-        );
+        // 2.0.3 记忆中台输入：一个完整轮次的三输出（思考引擎/执行中台/洞察中台），
+        // 多段 assistant 原样连续、一次 LLM 调用（无 User 段、无段内包装）；
+        // 异常路径缺段时不补空段。单段拼接 prompt（build_attention_prompt 段落合并）已废弃。
+        let attention_prompt = build_attention_prompt(&base_prompt, &existing_attention);
+        let assistant_segments = build_memory_assistant_segments(&ctx.thinking, execution, insight);
 
         let (Some(registry), Some(executor)) = (&self.registry, &self.executor) else {
             tracing::warn!(
@@ -229,7 +226,7 @@ impl MemoryPlatform {
             CapabilityLoopRequest {
                 actor_id: "attention-agent".to_string(),
                 system_prompt,
-                user_input: Some(ctx.user_message.clone()),
+                assistant_segments,
                 user_prompt: format!(
                     "提取并维护注意力记忆。当前轮 thought_id = {turn_id}，作为 source_refs 证据索引。开始执行。"
                 ),
@@ -694,44 +691,61 @@ fn parse_memory_agent_output(content: &str) -> MemoryAgentOutput {
     }
 }
 
-fn build_attention_prompt(
-    base_prompt: &str,
-    goal: &str,
-    think: &str,
-    insight: &InsightOutput,
-    execution: Option<&ExecutionOutput>,
-    existing_attention: &str,
-) -> String {
-    let insight_summary =
-        crate::common::json_util::truncate_head_tail(&insight.insight.insight, 2000);
-
-    let execution_summary = match execution {
-        Some(exec) => {
-            let mut lines = vec![
-                format!("task_design: {}", exec.task_design),
-                format!("task_status: {}", exec.task_status),
-            ];
-            for record in &exec.lifecycle_actions {
-                lines.push(format!(
-                    "  - capability_id={} lifecycle={:?} (calls={})",
-                    record.capability_id,
-                    record.lifecycle_state,
-                    record.capability_call_logs.len()
-                ));
-                if let Some(ref err) = record.error {
-                    lines.push(format!("    error: {}", err));
-                }
-            }
-            lines.join("\n")
-        }
-        None => "No execution data available.".to_string(),
-    };
-
-    let think_summary = crate::common::json_util::truncate_head_tail(think, 2000);
+/// 记忆中台 System(平台提示词)：基础提示词 + 已有注意力快照（RAG 检索结果）。
+/// 2.0.3：单段拼接（## Goal/## Think/## Insight/## Execution 段落合并）已废弃。
+fn build_attention_prompt(base_prompt: &str, existing_attention: &str) -> String {
     format!(
-        "{}\n\n## Goal\n{}\n\n## Think\n{}\n\n## Insight Analysis\n{}\n\n## Execution Results\n{}\n\n## Existing Attention\n{}",
-        base_prompt, goal, think_summary, insight_summary, execution_summary, existing_attention,
+        "{}\n\n## Existing Attention\n{}",
+        base_prompt, existing_attention
     )
+}
+
+/// 三输出段截断预算（每段）。
+const MEMORY_SEGMENT_TRUNCATE_CHARS: usize = 2000;
+
+/// 2.0.3 记忆中台输入组装：一个完整轮次的三个输出 —— 思考引擎输出（think_message）、
+/// 执行中台输出（ExecutionOutput）、洞察中台输出（InsightOutput）；
+/// 多段 assistant 原样连续、一次 LLM 调用，不做段内包装；缺段时不补空段。
+fn build_memory_assistant_segments(
+    thinking: &crate::agent::communication::ThinkingOutput,
+    execution: Option<&ExecutionOutput>,
+    insight: &InsightOutput,
+) -> Vec<String> {
+    let mut segments = Vec::with_capacity(3);
+    if !thinking.think_message.trim().is_empty() {
+        segments.push(crate::common::json_util::truncate_head_tail(
+            &thinking.think_message,
+            MEMORY_SEGMENT_TRUNCATE_CHARS,
+        ));
+    }
+    if let Some(exec) = execution {
+        let mut lines = vec![
+            format!("task_design: {}", exec.task_design),
+            format!("task_status: {}", exec.task_status),
+        ];
+        for record in &exec.lifecycle_actions {
+            lines.push(format!(
+                "  - capability_id={} lifecycle={:?} (calls={})",
+                record.capability_id,
+                record.lifecycle_state,
+                record.capability_call_logs.len()
+            ));
+            if let Some(ref err) = record.error {
+                lines.push(format!("    error: {}", err));
+            }
+        }
+        segments.push(crate::common::json_util::truncate_head_tail(
+            &lines.join("\n"),
+            MEMORY_SEGMENT_TRUNCATE_CHARS,
+        ));
+    }
+    if !insight.insight.insight.trim().is_empty() {
+        segments.push(crate::common::json_util::truncate_head_tail(
+            &insight.insight.insight,
+            MEMORY_SEGMENT_TRUNCATE_CHARS,
+        ));
+    }
+    segments
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -795,19 +809,90 @@ mod tests {
     }
 
     #[test]
-    fn attention_prompt_includes_think_section_for_judgement() {
-        let prompt = build_attention_prompt(
-            "BASE",
-            "goal text",
-            "think 中发现用户偏好暗色主题",
-            &make_insight_output(),
-            None,
-            "existing attention",
-        );
-        assert!(prompt.contains("## Goal"));
-        assert!(prompt.contains("## Think"));
-        assert!(prompt.contains("think 中发现用户偏好暗色主题"));
+    fn attention_prompt_keeps_base_and_existing_attention() {
+        let prompt = build_attention_prompt("BASE", "existing attention");
+        assert!(prompt.contains("BASE"));
+        assert!(prompt.contains("Existing Attention"));
         assert!(prompt.contains("existing attention"));
+    }
+
+    #[test]
+    fn memory_assistant_segments_three_outputs_in_order() {
+        // 2.0.3：三输出多段 assistant 组装（思考引擎 / 执行中台 / 洞察中台）。
+        let thinking = crate::agent::communication::ThinkingOutput {
+            decision: crate::agent::communication::ThinkDecision::Execute,
+            think_message: "think 中发现用户偏好暗色主题".into(),
+            constraints: vec![],
+        };
+        let execution = ExecutionOutput {
+            task_design: "设计".into(),
+            task_status: "等待".into(),
+            lifecycle_actions: vec![CapabilityLifecycleRecord {
+                capability_id: "subagent.run".into(),
+                capability_name: "Run Subagent".into(),
+                arguments_summary: "{}".into(),
+                lifecycle_state: CapabilityLifecycleState::Accepted,
+                invocation_ref: None,
+                error: None,
+                capability_call_logs: vec!["START subagent.run".into()],
+            }],
+            subagent_states: vec![],
+        };
+        let segments =
+            build_memory_assistant_segments(&thinking, Some(&execution), &make_insight_output());
+        assert_eq!(segments.len(), 3);
+        assert!(segments[0].contains("暗色主题"));
+        assert!(segments[1].contains("task_design"));
+        assert!(segments[1].contains("subagent.run"));
+        assert!(segments[2].contains("all within bounds"));
+    }
+
+    #[test]
+    fn memory_assistant_segments_missing_outputs_not_padded() {
+        // 2.0.3：异常路径缺段时不补空段。
+        let thinking = crate::agent::communication::ThinkingOutput {
+            decision: crate::agent::communication::ThinkDecision::Execute,
+            think_message: "only think".into(),
+            constraints: vec![],
+        };
+        let segments = build_memory_assistant_segments(&thinking, None, &make_insight_output());
+        assert_eq!(segments.len(), 2, "缺执行输出 → 不补空段");
+        assert_eq!(segments[0], "only think");
+
+        let empty_insight = InsightOutput {
+            insight: crate::agent::communication::InsightResult {
+                insight: String::new(),
+            },
+            usage_observations: vec![],
+        };
+        let segments = build_memory_assistant_segments(&thinking, None, &empty_insight);
+        assert_eq!(segments.len(), 1, "洞察为空 + 无执行 → 只剩 think");
+    }
+
+    #[test]
+    fn memory_assistant_segments_truncate_overlong() {
+        let thinking = crate::agent::communication::ThinkingOutput {
+            decision: crate::agent::communication::ThinkDecision::Execute,
+            think_message: "x".repeat(10_000),
+            constraints: vec![],
+        };
+        let segments = build_memory_assistant_segments(
+            &thinking,
+            None,
+            &InsightOutput {
+                insight: crate::agent::communication::InsightResult {
+                    insight: String::new(),
+                },
+                usage_observations: vec![],
+            },
+        );
+        assert_eq!(segments.len(), 1);
+        assert!(segments[0].contains("truncated"));
+        assert!(
+            segments[0].chars().count() <= MEMORY_SEGMENT_TRUNCATE_CHARS + 64,
+            "segment must stay near budget, got {}",
+            segments[0].chars().count()
+        );
     }
 
     #[test]

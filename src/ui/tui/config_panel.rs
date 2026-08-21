@@ -1,23 +1,14 @@
 use crate::data::duckdb::loader::ModelRow;
-use crate::startup::config::TriggerNode;
 use crossterm::event::KeyCode;
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
-pub const PRESET_TEMPLATES: &[(&str, &str, &str, &str)] = &[
-    (
-        "OpenAI 官方",
-        "openai",
-        "https://api.openai.com/v1",
-        "OpenAI",
-    ),
-    (
-        "Anthropic 官方",
-        "anthropic",
-        "https://api.anthropic.com",
-        "Anthropic",
-    ),
-];
+pub const PRESET_TEMPLATES: &[(&str, &str, &str, &str)] = &[(
+    "OpenAI 官方",
+    "openai",
+    "https://api.openai.com/v1",
+    "OpenAI",
+)];
 
 const MENU_ITEMS: &[(&str, bool)] = &[
     ("Model + Provider", true),
@@ -27,34 +18,8 @@ const MENU_ITEMS: &[(&str, bool)] = &[
 ];
 
 /// 协作设置子菜单项（与 /config CLI 的 manage_mode_styles 保持一致）。
-const MODE_STYLE_SUBMENU_LEN: usize = 4;
-
-fn mode_style_options_len(target: usize) -> usize {
-    match target {
-        0 => 3, // 协同节点
-        1 => 2, // Mix 思考
-        _ => 0,
-    }
-}
-
-/// 由目标项 + 光标位置生成待保存的值。
-fn mode_style_option(target: usize, cursor: usize) -> String {
-    match target {
-        0 => match cursor {
-            0 => TriggerNode::Execution.as_str().to_string(),
-            1 => TriggerNode::Insight.as_str().to_string(),
-            _ => TriggerNode::Memory.as_str().to_string(),
-        },
-        1 => {
-            if cursor == 0 {
-                "off".to_string()
-            } else {
-                "on".to_string()
-            }
-        }
-        _ => String::new(),
-    }
-}
+/// 放弃项 1/2/10：协同节点固定洞察 + mix 机制删除，仅保留 KEEP 预算两项。
+const MODE_STYLE_SUBMENU_LEN: usize = 2;
 
 #[derive(Debug, Clone)]
 pub enum ActionResult {
@@ -121,20 +86,13 @@ pub enum ConfigView {
 
     DeleteModelConfirm(DeleteModelConfirm),
 
-    /// 协同模式风格：子菜单（UNNI 协同方式 / UNNI 协同节点 / KEEP 预算 / LOOP 融合思考）。
+    /// 协作模式风格：子菜单（KEEP Token 预算 / KEEP 时间预算）。
+    /// 放弃项 1/2/10：协同节点选择与 Mix 项已删除（协同节点固定洞察）。
     ModeStyleSubMenu {
         cursor: usize,
     },
 
-    /// 选择器：统一承载"选中选项 → 提交"（仅协同方式/节点/LOOP Mix）。
-    ModeStyleSelect {
-        /// 子菜单中的目标项索引（0=UNNI 协同方式, 1=UNNI 协同节点, 4=LOOP 融合思考）。
-        target: usize,
-        cursor: usize,
-        submitted: bool,
-    },
-
-    /// KEEP 预算数字输入表单（子菜单 target=2 token / target=3 时间）。
+    /// KEEP 预算数字输入表单（子菜单 target=0 token / target=1 时间）。
     KeepBudgetInput(KeepBudgetInput),
 
     RenameAgent(RenameAgentForm),
@@ -240,17 +198,6 @@ impl ConfigPanel {
                     .unwrap_or_default();
                 DbRequest::SubmitSetDefault { model_id }
             }
-            ConfigView::ModeStyleSelect {
-                target,
-                cursor,
-                submitted,
-            } if *submitted => {
-                let value = mode_style_option(*target, *cursor);
-                DbRequest::SaveModeStyle {
-                    target: *target,
-                    value,
-                }
-            }
             ConfigView::KeepBudgetInput(form) if form.submitted => DbRequest::SaveModeStyle {
                 target: form.target,
                 value: form.input.trim().to_string(),
@@ -267,7 +214,6 @@ impl ConfigPanel {
             ConfigView::AddModel(f) => f.submitted = false,
             ConfigView::SetDefault(s) => s.submitted = false,
             ConfigView::DeleteModelConfirm(f) => f.submitted = false,
-            ConfigView::ModeStyleSelect { submitted, .. } => *submitted = false,
             ConfigView::KeepBudgetInput(form) => form.submitted = false,
             ConfigView::RenameAgent(f) => f.submitted = false,
             _ => {}
@@ -316,22 +262,6 @@ impl ConfigPanel {
 
                 if matches!(self.view, ConfigView::Menu) && self.expanded.is_some() {
                     self.view = ConfigView::ModeStyleSubMenu { cursor };
-                }
-                r
-            }
-            ConfigView::ModeStyleSelect {
-                target,
-                mut cursor,
-                mut submitted,
-            } => {
-                let r = self.handle_mode_style_select_key(key, target, &mut cursor, &mut submitted);
-
-                if matches!(self.view, ConfigView::Menu) && self.expanded.is_some() {
-                    self.view = ConfigView::ModeStyleSelect {
-                        target,
-                        cursor,
-                        submitted,
-                    };
                 }
                 r
             }
@@ -628,52 +558,11 @@ impl ConfigPanel {
             KeyCode::Esc => ActionResult::Exit,
             KeyCode::Right | KeyCode::Enter => {
                 let target = *cursor;
-                if matches!(target, 2 | 3) {
-                    self.view = ConfigView::KeepBudgetInput(KeepBudgetInput {
-                        target,
-                        input: String::new(),
-                        submitted: false,
-                    });
-                } else {
-                    self.view = ConfigView::ModeStyleSelect {
-                        target,
-                        cursor: 0,
-                        submitted: false,
-                    };
-                }
-                ActionResult::Navigate
-            }
-            _ => ActionResult::Navigate,
-        }
-    }
-
-    fn handle_mode_style_select_key(
-        &mut self,
-        key: KeyCode,
-        target: usize,
-        cursor: &mut usize,
-        submitted: &mut bool,
-    ) -> ActionResult {
-        match key {
-            KeyCode::Up => {
-                if *cursor > 0 {
-                    *cursor -= 1;
-                }
-                ActionResult::Navigate
-            }
-            KeyCode::Down => {
-                if *cursor < mode_style_options_len(target).saturating_sub(1) {
-                    *cursor += 1;
-                }
-                ActionResult::Navigate
-            }
-            KeyCode::Left => {
-                self.view = ConfigView::ModeStyleSubMenu { cursor: 0 };
-                ActionResult::Navigate
-            }
-            KeyCode::Esc => ActionResult::Exit,
-            KeyCode::Right | KeyCode::Enter => {
-                *submitted = true;
+                self.view = ConfigView::KeepBudgetInput(KeepBudgetInput {
+                    target,
+                    input: String::new(),
+                    submitted: false,
+                });
                 ActionResult::Navigate
             }
             _ => ActionResult::Navigate,
@@ -755,8 +644,7 @@ impl ConfigPanel {
             }
             ConfigView::AddModelSelectTemplate { .. }
             | ConfigView::SetDefault(_)
-            | ConfigView::ModeStyleSubMenu { .. }
-            | ConfigView::ModeStyleSelect { .. } => {
+            | ConfigView::ModeStyleSubMenu { .. } => {
                 "← 返回上级    ↑↓ 选择    → 确认    Esc 退出设置"
             }
             ConfigView::AddModel(_) => "← 取消        Tab 下一字段  Enter 确认    Esc 退出设置",
@@ -814,14 +702,6 @@ pub fn render(panel: &ConfigPanel, frame: &mut Frame, area: Rect) {
         }
         ConfigView::ModeStyleSubMenu { cursor } => {
             render_mode_style_submenu(panel, frame, content_area, *cursor);
-        }
-        ConfigView::ModeStyleSelect {
-            target,
-            cursor,
-            submitted,
-        } => {
-            let _ = submitted;
-            render_mode_style_select(panel, frame, content_area, *target, *cursor);
         }
         ConfigView::KeepBudgetInput(form) => {
             render_keep_budget_input(panel, frame, content_area, form);
@@ -1118,8 +998,6 @@ fn render_mode_style_submenu(_panel: &ConfigPanel, frame: &mut Frame, area: Rect
     use ratatui::widgets::Paragraph;
 
     let items: [(&str, &str); MODE_STYLE_SUBMENU_LEN] = [
-        ("协同节点", "执行 / 洞察 / 记忆 (UNNI/KEEP/LOOP 共用)"),
-        ("Mix 思考", "开 / 关 (节点为执行中台时自动关)"),
         ("KEEP Token 预算", "0=无限, 最小 100K"),
         ("KEEP 时间预算", "0=无限, 最小 5min"),
     ];
@@ -1151,60 +1029,6 @@ fn render_mode_style_submenu(_panel: &ConfigPanel, frame: &mut Frame, area: Rect
     }
     frame.render_widget(Paragraph::new(lines), area);
 }
-
-fn render_mode_style_select(
-    _panel: &ConfigPanel,
-    frame: &mut Frame,
-    area: Rect,
-    target: usize,
-    cursor: usize,
-) {
-    use ratatui::style::{Color, Modifier, Style};
-    use ratatui::text::{Line, Span};
-    use ratatui::widgets::Paragraph;
-
-    let (title, options): (&str, Vec<&str>) = match target {
-        0 => (
-            "协同节点",
-            vec![
-                TriggerNode::Execution.label(),
-                TriggerNode::Insight.label(),
-                TriggerNode::Memory.label(),
-            ],
-        ),
-        1 => (
-            "Mix 思考",
-            vec!["关 (顺序触发)", "开 (流水线并行 + 拼接合并)"],
-        ),
-        _ => ("", vec![]),
-    };
-
-    let mut lines: Vec<Line> = vec![
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            format!("{title}:"),
-            Style::default().fg(Color::Gray),
-        )]),
-        Line::from(""),
-    ];
-    for (i, desc) in options.iter().enumerate() {
-        let is_sel = cursor == i;
-        let style = if is_sel {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        let marker = if is_sel { "▶" } else { " " };
-        lines.push(Line::from(vec![
-            Span::styled(format!(" {} ", marker), style),
-            Span::styled(*desc, style),
-        ]));
-    }
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
 fn render_keep_budget_input(
     _panel: &ConfigPanel,
     frame: &mut Frame,
@@ -1215,7 +1039,7 @@ fn render_keep_budget_input(
     use ratatui::text::{Line, Span};
     use ratatui::widgets::Paragraph;
 
-    let (title, unit, minimum, minimum_label) = if form.target == 2 {
+    let (title, unit, minimum, minimum_label) = if form.target == 0 {
         ("KEEP Token 预算", "K", "100", "100K (100,000 token)")
     } else {
         ("KEEP 时间预算", "min", "5", "5min (300 秒)")
@@ -1338,29 +1162,11 @@ mod tests {
         panel.view = ConfigView::ModeStyleSubMenu { cursor: 1 };
         let text = render_to_text(&panel).replace(' ', "");
         assert!(text.contains("协作设置"), "submenu title: {text}");
-        assert!(text.contains("协同节点"), "item 1: {text}");
-        assert!(text.contains("Mix思考"), "item 2: {text}");
-        assert!(text.contains("KEEPToken"), "item 3: {text}");
-        assert!(text.contains("KEEP时间"), "item 4: {text}");
+        assert!(text.contains("KEEPToken"), "item 1: {text}");
+        assert!(text.contains("KEEP时间"), "item 2: {text}");
+        assert!(!text.contains("协同节点"), "node item removed: {text}");
+        assert!(!text.contains("Mix"), "mix item removed: {text}");
         assert!(!text.contains("UNNI协同方式"), "style item removed: {text}");
-        assert!(
-            !text.contains("LOOP融合思考"),
-            "loop-only mix item removed: {text}"
-        );
-    }
-
-    #[test]
-    fn mode_style_select_renders_without_panic() {
-        let mut panel = ConfigPanel::new();
-        panel.expanded = Some(3);
-        panel.view = ConfigView::ModeStyleSelect {
-            target: 0,
-            cursor: 1,
-            submitted: false,
-        };
-        let text = render_to_text(&panel).replace(' ', "");
-        assert!(text.contains("协同节点"), "select title: {text}");
-        assert!(text.contains("执行中台"), "option 0: {text}");
     }
 
     #[test]
@@ -1437,128 +1243,21 @@ mod tests {
     }
 
     #[test]
-    fn mode_style_submenu_navigates_and_enters_select() {
+    fn mode_style_submenu_enter_opens_keep_budget_input() {
         let mut p = ConfigPanel::new();
-        for _ in 0..3 {
-            p.handle_key(KeyCode::Down);
-        }
-        p.handle_key(KeyCode::Right);
-
-        // 子菜单默认光标 0 → 进入 UNNI 协同方式选择
+        p.expanded = Some(3);
+        p.view = ConfigView::ModeStyleSubMenu { cursor: 0 };
         p.handle_key(KeyCode::Enter);
         assert!(matches!(
             p.view,
-            ConfigView::ModeStyleSelect { target: 0, .. }
-        ));
-    }
-
-    #[test]
-    fn mode_style_select_node_submits_insight_and_clears() {
-        let mut p = ConfigPanel::new();
-        p.expanded = Some(3);
-        p.view = ConfigView::ModeStyleSelect {
-            target: 0,
-            cursor: 1,
-            submitted: false,
-        };
-        p.handle_key(KeyCode::Enter);
-        assert_eq!(
-            p.pending_db_request(),
-            DbRequest::SaveModeStyle {
-                target: 0,
-                value: "insight".to_string()
-            }
-        );
-        p.clear_db_request();
-        assert_eq!(p.pending_db_request(), DbRequest::None);
-    }
-
-    #[test]
-    fn mode_style_select_node_submits_memory() {
-        let mut p = ConfigPanel::new();
-        p.expanded = Some(3);
-        p.view = ConfigView::ModeStyleSelect {
-            target: 0,
-            cursor: 2,
-            submitted: false,
-        };
-        p.handle_key(KeyCode::Enter);
-        assert_eq!(
-            p.pending_db_request(),
-            DbRequest::SaveModeStyle {
-                target: 0,
-                value: "memory".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn mode_style_select_node_down_twice_reaches_memory() {
-        let mut p = ConfigPanel::new();
-        p.expanded = Some(3);
-        p.view = ConfigView::ModeStyleSelect {
-            target: 0,
-            cursor: 0,
-            submitted: false,
-        };
-        p.handle_key(KeyCode::Down);
-        p.handle_key(KeyCode::Down);
-        if let ConfigView::ModeStyleSelect { cursor, .. } = &p.view {
-            assert_eq!(*cursor, 2, "two Down presses must reach Memory option");
-        } else {
-            panic!("still ModeStyleSelect");
-        }
-        p.handle_key(KeyCode::Down);
-        if let ConfigView::ModeStyleSelect { cursor, .. } = &p.view {
-            assert_eq!(*cursor, 2, "Down must not move past the last option");
-        } else {
-            panic!();
-        }
-        p.handle_key(KeyCode::Enter);
-        assert_eq!(
-            p.pending_db_request(),
-            DbRequest::SaveModeStyle {
-                target: 0,
-                value: "memory".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn mode_style_select_loop_mix_submits() {
-        let mut p = ConfigPanel::new();
-        p.expanded = Some(3);
-        p.view = ConfigView::ModeStyleSelect {
-            target: 1,
-            cursor: 1,
-            submitted: false,
-        };
-        p.handle_key(KeyCode::Enter);
-        assert_eq!(
-            p.pending_db_request(),
-            DbRequest::SaveModeStyle {
-                target: 1,
-                value: "on".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn keep_budget_enter_from_submenu_opens_numeric_input() {
-        let mut p = ConfigPanel::new();
-        p.expanded = Some(3);
-        p.view = ConfigView::ModeStyleSubMenu { cursor: 2 };
-        p.handle_key(KeyCode::Enter);
-        assert!(matches!(
-            p.view,
-            ConfigView::KeepBudgetInput(KeepBudgetInput { target: 2, .. })
+            ConfigView::KeepBudgetInput(KeepBudgetInput { target: 0, .. })
         ));
 
-        p.view = ConfigView::ModeStyleSubMenu { cursor: 3 };
+        p.view = ConfigView::ModeStyleSubMenu { cursor: 1 };
         p.handle_key(KeyCode::Enter);
         assert!(matches!(
             p.view,
-            ConfigView::KeepBudgetInput(KeepBudgetInput { target: 3, .. })
+            ConfigView::KeepBudgetInput(KeepBudgetInput { target: 1, .. })
         ));
     }
 
@@ -1566,7 +1265,7 @@ mod tests {
     fn keep_budget_input_submits_zero_and_values() {
         let mut p = ConfigPanel::new();
         p.view = ConfigView::KeepBudgetInput(KeepBudgetInput {
-            target: 2,
+            target: 0,
             input: "0".into(),
             submitted: false,
         });
@@ -1574,7 +1273,7 @@ mod tests {
         assert_eq!(
             p.pending_db_request(),
             DbRequest::SaveModeStyle {
-                target: 2,
+                target: 0,
                 value: "0".to_string()
             }
         );
@@ -1582,7 +1281,7 @@ mod tests {
         assert_eq!(p.pending_db_request(), DbRequest::None);
 
         p.view = ConfigView::KeepBudgetInput(KeepBudgetInput {
-            target: 3,
+            target: 1,
             input: "10".into(),
             submitted: false,
         });
@@ -1590,7 +1289,7 @@ mod tests {
         assert_eq!(
             p.pending_db_request(),
             DbRequest::SaveModeStyle {
-                target: 3,
+                target: 1,
                 value: "10".to_string()
             }
         );
@@ -1600,7 +1299,7 @@ mod tests {
     fn keep_budget_input_only_accepts_digits_and_backspace() {
         let mut p = ConfigPanel::new();
         p.view = ConfigView::KeepBudgetInput(KeepBudgetInput {
-            target: 2,
+            target: 0,
             input: String::new(),
             submitted: false,
         });
@@ -1624,24 +1323,12 @@ mod tests {
     fn keep_budget_input_esc_cancels_to_submenu() {
         let mut p = ConfigPanel::new();
         p.view = ConfigView::KeepBudgetInput(KeepBudgetInput {
-            target: 3,
+            target: 1,
             input: "0".into(),
             submitted: false,
         });
         p.handle_key(KeyCode::Esc);
-        assert!(matches!(p.view, ConfigView::ModeStyleSubMenu { cursor: 3 }));
-    }
-
-    #[test]
-    fn mode_style_select_left_returns_submenu() {
-        let mut p = ConfigPanel::new();
-        p.view = ConfigView::ModeStyleSelect {
-            target: 1,
-            cursor: 0,
-            submitted: false,
-        };
-        p.handle_key(KeyCode::Left);
-        assert!(matches!(p.view, ConfigView::ModeStyleSubMenu { .. }));
+        assert!(matches!(p.view, ConfigView::ModeStyleSubMenu { cursor: 1 }));
     }
 
     #[test]

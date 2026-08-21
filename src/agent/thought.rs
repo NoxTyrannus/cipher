@@ -16,16 +16,13 @@ pub enum ThinkingInput {
     User {
         text: String,
     },
-    PlatformEcho {
-        platform: InternalPlatform,
+    /// 洞察回环轮输入：insight_complete 触发思考引擎下一轮时注入。
+    /// `summary` 为洞察输出段原文；`has_subagent_result` 表示该轮洞察输入是否含
+    /// subagent 结果段（依据 AgentPool subagent 状态变化，中间/最终结果均计），
+    /// 供 UNNI 动态执行权判定（含结果 → 回环轮无执行权，等用户下一次输入）。
+    PlatformInsight {
         summary: String,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        artifact_refs: Vec<String>,
-    },
-    /// 融合思考（Mix Thinking）的中间反思实例：think 后不触发执行/洞察/记忆链，
-    /// 只产出 think 文本，供下一阶段拼接（同一思考引擎，上下文逐步累积）。
-    ReflectOnly {
-        summary: String,
+        has_subagent_result: bool,
     },
     ModeTrigger {
         mode: String,
@@ -38,14 +35,9 @@ pub enum ThinkingInput {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         artifact_refs: Vec<String>,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InternalPlatform {
-    Execution,
-    Insight,
-    Memory,
+    /// 旧版本落盘的内部轮（echo/reflect）兼容兜底：只保证可反序列化，不产生任何新语义。
+    #[serde(other)]
+    LegacyInternal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,19 +175,11 @@ pub enum ThoughtLifecycleState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InternalEcho {
-    pub summary: String,
-    pub artifact_refs: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThoughtContext {
     pub thought_id: ThoughtId,
     pub occurred_at: UtcTimestamp,
     pub input: ThinkingInput,
     pub output: Option<ThinkingOutput>,
-    pub execution_echo: Option<InternalEcho>,
-    pub insight_echo: Option<InternalEcho>,
     pub lifecycle_state: ThoughtLifecycleState,
 }
 
@@ -210,8 +194,6 @@ impl ThoughtContext {
             occurred_at,
             input,
             output: None,
-            execution_echo: None,
-            insight_echo: None,
             lifecycle_state: ThoughtLifecycleState::Thinking,
         }
     }
@@ -219,16 +201,6 @@ impl ThoughtContext {
     pub fn set_output(&mut self, output: ThinkingOutput) {
         self.lifecycle_state = lifecycle_after_output(&output);
         self.output = Some(output);
-    }
-
-    pub fn set_execution_echo(&mut self, echo: InternalEcho) {
-        self.execution_echo = Some(echo);
-        self.lifecycle_state = ThoughtLifecycleState::Insight;
-    }
-
-    pub fn set_insight_echo(&mut self, echo: InternalEcho) {
-        self.insight_echo = Some(echo);
-        self.lifecycle_state = ThoughtLifecycleState::Memory;
     }
 
     pub fn mark_completed(&mut self) {

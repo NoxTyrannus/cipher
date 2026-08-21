@@ -5,7 +5,6 @@ use crate::data::duckdb::loader::{
 };
 use crate::data::workspace_store::{WorkspaceRow, WorkspaceStore};
 use crate::data::ModelRow;
-use crate::logic::model::anthropic::AnthropicProvider;
 use crate::logic::model::api_key::resolve_api_key;
 use crate::logic::model::message::ChatMessage;
 use crate::logic::model::openai::OpenAiProvider;
@@ -16,20 +15,12 @@ use secrecy::SecretString;
 use std::path::Path;
 use std::sync::Arc;
 
-const PRESET_TEMPLATES: &[(&str, &str, &str, &str)] = &[
-    (
-        "OpenAI 官方",
-        "openai",
-        "https://api.openai.com/v1",
-        "OpenAI",
-    ),
-    (
-        "Anthropic 官方",
-        "anthropic",
-        "https://api.anthropic.com",
-        "Anthropic",
-    ),
-];
+const PRESET_TEMPLATES: &[(&str, &str, &str, &str)] = &[(
+    "OpenAI 官方",
+    "openai",
+    "https://api.openai.com/v1",
+    "OpenAI",
+)];
 
 pub async fn init_flow(app: &AppState, data_dir: &Path) -> Result<(), AgentError> {
     if has_configured_model(&app.duckdb)? {
@@ -88,7 +79,7 @@ async fn prompt_and_configure_model(app: &AppState, _data_dir: &Path) -> Result<
             (t.1.to_string(), t.2.to_string(), t.3.to_string())
         } else {
             let p = Input::<String>::new()
-                .with_prompt("provider 标识 (如 openai / anthropic / minimax)")
+                .with_prompt("provider 标识 (如 openai / minimax / responses)")
                 .interact_text()
                 .map_err(|e| AgentError::Parse(format!("provider input: {}", e)))?;
             let u = Input::<String>::new()
@@ -96,7 +87,7 @@ async fn prompt_and_configure_model(app: &AppState, _data_dir: &Path) -> Result<
                 .interact_text()
                 .map_err(|e| AgentError::Parse(format!("api_url input: {}", e)))?;
             let t = Input::<String>::new()
-                .with_prompt("api_type (OpenAI / Anthropic)")
+                .with_prompt("api_type (OpenAI / Responses)")
                 .default("OpenAI".to_string())
                 .interact_text()
                 .map_err(|e| AgentError::Parse(format!("api_type input: {}", e)))?;
@@ -180,13 +171,19 @@ pub fn build_provider_registry(model_row: &ModelRow) -> Result<ProviderRegistry,
     let mut registry = ProviderRegistry::new();
     match model_row.api_type.to_lowercase().as_str() {
         "openai" => registry.register(Arc::new(OpenAiProvider::new())),
-        "anthropic" => registry.register(Arc::new(AnthropicProvider::new())),
         "responses" => registry.register(Arc::new(ResponsesProvider::new())),
+        "anthropic" => {
+            return Err(AgentError::Llm(
+                "Anthropic API 支持已移除（只保留 Chat Completions + Responses 两种接入）；\
+                 请重新配置模型（api_type=OpenAI/Responses）"
+                    .to_string(),
+            ))
+        }
         other => {
             return Err(AgentError::Llm(format!(
-            "build_provider_registry: 未知 api_type '{}' (仅支持 OpenAI / Anthropic / Responses)",
-            other
-        )))
+                "build_provider_registry: 未知 api_type '{}' (仅支持 OpenAI / Responses)",
+                other
+            )))
         }
     }
     Ok(registry)
@@ -250,20 +247,40 @@ mod tests {
     }
 
     #[test]
-    fn build_provider_registry_anthropic() {
+    fn build_provider_registry_rejects_anthropic() {
+        // TE：Anthropic API 支持已移除（只保留 Chat Completions + Responses），api_type 校验拒绝。
         let row = crate::data::ModelRow {
             id: "t".into(),
             name: "T".into(),
             provider: "p".into(),
             api_url: "https://x".into(),
             api_type: "Anthropic".into(),
-            api_protocol: "anthropic-messages".into(),
+            api_protocol: "openai-v1".into(),
             model_id: "m".into(),
             api_key: Some("k".into()),
             config: None,
         };
-        let r = build_provider_registry(&row).expect("anthropic registry");
-        assert!(r.pick_by_kind("anthropic").is_some());
+        assert!(
+            build_provider_registry(&row).is_err(),
+            "Anthropic api_type → Err"
+        );
+    }
+
+    #[test]
+    fn build_provider_registry_responses() {
+        let row = crate::data::ModelRow {
+            id: "t".into(),
+            name: "T".into(),
+            provider: "p".into(),
+            api_url: "https://x".into(),
+            api_type: "Responses".into(),
+            api_protocol: "openai-v1".into(),
+            model_id: "m".into(),
+            api_key: Some("k".into()),
+            config: None,
+        };
+        let r = build_provider_registry(&row).expect("responses registry");
+        assert!(r.pick_by_kind("responses").is_some());
     }
 
     #[test]

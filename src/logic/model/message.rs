@@ -40,7 +40,7 @@ pub enum MemoryKind {
 pub struct Normalized {
     pub system: String,
     pub messages: Vec<ChatMessage>,
-    /// 恒 true（本轮实现 anthropic 缓存断点）。
+    /// 恒 true（System 段缓存断点，本轮不细分 provider）。
     pub cache_after_system: bool,
 }
 

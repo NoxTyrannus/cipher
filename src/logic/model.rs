@@ -1,4 +1,3 @@
-pub mod anthropic;
 pub mod api_key;
 pub mod capability;
 pub mod error;
@@ -10,7 +9,6 @@ pub mod registry;
 pub mod responses;
 pub mod stream;
 
-pub use anthropic::AnthropicProvider;
 pub use error::{
     backoff_delay_secs, extract_http_status, is_retryable_llm_error, is_retryable_status,
     map_reqwest_error,

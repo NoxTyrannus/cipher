@@ -36,16 +36,6 @@ fn builtin_model_capability(model_id: &str) -> Option<ModelCapability> {
             Some((16385, 4096, TokenCountingStrategy::Tiktoken))
         }
 
-        "claude-3-5-sonnet-20241022" | "claude-3-5-sonnet" | "claude-sonnet-4-6" => {
-            Some((200000, 8192, TokenCountingStrategy::Conservative))
-        }
-        "claude-3-opus-20240229" | "claude-3-opus" => {
-            Some((200000, 4096, TokenCountingStrategy::Conservative))
-        }
-        "claude-3-haiku-20240307" | "claude-3-haiku" => {
-            Some((200000, 4096, TokenCountingStrategy::Conservative))
-        }
-
         id if id.contains("doubao-pro") || id.contains("doubao-pro") => {
             Some((200000, 8192, TokenCountingStrategy::Conservative))
         }
@@ -101,13 +91,6 @@ fn provider_default_capability(api_type: &str) -> Option<ModelCapability> {
             context_window: 128000,
             max_output_tokens: 4096,
             token_counting_strategy: TokenCountingStrategy::Tiktoken,
-            temperature: None,
-            top_p: None,
-        }),
-        "anthropic" => Some(ModelCapability {
-            context_window: 200000,
-            max_output_tokens: 4096,
-            token_counting_strategy: TokenCountingStrategy::Conservative,
             temperature: None,
             top_p: None,
         }),
@@ -208,16 +191,6 @@ mod tests {
     }
 
     #[test]
-    fn test_builtin_claude_sonnet() {
-        let cap = resolve_model_capability(&make_row("claude-3-5-sonnet", "anthropic", None));
-        assert_eq!(cap.context_window, 200000);
-        assert_eq!(
-            cap.token_counting_strategy,
-            TokenCountingStrategy::Conservative
-        );
-    }
-
-    #[test]
     fn test_config_overrides_builtin() {
         let config = serde_json::json!({"context_window": 64000});
         let cap = resolve_model_capability(&make_row("gpt-4o", "openai", Some(config)));
@@ -271,18 +244,6 @@ mod tests {
     }
 
     #[test]
-    fn test_anthropic_provider_default() {
-        let cap =
-            resolve_model_capability(&make_row("claude-some-future-model", "Anthropic", None));
-        assert_eq!(cap.context_window, 200000);
-        assert_eq!(cap.max_output_tokens, 4096);
-        assert_eq!(
-            cap.token_counting_strategy,
-            TokenCountingStrategy::Conservative
-        );
-    }
-
-    #[test]
     fn test_builtin_kimi_temperature() {
         let cap = resolve_model_capability(&make_row("kimi-k3", "openai", None));
         assert_eq!(cap.temperature, Some(1.0));
@@ -290,7 +251,7 @@ mod tests {
 
     #[test]
     fn test_builtin_minimax_temperature() {
-        let cap = resolve_model_capability(&make_row("MiniMax-M3", "anthropic", None));
+        let cap = resolve_model_capability(&make_row("MiniMax-M3", "openai", None));
 
         assert_eq!(cap.temperature, Some(1.0));
         assert_eq!(cap.top_p, Some(0.95));
@@ -299,21 +260,21 @@ mod tests {
     #[test]
     fn test_config_temperature_overrides_builtin() {
         let config = serde_json::json!({"temperature": 0.42});
-        let cap = resolve_model_capability(&make_row("MiniMax-M3", "anthropic", Some(config)));
+        let cap = resolve_model_capability(&make_row("MiniMax-M3", "openai", Some(config)));
         assert_eq!(cap.temperature, Some(0.42));
     }
 
     #[test]
     fn test_config_default_temperature_backward_compat() {
         let config = serde_json::json!({"default_temperature": 0.3});
-        let cap = resolve_model_capability(&make_row("MiniMax-M3", "anthropic", Some(config)));
+        let cap = resolve_model_capability(&make_row("MiniMax-M3", "openai", Some(config)));
         assert_eq!(cap.temperature, Some(0.3));
     }
 
     #[test]
     fn test_config_temperature_priority_over_default() {
         let config = serde_json::json!({"temperature": 0.5, "default_temperature": 0.9});
-        let cap = resolve_model_capability(&make_row("MiniMax-M3", "anthropic", Some(config)));
+        let cap = resolve_model_capability(&make_row("MiniMax-M3", "openai", Some(config)));
         assert_eq!(cap.temperature, Some(0.5));
     }
 

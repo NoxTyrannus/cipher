@@ -10,13 +10,6 @@ fn make_openai_response() -> serde_json::Value {
     })
 }
 
-fn make_anthropic_response() -> serde_json::Value {
-    serde_json::json!({
-        "content": [{ "type": "text", "text": "hi from anthropic" }],
-        "usage": { "input_tokens": 5, "output_tokens": 3 }
-    })
-}
-
 #[tokio::test]
 async fn openai_call_sends_authorization_bearer() {
     let mut server = Server::run();
@@ -41,34 +34,6 @@ async fn openai_call_sends_authorization_bearer() {
     };
     let r = p.call(&req).await.unwrap();
     assert_eq!(r.content, "hi from openai");
-    server.verify_and_clear();
-}
-
-#[tokio::test]
-async fn anthropic_call_sends_x_api_key_header() {
-    let mut server = Server::run();
-    server.expect(
-        Expectation::matching(all_of![
-            request::method("POST"),
-            request::path("/v1/messages"),
-            request::body(matches(".*claude-3-5-sonnet.*")),
-        ])
-        .respond_with(json_encoded(make_anthropic_response())),
-    );
-    let url_trimmed = server.url_str("").trim_end_matches('/').to_string();
-    let p = AnthropicProvider::new();
-    let req = LlmRequest {
-        model: "claude-3-5-sonnet".to_string(),
-        messages: vec![ChatMessage::User {
-            text: "hi".to_string(),
-        }],
-        max_tokens: Some(1024),
-        api_url: url_trimmed,
-        api_key: Some(secrecy::SecretString::new("sk-ant-test".to_string())),
-        ..Default::default()
-    };
-    let r = p.call(&req).await.unwrap();
-    assert_eq!(r.content, "hi from anthropic");
     server.verify_and_clear();
 }
 
@@ -115,8 +80,9 @@ async fn provider_returns_io_error_on_connection_refused() {
 async fn provider_registry_can_register_two() {
     let mut r = crate::logic::model::ProviderRegistry::new();
     r.register(std::sync::Arc::new(OpenAiProvider::new()));
-    r.register(std::sync::Arc::new(AnthropicProvider::new()));
+    r.register(std::sync::Arc::new(ResponsesProvider::new()));
 
     assert!(r.pick_by_kind("openai").is_some());
-    assert!(r.pick_by_kind("anthropic").is_some());
+    assert!(r.pick_by_kind("responses").is_some());
+    assert!(r.pick_by_kind("anthropic").is_none());
 }

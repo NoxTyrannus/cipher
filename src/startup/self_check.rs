@@ -1,6 +1,6 @@
 use super::config::Config;
 #[cfg(test)]
-use super::config::{CollaborationSection, ContextSection, ModeStyles};
+use super::config::{ContextSection, ModeStyles};
 use crate::common::AgentError;
 use crate::data::ModelRow;
 use crate::mode_runtime::ModeKind;
@@ -227,7 +227,6 @@ mod tests {
             api_key: "sk-test".into(),
             data_dir: PathBuf::from("/tmp/__cipher_dummy__"),
             default_mode: "unni".into(),
-            collaboration: CollaborationSection::default(),
             mode_styles: ModeStyles::default(),
             default_model: None,
             context: ContextSection::default(),

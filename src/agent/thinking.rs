@@ -198,11 +198,11 @@ impl ThinkingInstance {
     fn input_kind(&self) -> &'static str {
         match &self.input_override {
             None | Some(PersistentThinkingInput::User { .. }) => "user",
-            Some(PersistentThinkingInput::ReflectOnly { .. }) => "reflect",
+            Some(PersistentThinkingInput::PlatformInsight { .. }) => "insight",
             Some(
-                PersistentThinkingInput::PlatformEcho { .. }
-                | PersistentThinkingInput::ModeTrigger { .. }
-                | PersistentThinkingInput::CapabilityResult { .. },
+                PersistentThinkingInput::ModeTrigger { .. }
+                | PersistentThinkingInput::CapabilityResult { .. }
+                | PersistentThinkingInput::LegacyInternal,
             ) => "echo",
         }
     }
@@ -385,12 +385,25 @@ impl ThinkingSchemeHandler for DualThinkingHandler {
         let api_key = resolve_api_key(model_row)?;
         let self_awareness = assembler.build_self_awareness().await;
         let has_user_input = is_user_input;
-        let unni_internal = mode_hint.eq_ignore_ascii_case("unni") && !is_user_input;
-        let reflect_internal = matches!(
+        // 2.0.8 回环轮执行权（决策冻结 2026-08-21）：
+        // - UNNI：洞察回环轮（PlatformInsight）且该轮洞察输入含 subagent 结果段
+        //   （has_subagent_result=true）→ 无执行权（输出交付后停，等用户下一次输入）；
+        // - UNNI 无结果段 → 有执行权（循环继续）；KEEP/LOOP 回环轮恒有执行权（预算/idle 收敛）。
+        let is_insight_loop = matches!(
             &instance.input_override,
-            Some(PersistentThinkingInput::ReflectOnly { .. })
+            Some(PersistentThinkingInput::PlatformInsight { .. })
         );
-        let internal_no_downstream = unni_internal || reflect_internal;
+        let has_subagent_result = matches!(
+            &instance.input_override,
+            Some(PersistentThinkingInput::PlatformInsight {
+                has_subagent_result: true,
+                ..
+            })
+        );
+        let internal_no_downstream = match mode_hint.to_ascii_lowercase().as_str() {
+            "unni" => is_insight_loop && has_subagent_result,
+            _ => false,
+        };
         let input_kind = instance.input_kind();
         let should_say = match mode_hint.to_ascii_lowercase().as_str() {
             "unni" => true,
@@ -425,23 +438,15 @@ impl ThinkingSchemeHandler for DualThinkingHandler {
         let think_text = crate::common::json_util::strip_reasoning_preamble(&think_resp.content)
             .trim()
             .to_string();
+        // 2.0.5 say-only 死代码清除：think 为空一律报错（无 say-only 宽松，洞察回环轮亦同）。
         if think_text.is_empty() {
-            // UNNI 内部实例允许纯 say 报告（消息上游判据会跳过 execution_done），
-            // 其余实例仍要求 think 输出非空。
-            if mode_hint.eq_ignore_ascii_case("unni") && !is_user_input {
-                tracing::debug!(
-                    "run_dual: UNNI internal think output empty; continuing as say-only report turn_id={}",
-                    turn_id
-                );
-            } else {
-                let error = AgentError::Parse("dual think output empty after stripping CoT".into());
-                persist_terminal_output(
-                    thought_store,
-                    thought_context,
-                    PersistentThinkingOutput::failed(error.to_string()),
-                )?;
-                return Err(error);
-            }
+            let error = AgentError::Parse("dual think output empty after stripping CoT".into());
+            persist_terminal_output(
+                thought_store,
+                thought_context,
+                PersistentThinkingOutput::failed(error.to_string()),
+            )?;
+            return Err(error);
         }
 
         let mut output = AgentOutput {
@@ -523,64 +528,34 @@ impl ThinkingSchemeHandler for DualThinkingHandler {
             },
         )?;
 
-        if let Some(think) = &output.think {
-            let ctx = TurnContext {
-                turn_id: turn_id.clone(),
-                thinking: ThinkingOutput {
-                    decision: ThinkDecision::Execute,
-                    goal: think.clone(),
-                    constraints: vec![],
-                    message: think.clone(),
-                },
-                execution: None,
-                insight: None,
-                memory: None,
-                status: TurnStatus::Executing,
-                user_message: input.to_string(),
-                input_kind: input_kind.into(),
-            };
-            pool.create_turn_context(ctx).await;
-            if internal_no_downstream {
-                tracing::debug!(
-                    "run_dual: internal instance think persisted without downstream execute turn_id={} input_kind={}",
-                    turn_id, input_kind
-                );
-            } else if let Err(send_err) = pool.send_execute(&turn_id).await {
-                tracing::warn!(
-                    "run_dual: send_execute failed turn_id={}: {}",
-                    turn_id,
-                    send_err
-                );
-            }
-        } else {
-            let ctx = TurnContext {
-                turn_id: turn_id.clone(),
-                thinking: ThinkingOutput {
-                    decision: ThinkDecision::Reply,
-                    goal: output.say.clone().unwrap_or_default(),
-                    constraints: vec![],
-                    message: output.say.clone().unwrap_or_default(),
-                },
-                execution: None,
-                insight: None,
-                memory: None,
-                status: TurnStatus::Insighting,
-                user_message: input.to_string(),
-                input_kind: input_kind.into(),
-            };
-            pool.create_turn_context(ctx).await;
-            if internal_no_downstream {
-                tracing::debug!(
-                    "run_dual: internal say-only instance persisted without execution_done turn_id={} input_kind={}",
-                    turn_id, input_kind
-                );
-            } else if let Err(send_err) = pool.send_execution_done(&turn_id).await {
-                tracing::warn!(
-                    "run_dual: say-only send_execution_done failed turn_id={}: {}",
-                    turn_id,
-                    send_err
-                );
-            }
+        // think 恒非空（空已在上游报错），无 say-only 分支。
+        let ctx = TurnContext {
+            turn_id: turn_id.clone(),
+            thinking: ThinkingOutput {
+                decision: ThinkDecision::Execute,
+                think_message: think_text.clone(),
+                constraints: vec![],
+            },
+            execution: None,
+            insight: None,
+            memory: None,
+            status: TurnStatus::Executing,
+            user_message: input.to_string(),
+            input_kind: input_kind.into(),
+            has_subagent_result: false,
+        };
+        pool.create_turn_context(ctx).await;
+        if internal_no_downstream {
+            tracing::debug!(
+                "run_dual: internal instance think persisted without downstream execute turn_id={} input_kind={}",
+                turn_id, input_kind
+            );
+        } else if let Err(send_err) = pool.send_execute(&turn_id).await {
+            tracing::warn!(
+                "run_dual: send_execute failed turn_id={}: {}",
+                turn_id,
+                send_err
+            );
         }
 
         Ok(output)
@@ -841,23 +816,14 @@ mod tests {
             .unwrap();
         assert_eq!(user.input_kind(), "user");
 
-        let echo = factory
-            .create_from_mode("UNNI", "unni".into(), "echo summary".into())
+        let insight = factory
+            .create_from_mode("UNNI", "unni".into(), "insight summary".into())
             .unwrap()
-            .with_input_override(PersistentThinkingInput::PlatformEcho {
-                platform: crate::agent::thought::InternalPlatform::Memory,
-                summary: "echo summary".into(),
-                artifact_refs: vec![],
+            .with_input_override(PersistentThinkingInput::PlatformInsight {
+                summary: "insight summary".into(),
+                has_subagent_result: false,
             });
-        assert_eq!(echo.input_kind(), "echo");
-
-        let reflect = factory
-            .create_from_mode("LOOP", "loop".into(), "reflect summary".into())
-            .unwrap()
-            .with_input_override(PersistentThinkingInput::ReflectOnly {
-                summary: "reflect summary".into(),
-            });
-        assert_eq!(reflect.input_kind(), "reflect");
+        assert_eq!(insight.input_kind(), "insight");
     }
 
     struct DualScriptedProvider {
@@ -944,14 +910,13 @@ mod tests {
         )
     }
 
-    fn unni_echo_instance(summary: &str) -> ThinkingInstance {
+    fn unni_insight_instance(summary: &str, has_subagent_result: bool) -> ThinkingInstance {
         ThinkingFactory::new()
             .create_from_mode("UNNI", "unni".into(), summary.into())
             .unwrap()
-            .with_input_override(PersistentThinkingInput::PlatformEcho {
-                platform: crate::agent::thought::InternalPlatform::Memory,
+            .with_input_override(PersistentThinkingInput::PlatformInsight {
                 summary: summary.into(),
-                artifact_refs: vec![],
+                has_subagent_result,
             })
     }
 
@@ -988,8 +953,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unni_echo_with_think_does_not_send_execute() {
-        let instance = unni_echo_instance("echo summary");
+    async fn unni_insight_loop_with_subagent_result_has_no_execution_right() {
+        // 2.0.8：UNNI 洞察回环轮，洞察输入含 subagent 结果段 → 无执行权（交付后停）。
+        let instance = unni_insight_instance("insight summary", true);
         let (id, mut receivers) = run_dual_test_case(
             instance,
             DualScriptedProvider::new("internal plan", "user visible report"),
@@ -1004,32 +970,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unni_echo_say_only_does_not_send_execution_done() {
-        let instance = unni_echo_instance("echo summary");
-        let (id, mut receivers) = run_dual_test_case(
+    async fn unni_insight_loop_without_subagent_result_keeps_execution_right() {
+        // 2.0.8：UNNI 洞察回环轮，洞察输入无 subagent 结果段 → 有执行权（循环继续）。
+        let instance = unni_insight_instance("insight summary", false);
+        let (_id, mut receivers) = run_dual_test_case(
             instance,
-            DualScriptedProvider::new(String::new(), "user visible report"),
+            DualScriptedProvider::new("internal plan", "user visible report"),
         )
         .await;
-        let _ = id;
         assert!(matches!(
-            receivers.insight_rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty
-                | tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            receivers.execution_rx.try_recv(),
+            Ok(crate::agent::communication::AgentMessage::Execute { .. })
         ));
     }
 
     #[tokio::test]
-    async fn loop_reflect_think_does_not_send_execute() {
+    async fn loop_insight_loop_keeps_execution_right() {
+        // 2.0.8：LOOP 洞察回环轮恒有执行权（mix 机制删除后 LOOP 为普通 think 实例循环）。
         let temporary = tempfile::tempdir().unwrap();
         let thought_store = Arc::new(ThoughtStore::open(temporary.path()).unwrap());
         let (pool, mut receivers) = AgentPool::new();
         let assembler = dual_test_assembler(temporary.path());
         let instance = ThinkingFactory::new()
-            .create_from_mode("LOOP", "loop".into(), "reflect summary".into())
+            .create_from_mode("LOOP", "loop".into(), "insight summary".into())
             .unwrap()
-            .with_input_override(PersistentThinkingInput::ReflectOnly {
-                summary: "reflect summary".into(),
+            .with_input_override(PersistentThinkingInput::PlatformInsight {
+                summary: "insight summary".into(),
+                has_subagent_result: true,
             });
         let id = instance.id.clone();
         let mut context = instance.thought_context();
@@ -1039,14 +1006,11 @@ mod tests {
             .run_with_dm(
                 instance,
                 &dual_test_model_row(),
-                Arc::new(DualScriptedProvider::new(
-                    "internal reflection",
-                    String::new(),
-                )),
+                Arc::new(DualScriptedProvider::new("internal plan", String::new())),
                 &assembler,
                 &pool,
                 &thought_store,
-                "reflect summary",
+                "insight summary",
                 false,
                 &mut context,
                 &tokio::sync::Notify::new(),
@@ -1055,11 +1019,10 @@ mod tests {
             .unwrap();
 
         let ctx = pool.get_turn_context(&id).await.unwrap();
-        assert_eq!(ctx.input_kind, "reflect");
+        assert_eq!(ctx.input_kind, "insight");
         assert!(matches!(
             receivers.execution_rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty
-                | tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            Ok(crate::agent::communication::AgentMessage::Execute { .. })
         ));
     }
 

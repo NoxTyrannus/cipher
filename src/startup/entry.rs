@@ -1,4 +1,4 @@
-use super::config::{Config, RuntimeStyles, TriggerNode};
+use super::config::{Config, RuntimeStyles};
 use super::{init, self_check};
 use crate::agent::context_assembler::{ContextAssembler, ContextConfig};
 use crate::common::AgentError;
@@ -398,6 +398,7 @@ pub async fn run_normal(
     let pool_insight = std::sync::Arc::clone(&pool);
     let insight_model = default_model.clone();
     let insight_prompts_dir = prompts_dir.clone();
+    let insight_storage_root = Some(app_state.paths.storage_root().to_path_buf());
     let insight_task = tokio::spawn(async move {
         crate::agent::insight_platform::run(
             pool_insight,
@@ -407,6 +408,7 @@ pub async fn run_normal(
             insight_api_key,
             usage_observation_tx,
             insight_prompts_dir,
+            insight_storage_root,
         )
         .await;
     });
@@ -760,13 +762,6 @@ pub async fn run_streaming_loop(
 
     let mut should_exit = false;
 
-    let mut mix_state = MixThinkingState::default();
-
-    // Mix join（缺陷2）：依赖实例注册表 + 待推进状态，事件驱动不阻塞主循环。
-    let mix_registry = MixDepRegistry::default();
-    let mut mix_join: Option<PendingMix> = None;
-    let mut final_wanted = false;
-
     // 自动修复（F1）：按用户输入原文计数的防循环上限。
     let mut auto_repair_counts: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
@@ -869,34 +864,10 @@ pub async fn run_streaming_loop(
                                 let config_path = crate::startup::Config::default_path();
                                 let mut config = crate::startup::init::init(&config_path)?;
                                 let mut styles = *mode_styles_shared.lock().unwrap();
+                                // 放弃项 1/2/10：协同节点固定洞察 + mix 机制整体删除，
+                                // 协作设置仅保留 KEEP 预算（target 0=Token，1=时间）。
                                 let msg = match target {
                                     0 => {
-                                        let next = match value.as_str() {
-                                            "insight" => TriggerNode::Insight,
-                                            "memory" => TriggerNode::Memory,
-                                            _ => TriggerNode::Execution,
-                                        };
-                                        config.collaboration.node = next;
-                                        styles.collaboration.node = next;
-                                        if next == TriggerNode::Execution {
-                                            config.collaboration.mix_thinking = false;
-                                            styles.collaboration.mix_thinking = false;
-                                            "协同节点已切换 → 执行中台（Mix 思考自动关闭）".to_string()
-                                        } else {
-                                            format!("协同节点已切换 → {next:?}")
-                                        }
-                                    }
-                                    1 => {
-                                        let on = value == "on";
-                                        if config.collaboration.node == TriggerNode::Execution && on {
-                                            "协同节点为执行中台时 Mix 思考自动关闭，请先切换协同节点".to_string()
-                                        } else {
-                                            config.collaboration.mix_thinking = on;
-                                            styles.collaboration.mix_thinking = on;
-                                            format!("Mix 思考已切换 → {}", if on { "开" } else { "关" })
-                                        }
-                                    }
-                                    2 => {
                                         // 0=无限；非 0 时 clamp 到默认最小值 100K。
                                         let budget = normalize_keep_token_budget(&value);
                                         config.mode_styles.keep.token_budget = budget;
@@ -909,7 +880,7 @@ pub async fn run_streaming_loop(
                                             format!("KEEP Token 预算已切换 → {}K", budget / 1000)
                                         }
                                     }
-                                    3 => {
+                                    1 => {
                                         // 0=无限；非 0 时 clamp 到默认最小值 5min。
                                         let secs = normalize_keep_time_budget_secs(&value);
                                         config.mode_styles.keep.time_budget_secs = secs;
@@ -1084,21 +1055,12 @@ pub async fn run_streaming_loop(
 
 
             Some(outcome) = pool_rx.recv() => {
-                // Mix 依赖注册表更新（缺陷2）：实例结果到达 → 状态更新 + 事件驱动推进 join
+                // F1: invalid_json 重试耗尽后保留用户输入意图，自动续跑修复轮（不回到询问状态）。
                 let oid = outcome.id.clone();
                 let outcome_ok = outcome.result.is_ok();
-                let outcome_err = outcome.result.as_ref().err().map(|e| e.to_string());
                 tracing::debug!(
-                    "streaming_loop: pool outcome id={oid} ok={outcome_ok} join={mix_join:?}"
+                    "streaming_loop: pool outcome id={oid} ok={outcome_ok}"
                 );
-                mix_registry.on_outcome(&oid, outcome_ok, outcome_err);
-                try_progress_mix(
-                    mode_manager, &mut state, &pool, &mut mix_state,
-                    &mix_registry, &mut mix_join, &mut final_wanted,
-                )
-                .await;
-
-                // F1: invalid_json 重试耗尽后保留用户输入意图，自动续跑修复轮（不回到询问状态）。
                 let repair_hint = match &outcome.result {
                     Err(AgentError::ThinkingOutputInvalid(msg)) => Some(msg.clone()),
                     _ => None,
@@ -1107,12 +1069,12 @@ pub async fn run_streaming_loop(
                 mode_manager.bookkeep(outcome, &state.last_user_message());
 
                 if let Some(failure_msg) = repair_hint {
-                    // 内部实例（融合思考反思/echo 轮）失败不触发自动修复——
-                    // 它们不是用户可见的请求轮，自动重试会打乱 Mix 状态机。
+                    // 内部实例（洞察回环轮/legacy 内部轮）失败不触发自动修复——
+                    // 它们不是用户可见的请求轮，自动重试会打乱回环执行权判定。
                     let failed_ctx = pool.get_turn_context(&failed_id).await;
                     let is_internal = failed_ctx
                         .as_ref()
-                        .is_some_and(|c| c.input_kind == "reflect" || c.input_kind == "echo");
+                        .is_some_and(|c| c.input_kind == "insight" || c.input_kind == "echo");
                     let original = failed_ctx
                         .map(|c| c.user_message)
                         .filter(|s| !s.trim().is_empty())
@@ -1166,194 +1128,82 @@ pub async fn run_streaming_loop(
                     event.turn_id, event.reason
                 );
 
-                // 统一触发调度（分组 C）：
-                // 1. 当前模式 → style（UNNI 用用户配置, KEEP/LOOP 固定）
-                // 2. 事件 reason → platform
-                // 3. 仅当 platform == 协同节点时触发/暂存；协同节点后的异步中台只沉淀不触发。
+                // 2.0.1 统一触发调度（决策冻结 2026-08-21）：
+                // 核心循环 = 思考引擎 → 执行中台 → 洞察中台 → 记忆中台（异步沉淀）→ 思考引擎；
+                // 协同节点固定洞察：execution_complete 只走消息通道触发洞察（不在此 spawn）；
+                // subagent_complete 退化为纯数据事件（不触发任何轮）；memory_complete 只沉淀不触发。
                 let mode_name = mode_manager.current_name().to_ascii_lowercase();
-                let styles = *mode_styles_shared.lock().unwrap();
-                let node = styles.node();
 
-                // subagent 完成事件：异步结果回传，触发新一轮思考/echo 让用户看到结果。
-                if event.reason == "subagent_complete" {
-                    if let Some(summary) = build_subagent_complete_summary(&pool, &event.turn_id).await {
-                        match mode_manager
-                            .spawn_with_override(
-                                summary.clone(),
-                                Some(crate::agent::thought::ThinkingInput::PlatformEcho {
-                                    platform: crate::agent::thought::InternalPlatform::Memory,
-                                    summary,
-                                    artifact_refs: vec![],
-                                }),
-                            )
-                            .await
-                        {
-                            Ok(id) => state.push_streaming(id),
-                            Err(e) => state.set_error(e.to_string()),
-                        }
-                    } else {
-                        tracing::warn!(
-                            "streaming_loop: subagent_complete event without subagent state: {}",
+                match event.reason.as_str() {
+                    // subagent_complete：纯数据事件（状态变化已落盘 AgentPool / memory.json），
+                    // 不触发任何轮；subagent 结果段由洞察中台在输入组装时按状态变化纳入。
+                    "subagent_complete" => {
+                        tracing::debug!(
+                            "streaming_loop: subagent_complete is a data event, no round triggered (subagent_id={})",
                             event.turn_id
                         );
+                        continue;
                     }
-                    continue;
-                }
-
-                let platform = match event.reason.as_str() {
-                    "execution_complete" => Some(TriggerNode::Execution),
-                    "insight_complete" => Some(TriggerNode::Insight),
-                    "memory_complete" => Some(TriggerNode::Memory),
-                    _ => None,
-                };
-                let Some(platform) = platform else {
-                    tracing::debug!(
-                        "streaming_loop: trigger ignored (unknown reason={})",
-                        event.reason
-                    );
-                    continue;
-                };
-
-                // 全局 Mix Thinking（仅 LOOP 使用；node=execution 时配置层已自动关闭）。
-                //
-                // node=Memory：三阶段流水线（执行反思 → 洞察反思 → 记忆综合 final）。
-                // node=Insight：两阶段流水线（执行反思 → insight_complete 直接 final，跳过实例2）。
-                let mix_on = mode_name == "loop" && styles.mix_on(node);
-
-                // LOOP 收敛：无论 mix 开关，触发节点轮若空转达到阈值则停止 spawn。
-                if mode_name == "loop" && platform == node {
-                    let ctx = pool.get_turn_context(&event.turn_id).await;
-                    let actions_empty = ctx
-                        .as_ref()
-                        .and_then(|c| c.execution.as_ref())
-                        .map(|e| e.lifecycle_actions.is_empty())
-                        .unwrap_or(true);
-                    let subagents_running = pool
-                        .subagent_states()
-                        .await
-                        .iter()
-                        .any(|s| s.lifecycle == crate::agent::execution_types::SubagentLifecycle::Running);
-                    if actions_empty && !subagents_running {
-                        mode_manager.loop_note_noop();
-                        if mode_manager.loop_should_stop_idle() {
-                            tracing::info!(
-                                "streaming_loop: LOOP idle convergence reached, waiting for user input (thought_id={})",
-                                event.turn_id
-                            );
-                            continue;
-                        }
-                    } else {
-                        mode_manager.loop_reset_idle();
+                    // 记忆中台沉淀完成：只沉淀不触发（异步链）。
+                    "memory_complete" => {
+                        tracing::debug!(
+                            "streaming_loop: memory_complete only sinks memory, no round triggered (thought_id={})",
+                            event.turn_id
+                        );
+                        continue;
                     }
-                }
-
-                if mix_on {
-                    match platform {
-                        TriggerNode::Execution => {
-                            // 新一轮开始（执行实例完成）
-                            mix_state.begin_round(&event.turn_id);
-                            mix_join = None;
-                            final_wanted = false;
-                            let summary = mix_summary(&pool, &event.turn_id, None, None, &event.reason).await;
-                            let new_id = spawn_mix_reflect(mode_manager, &mut state, &summary).await;
-                            if let Some(id1) = &new_id {
-                                mix_state.set_reflect1(Some(id1.clone()), &event.turn_id);
-                                mix_registry.register(id1.clone());
-                            }
-                        }
-                        TriggerNode::Insight => {
-                            if !mix_state.is_current_round(&event.turn_id) {
-                                tracing::debug!(
-                                    "streaming_loop: mix insight_complete for non-current round ({}) ignored",
-                                    event.turn_id
-                                );
+                    // 执行完成：洞察中台已由消息通道（ExecutionDone）直接触发，此处无 spawn。
+                    "execution_complete" => {
+                        tracing::debug!(
+                            "streaming_loop: execution_complete routes to insight via message channel (thought_id={})",
+                            event.turn_id
+                        );
+                        continue;
+                    }
+                    // 洞察完成 → 触发思考引擎下一轮（2.0.10 PlatformInsight，输入含洞察输出段）；
+                    // 轮次完成异步触发记忆中台（insight 完成已驱动 memory platform，不阻塞循环）。
+                    "insight_complete" => {
+                        if mode_name == "keep" {
+                            let mut tracker = keep_budget_tracker.lock().unwrap();
+                            if !keep_budget_allows(&mut tracker, &mut state, &event.turn_id) {
                                 continue;
                             }
-                            if node == TriggerNode::Insight {
-                                // node=Insight：等实例1 就绪后直接 spawn final（输入=base+反思1）。
-                                final_wanted = true;
-                                if let Some(r1) = mix_state.reflect1() {
-                                    mix_join = Some(PendingMix::AwaitFinalFromInsight {
-                                        base: event.turn_id.clone(),
-                                        reflect1: r1.to_string(),
-                                    });
+                            tracker.record_instance();
+                        }
+                        // LOOP idle 收敛：触发轮空转（无动作且无 subagent 在跑）达到阈值则停止迭代。
+                        if mode_name == "loop" {
+                            let ctx = pool.get_turn_context(&event.turn_id).await;
+                            let actions_empty = ctx
+                                .as_ref()
+                                .and_then(|c| c.execution.as_ref())
+                                .map(|e| e.lifecycle_actions.is_empty())
+                                .unwrap_or(true);
+                            let subagents_running = pool
+                                .subagent_states()
+                                .await
+                                .iter()
+                                .any(|s| s.lifecycle == crate::agent::execution_types::SubagentLifecycle::Running);
+                            if actions_empty && !subagents_running {
+                                mode_manager.loop_note_noop();
+                                if mode_manager.loop_should_stop_idle() {
+                                    tracing::info!(
+                                        "streaming_loop: LOOP idle convergence reached, waiting for user input (thought_id={})",
+                                        event.turn_id
+                                    );
+                                    continue;
                                 }
-                                try_progress_mix(
-                                    mode_manager, &mut state, &pool, &mut mix_state,
-                                    &mix_registry, &mut mix_join, &mut final_wanted,
-                                )
-                                .await;
                             } else {
-                                // node=Memory：等实例1 就绪后 spawn 实例2。
-                                if let Some(r1) = mix_state.reflect1() {
-                                    mix_join = Some(PendingMix::AwaitReflect1 {
-                                        base: event.turn_id.clone(),
-                                        reflect1: r1.to_string(),
-                                    });
-                                }
-                                try_progress_mix(
-                                    mode_manager, &mut state, &pool, &mut mix_state,
-                                    &mix_registry, &mut mix_join, &mut final_wanted,
-                                )
-                                .await;
+                                mode_manager.loop_reset_idle();
                             }
                         }
-                        TriggerNode::Memory => {
-                            if node != TriggerNode::Memory {
-                                tracing::debug!(
-                                    "streaming_loop: mix memory_complete is async-after for node={node:?} (thought_id={})",
-                                    event.turn_id
-                                );
-                                continue;
-                            }
-                            if mix_state.is_current_round(&event.turn_id) {
-                                final_wanted = true;
-                                try_progress_mix(
-                                    mode_manager, &mut state, &pool, &mut mix_state,
-                                    &mix_registry, &mut mix_join, &mut final_wanted,
-                                )
-                                .await;
-                            } else {
-                                tracing::debug!(
-                                    "streaming_loop: mix memory_complete for non-current round ({}) ignored",
-                                    event.turn_id
-                                );
-                            }
-                        }
+                        spawn_platform_insight(mode_manager, &mut state, &pool, &event.turn_id).await;
                     }
-                    continue;
-                }
-
-                if platform == node {
-                    // 协同节点完成 → 立即触发新一轮思考引擎（Follow/pending 机制已删除）。
-                    if mode_name == "keep" {
-                        let mut tracker = keep_budget_tracker.lock().unwrap();
-                        if !keep_budget_allows(&mut tracker, &mut state, &event.turn_id) {
-                            continue;
-                        }
-                        tracker.record_instance();
+                    _ => {
+                        tracing::debug!(
+                            "streaming_loop: trigger ignored (unknown reason={})",
+                            event.reason
+                        );
                     }
-                    spawn_flywheel_echo(
-                        mode_manager,
-                        &mut state,
-                        &pool,
-                        &event.turn_id,
-                        &event.reason,
-                    )
-                    .await;
-                } else if node.async_after().contains(&platform) {
-                    // 协同节点后的异步中台：只沉淀记忆，不触发新实例
-                    tracing::info!(
-                        "streaming_loop: async platform {platform:?} after trigger node {:?} — \
-                         only sinking memory, not triggering (thought_id={})",
-                        node, event.turn_id
-                    );
-                } else {
-                    // 协同节点前的中台：忽略
-                    tracing::debug!(
-                        "streaming_loop: trigger ignored (platform {platform:?} before trigger node {:?})",
-                        node
-                    );
                 }
             }
 
@@ -1365,91 +1215,6 @@ pub async fn run_streaming_loop(
         }
     }
     Ok(())
-}
-
-/// 构造 echo 轮注入摘要（纯函数, 便于单测）:
-/// 执行结果段逐节点带 summary（失败附 error）, 记忆沉淀段带注意力 content（200 截断）, 整体 4000 兜底。
-fn build_echo_summary(
-    ctx: &crate::agent::communication::TurnContext,
-    turn_id: &str,
-    reason: &str,
-) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    parts.push(format!("既定目标: {}", ctx.thinking.goal));
-    if let Some(exec) = &ctx.execution {
-        let failed = exec
-            .lifecycle_actions
-            .iter()
-            .filter(|record| {
-                matches!(
-                    record.lifecycle_state,
-                    crate::agent::communication::CapabilityLifecycleState::Failed
-                        | crate::agent::communication::CapabilityLifecycleState::Rejected
-                )
-            })
-            .count();
-        let action_lines: Vec<String> = exec
-            .lifecycle_actions
-            .iter()
-            .map(|record| match &record.error {
-                Some(err) => format!("{}: 失败[{}]", record.capability_id, err),
-                None => format!("{}: {:?}", record.capability_id, record.lifecycle_state),
-            })
-            .collect();
-        parts.push(format!(
-            "执行结果: 完成 {} 项 / 失败 {} 项, 动作明细 [{}]",
-            exec.lifecycle_actions.len().saturating_sub(failed),
-            failed,
-            action_lines.join("; ")
-        ));
-    }
-    if let Some(ins) = &ctx.insight {
-        parts.push(format!(
-            "洞察: {}",
-            crate::common::json_util::truncate_head_tail(&ins.insight.insight, 800)
-        ));
-    }
-    if let Some(mem) = &ctx.memory {
-        if !mem.attention.is_empty() {
-            let lines: Vec<String> = mem
-                .attention
-                .iter()
-                .map(|a| {
-                    format!(
-                        "{}: {}",
-                        a.focus,
-                        crate::common::json_util::truncate_head_tail(&a.content, 200)
-                    )
-                })
-                .collect();
-            parts.push(format!(
-                "记忆沉淀: 新增注意力 {} 条 [{}]",
-                mem.attention.len(),
-                lines.join("; ")
-            ));
-        }
-        if !mem.experience.is_empty() {
-            parts.push(format!("记忆沉淀: 新增经验 {} 条", mem.experience.len()));
-        }
-    }
-    parts.push(summary_closing(turn_id, reason));
-    crate::common::json_util::truncate_head_tail(&parts.join("\n"), 4000)
-}
-
-/// 摘要结尾文案，按触发原因动态生成（兼容 Mix Thinking 各阶段）。
-fn summary_closing(turn_id: &str, reason: &str) -> String {
-    match reason {
-        "execution_complete" => {
-            format!("执行已完成 (thought_id={turn_id}). 请基于执行结果做一轮反思，不重复执行.")
-        }
-        "insight_complete" => {
-            format!("洞察已完成 (thought_id={turn_id}). 请结合执行+洞察结果做一轮反思，不重复执行.")
-        }
-        "memory_complete" => {
-            format!("记忆中台已整理上一轮 (thought_id={turn_id}). 请基于此继续推进目标.")
-        }
-        _ => format!("上一轮已整理 (thought_id={turn_id}, reason={reason}). 请基于此继续推进目标."),
-    }
 }
 
 /// KEEP 预算追踪器：token 与时间预算，0=无限。
@@ -1573,370 +1338,31 @@ fn keep_budget_allows(
     true
 }
 
-/// 融合思考（Mix Thinking）轮状态机：
-/// 当前轮由执行实例（base_turn）驱动，记录其反思实例（实例1/2）的 turn_id，
-/// 供下一阶段拼接读取 think 输出。
-#[derive(Debug, Default)]
-struct MixThinkingState {
-    base_turn: Option<String>,
-    reflect1: Option<String>,
-    reflect2: Option<String>,
-}
-
-impl MixThinkingState {
-    /// 执行实例完成 → 新一轮开始（若 turn 不同）。
-    fn begin_round(&mut self, turn_id: &str) {
-        if self.base_turn.as_deref() != Some(turn_id) {
-            self.base_turn = Some(turn_id.to_string());
-            self.reflect1 = None;
-            self.reflect2 = None;
-        }
-    }
-
-    fn is_current_round(&self, turn_id: &str) -> bool {
-        self.base_turn.as_deref() == Some(turn_id)
-    }
-
-    fn set_reflect1(&mut self, id: Option<String>, turn_id: &str) {
-        if self.is_current_round(turn_id) {
-            self.reflect1 = id;
-        }
-    }
-
-    fn set_reflect2(&mut self, id: Option<String>, turn_id: &str) {
-        if self.is_current_round(turn_id) {
-            self.reflect2 = id;
-        }
-    }
-
-    fn reflect1(&self) -> Option<&str> {
-        self.reflect1.as_deref()
-    }
-
-    #[allow(dead_code)] // 仅测试使用（生产路径由 PendingMix 持有实例2 id）
-    fn reflect2(&self) -> Option<&str> {
-        self.reflect2.as_deref()
-    }
-
-    /// 实例3 = 下一轮 think_0：成为新的 base_turn，反思位清空。
-    fn advance_round(&mut self, new_base: Option<String>) {
-        self.base_turn = new_base;
-        self.reflect1 = None;
-        self.reflect2 = None;
-    }
-}
-
-/// Mix 依赖实例（实例1/2）状态。
-#[derive(Debug, Clone)]
-enum MixDepState {
-    /// 已 spawn，等待结果（含实例内部指数退避重试中）
-    Running,
-    /// think 已落库（可从 pool 读取）
-    Ready,
-    /// 永久失败（错误已暴露，摘要缺段继续，不中断）
-    Permanent(String),
-}
-
-/// Mix 依赖注册表：turn_id → 状态，配合 Notify 做事件驱动唤醒（替代轮询）。
-#[derive(Default)]
-struct MixDepRegistry {
-    inner: std::sync::Mutex<std::collections::HashMap<String, MixDepState>>,
-    notify: tokio::sync::Notify,
-}
-
-impl MixDepRegistry {
-    fn register(&self, id: String) {
-        self.inner.lock().unwrap().insert(id, MixDepState::Running);
-    }
-
-    fn state(&self, id: &str) -> MixDepState {
-        self.inner
-            .lock()
-            .unwrap()
-            .get(id)
-            .cloned()
-            .unwrap_or(MixDepState::Permanent(format!("未注册的依赖实例 {id}")))
-    }
-
-    /// 主循环处理完一个实例结果后调用；仅更新已注册的 mix 依赖并唤醒等待者。
-    fn on_outcome(&self, id: &str, ok: bool, err: Option<String>) {
-        let mut m = self.inner.lock().unwrap();
-        if !m.contains_key(id) {
-            return;
-        }
-        m.insert(
-            id.to_string(),
-            if ok {
-                MixDepState::Ready
-            } else {
-                MixDepState::Permanent(err.unwrap_or_else(|| "未知错误".to_string()))
-            },
-        );
-        drop(m);
-        self.notify.notify_waiters();
-    }
-}
-
-/// Mix join 待推进状态：事件驱动、不阻塞主循环。
-///
-/// - `AwaitReflect1`：实例2 尚未 spawn，等实例1 就绪（或永久失败）后 spawn 实例2；
-/// - `AwaitFinal`：实例2 已 spawn，等实例1+2 就绪（或永久失败）后 spawn final。
-#[derive(Debug, Clone)]
-enum PendingMix {
-    AwaitReflect1 {
-        base: String,
-        reflect1: String,
-    },
-    /// node=Insight：等实例1 就绪后直接 spawn final（无实例2）。
-    AwaitFinalFromInsight {
-        base: String,
-        reflect1: String,
-    },
-    AwaitFinal {
-        base: String,
-        reflect1: String,
-        reflect2: String,
-    },
-}
-
-/// 推进 Mix join：依赖就绪/永久失败即前进（spawn 实例2 / spawn final）。
-///
-/// 事件驱动：每次实例结果到达或阶段触发后调用；依赖仍在跑（含退避重试）时立即返回，
-/// 不阻塞主循环——依赖的结果到达后会再次进入本函数。
-#[allow(clippy::too_many_arguments)]
-async fn try_progress_mix(
-    mode_manager: &mut ModeManager,
-    state: &mut TuiState,
-    pool: &std::sync::Arc<crate::agent::agent_pool::AgentPool>,
-    mix_state: &mut MixThinkingState,
-    registry: &MixDepRegistry,
-    mix_join: &mut Option<PendingMix>,
-    final_wanted: &mut bool,
-) {
-    loop {
-        let Some(pending) = mix_join.clone() else {
-            return;
-        };
-        tracing::debug!("try_progress_mix: pending={pending:?} final_wanted={final_wanted}");
-        match pending {
-            PendingMix::AwaitReflect1 { base, reflect1 } => {
-                let s1 = registry.state(&reflect1);
-                match &s1 {
-                    MixDepState::Running => return, // 等实例1（含退避重试中）的结果
-                    MixDepState::Permanent(err) => {
-                        tracing::warn!(
-                            "streaming_loop: mix dep reflect1 ({reflect1}) permanent failed: {err}"
-                        );
-                        state.set_error(format!("反思实例1 永久失败（{err}），实例2 将缺该段继续"));
-                    }
-                    MixDepState::Ready => {}
-                }
-                let r1_for_summary = matches!(s1, MixDepState::Ready).then(|| reflect1.clone());
-                let summary = mix_summary(
-                    pool,
-                    &base,
-                    r1_for_summary.as_deref(),
-                    None,
-                    "insight_complete",
-                )
-                .await;
-                let new_id = spawn_mix_reflect(mode_manager, state, &summary).await;
-                if let Some(id2) = &new_id {
-                    mix_state.set_reflect2(Some(id2.clone()), &base);
-                    registry.register(id2.clone());
-                }
-                *mix_join = Some(PendingMix::AwaitFinal {
-                    base,
-                    reflect1,
-                    reflect2: new_id.unwrap_or_default(),
-                });
-                // 继续循环：若 reflect2 已就绪，则顺势推进 final
-            }
-            PendingMix::AwaitFinalFromInsight { base, reflect1 } => {
-                if !*final_wanted {
-                    return;
-                }
-                let s1 = registry.state(&reflect1);
-                if matches!(s1, MixDepState::Running) {
-                    return;
-                }
-                if let MixDepState::Permanent(err) = &s1 {
-                    tracing::warn!(
-                        "streaming_loop: mix dep reflect1 ({reflect1}) permanent failed: {err}"
-                    );
-                    state.set_error(format!("反思实例1 永久失败（{err}），final 将缺该段继续"));
-                }
-                let r1_for_summary = matches!(s1, MixDepState::Ready).then(|| reflect1.clone());
-                let summary = mix_summary(
-                    pool,
-                    &base,
-                    r1_for_summary.as_deref(),
-                    None,
-                    "insight_complete",
-                )
-                .await;
-                let new_id = spawn_mix_final(mode_manager, state, &summary).await;
-                mix_state.advance_round(new_id);
-                *mix_join = None;
-                *final_wanted = false;
-            }
-            PendingMix::AwaitFinal {
-                base,
-                reflect1,
-                reflect2,
-            } => {
-                // final 的输入含 base 轮的记忆摘要 → 必须等 memory_complete 到达后再拼
-                if !*final_wanted {
-                    return;
-                }
-                let s1 = registry.state(&reflect1);
-                let s2 = registry.state(&reflect2);
-                if matches!(s1, MixDepState::Running) || matches!(s2, MixDepState::Running) {
-                    return; // 还有依赖在跑（含退避重试中）
-                }
-                if let MixDepState::Permanent(err) = &s1 {
-                    tracing::warn!(
-                        "streaming_loop: mix dep reflect1 ({reflect1}) permanent failed: {err}"
-                    );
-                    state.set_error(format!("反思实例1 永久失败（{err}），final 将缺该段继续"));
-                }
-                if let MixDepState::Permanent(err) = &s2 {
-                    tracing::warn!(
-                        "streaming_loop: mix dep reflect2 ({reflect2}) permanent failed: {err}"
-                    );
-                    state.set_error(format!("反思实例2 永久失败（{err}），final 将缺该段继续"));
-                }
-                let r1 = matches!(s1, MixDepState::Ready).then(|| reflect1.clone());
-                let r2 = matches!(s2, MixDepState::Ready).then(|| reflect2.clone());
-                let summary =
-                    mix_summary(pool, &base, r1.as_deref(), r2.as_deref(), "memory_complete").await;
-                let new_id = spawn_mix_final(mode_manager, state, &summary).await;
-                // 实例3 = 下一轮 think_0：成为新的 base_turn，反思位清空
-                mix_state.advance_round(new_id);
-                *mix_join = None;
-                *final_wanted = false;
-                return;
-            }
-        }
-    }
-}
-
-/// 融合思考拼接：把当前轮中台结果 + 实例1/2 的 think 输出拼进下一实例输入。
-async fn mix_summary(
-    pool: &std::sync::Arc<crate::agent::agent_pool::AgentPool>,
-    turn_id: &str,
-    reflect1: Option<&str>,
-    reflect2: Option<&str>,
-    reason: &str,
-) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(ctx) = pool.get_turn_context(turn_id).await {
-        parts.push(build_echo_summary(&ctx, turn_id, reason));
-    }
-    for (label, id) in [("实例1 反思", reflect1), ("实例2 反思", reflect2)] {
-        if let Some(id) = id {
-            if let Some(ctx) = pool.get_turn_context(id).await {
-                let think = ctx.thinking.message.clone();
-                if !think.trim().is_empty() {
-                    parts.push(format!("[{label} (thought_id={id})]\n{think}"));
-                }
-            }
-        }
-    }
-    if parts.is_empty() {
-        parts.push(summary_closing(turn_id, reason));
-    }
-    crate::common::json_util::truncate_head_tail(&parts.join("\n\n"), 4000)
-}
-
-/// spawn 融合思考中间反思实例（ReflectOnly：think 后不执行）。
-async fn spawn_mix_reflect(
-    mode_manager: &mut ModeManager,
-    state: &mut TuiState,
-    summary: &str,
-) -> Option<String> {
-    match mode_manager
-        .spawn_with_override(
-            summary.to_string(),
-            Some(crate::agent::thought::ThinkingInput::ReflectOnly {
-                summary: summary.to_string(),
-            }),
-        )
-        .await
-    {
-        Ok(id) => {
-            state.push_streaming(id.clone());
-            Some(id)
-        }
-        Err(e) => {
-            state.set_error(e.to_string());
-            None
-        }
-    }
-}
-
-/// spawn 融合思考最终实例（PlatformEcho：think 后执行 = 下一轮 think_0）。
-async fn spawn_mix_final(
-    mode_manager: &mut ModeManager,
-    state: &mut TuiState,
-    summary: &str,
-) -> Option<String> {
-    match mode_manager
-        .spawn_with_override(
-            summary.to_string(),
-            Some(crate::agent::thought::ThinkingInput::PlatformEcho {
-                platform: crate::agent::thought::InternalPlatform::Memory,
-                summary: summary.to_string(),
-                artifact_refs: vec![],
-            }),
-        )
-        .await
-    {
-        Ok(id) => {
-            state.push_streaming(id.clone());
-            Some(id)
-        }
-        Err(e) => {
-            state.set_error(e.to_string());
-            None
-        }
-    }
-}
-
-/// subagent 完成事件摘要：从 AgentPool 中读取 subagent 最新 last_output。
-async fn build_subagent_complete_summary(
-    pool: &std::sync::Arc<crate::agent::agent_pool::AgentPool>,
-    subagent_id: &str,
-) -> Option<String> {
-    let states = pool.subagent_states().await;
-    let state = states.iter().find(|s| s.subagent_id == subagent_id)?;
-    let last_output = state.last_output_truncated.as_deref().unwrap_or("(none)");
-    Some(format!(
-        "既定目标: subagent 已完成\nsubagent_id: {}\nlast_output: {}",
-        subagent_id, last_output
-    ))
-}
-
-async fn spawn_flywheel_echo(
+/// insight_complete → 触发思考引擎下一轮（2.0.10 PlatformInsight，输入含洞察输出段）。
+/// `has_subagent_result` = 该轮洞察输入是否含 subagent 结果段（洞察中台组装时按 AgentPool
+/// subagent 状态变化记录，中间/最终结果均计），供 UNNI 动态执行权判定。
+async fn spawn_platform_insight(
     mode_manager: &mut ModeManager,
     state: &mut TuiState,
     pool: &std::sync::Arc<crate::agent::agent_pool::AgentPool>,
     turn_id: &str,
-    reason: &str,
 ) {
-    let echo_ctx = pool.get_turn_context(turn_id).await;
-    let summary = match &echo_ctx {
-        Some(ctx) => build_echo_summary(ctx, turn_id, reason),
-        None => summary_closing(turn_id, reason),
+    let Some(ctx) = pool.get_turn_context(turn_id).await else {
+        tracing::warn!("streaming_loop: insight_complete without turn context: {turn_id}");
+        return;
     };
-
+    let Some(ins) = &ctx.insight else {
+        tracing::warn!("streaming_loop: insight_complete without insight output: {turn_id}");
+        return;
+    };
+    let summary = ins.insight.insight.clone();
+    let has_subagent_result = ctx.has_subagent_result;
     match mode_manager
         .spawn_with_override(
             summary.clone(),
-            Some(crate::agent::thought::ThinkingInput::PlatformEcho {
-                platform: crate::agent::thought::InternalPlatform::Memory,
+            Some(crate::agent::thought::ThinkingInput::PlatformInsight {
                 summary,
-                artifact_refs: vec![],
+                has_subagent_result,
             }),
         )
         .await
@@ -2093,198 +1519,11 @@ mod prompt_install_tests {
             "keep this too"
         );
     }
-
-    #[test]
-    fn mix_state_tracks_rounds_and_reflect_ids() {
-        let mut st = MixThinkingState::default();
-        assert!(!st.is_current_round("t0"));
-
-        st.begin_round("t0");
-        assert!(st.is_current_round("t0"));
-
-        st.set_reflect1(Some("r1".into()), "t0");
-        assert_eq!(st.reflect1(), Some("r1"));
-
-        st.set_reflect2(Some("r2".into()), "t0");
-        assert_eq!(st.reflect2(), Some("r2"));
-
-        // 新一轮开始（不同 base_turn）→ 反思位清空
-        st.begin_round("t1");
-        assert!(st.is_current_round("t1"));
-        assert_eq!(st.reflect1(), None);
-        assert_eq!(st.reflect2(), None);
-
-        // advance_round：实例3 成为新 base_turn
-        st.set_reflect1(Some("r1".into()), "t1");
-        st.advance_round(Some("final1".into()));
-        assert!(st.is_current_round("final1"));
-        assert_eq!(st.reflect1(), None);
-        assert_eq!(st.reflect2(), None);
-    }
-
-    #[test]
-    fn mix_state_ignores_stale_round_writes() {
-        let mut st = MixThinkingState::default();
-        st.begin_round("t0");
-        st.set_reflect1(Some("r1".into()), "t0");
-        // 旧轮 turn 写入被忽略
-        st.set_reflect2(Some("stale".into()), "old");
-        assert_eq!(st.reflect2(), None);
-        assert!(!st.is_current_round("old"));
-    }
 }
 
 #[cfg(test)]
-mod echo_summary_tests {
+mod keep_budget_tests {
     use super::*;
-    use crate::agent::communication::{
-        AttentionFragment, CapabilityLifecycleRecord, CapabilityLifecycleState, ExecutionOutput,
-        ExperienceFragment, InsightOutput, MemoryOutput, ThinkDecision, ThinkingOutput,
-        TurnContext, TurnStatus,
-    };
-
-    fn action(
-        capability_id: &str,
-        state: CapabilityLifecycleState,
-        error: Option<&str>,
-    ) -> CapabilityLifecycleRecord {
-        CapabilityLifecycleRecord {
-            capability_id: capability_id.into(),
-            capability_name: String::new(),
-            arguments_summary: "{}".into(),
-            lifecycle_state: state,
-            invocation_ref: None,
-            error: error.map(str::to_string),
-            capability_call_logs: vec![],
-        }
-    }
-
-    fn turn_context(
-        execution: Option<ExecutionOutput>,
-        memory: Option<MemoryOutput>,
-    ) -> TurnContext {
-        TurnContext {
-            turn_id: "t1".into(),
-            thinking: ThinkingOutput {
-                decision: ThinkDecision::Execute,
-                goal: "统计 ERROR 总数".into(),
-                constraints: vec![],
-                message: String::new(),
-            },
-            execution,
-            insight: Some(InsightOutput {
-                insight: crate::agent::communication::InsightResult {
-                    insight: String::new(),
-                },
-                usage_observations: vec![],
-            }),
-            memory,
-            status: TurnStatus::Memorizing,
-            user_message: String::new(),
-            input_kind: "echo".into(),
-        }
-    }
-
-    #[test]
-    fn echo_summary_includes_lifecycle_actions_and_attention_content() {
-        let ctx = turn_context(
-            Some(ExecutionOutput {
-                task_design: "d".into(),
-                task_status: "s".into(),
-                lifecycle_actions: vec![
-                    action("subagent.create", CapabilityLifecycleState::Completed, None),
-                    action(
-                        "subagent.run",
-                        CapabilityLifecycleState::Rejected,
-                        Some("文件缺失"),
-                    ),
-                ],
-                subagent_states: vec![],
-            }),
-            Some(MemoryOutput {
-                attention: vec![AttentionFragment {
-                    focus: "ERROR统计结果-a.log".into(),
-                    content: "logs/a.log 中 ERROR 出现 3 次".into(),
-                    source_refs: vec![],
-                }],
-                experience: vec![ExperienceFragment {
-                    title: "经验1".into(),
-                    summary: "s".into(),
-                    source_refs: vec![],
-                }],
-                preference: vec![],
-                cognitive: vec![],
-            }),
-        );
-        let summary = build_echo_summary(&ctx, "t1", "echo");
-        assert!(summary.contains("subagent.create"), "{summary}");
-        assert!(
-            summary.contains("subagent.run: 失败[文件缺失]"),
-            "{summary}"
-        );
-        assert!(
-            summary.contains("logs/a.log 中 ERROR 出现 3 次"),
-            "{summary}"
-        );
-        assert!(summary.contains("ERROR统计结果-a.log"), "{summary}");
-        assert!(summary.contains("新增经验 1 条"), "{summary}");
-        assert!(summary.contains("既定目标: 统计 ERROR 总数"), "{summary}");
-    }
-
-    #[test]
-    fn echo_summary_empty_context_does_not_panic() {
-        let ctx = turn_context(None, None);
-        let summary = build_echo_summary(&ctx, "t1", "memory_complete");
-        assert!(summary.contains("既定目标: 统计 ERROR 总数"), "{summary}");
-        assert!(
-            summary.contains("记忆中台已整理上一轮 (thought_id=t1)"),
-            "{summary}"
-        );
-        assert!(!summary.contains("动作明细"), "{summary}");
-    }
-
-    #[test]
-    fn summary_closing_adapts_to_reason() {
-        let exec = summary_closing("t1", "execution_complete");
-        assert!(exec.contains("执行已完成"), "{exec}");
-        assert!(exec.contains("不重复执行"), "{exec}");
-
-        let insight = summary_closing("t1", "insight_complete");
-        assert!(insight.contains("洞察已完成"), "{insight}");
-        assert!(insight.contains("执行+洞察"), "{insight}");
-
-        let mem = summary_closing("t1", "memory_complete");
-        assert!(mem.contains("记忆中台已整理上一轮"), "{mem}");
-        assert!(mem.contains("继续推进目标"), "{mem}");
-    }
-
-    #[test]
-    fn echo_summary_truncates_overlong_total() {
-        let ctx = turn_context(
-            Some(ExecutionOutput {
-                task_design: "d".into(),
-                task_status: "s".into(),
-                lifecycle_actions: vec![action(
-                    &"x".repeat(5000),
-                    CapabilityLifecycleState::Completed,
-                    None,
-                )],
-                subagent_states: vec![],
-            }),
-            None,
-        );
-        let summary = build_echo_summary(&ctx, "t1", "echo");
-        assert!(
-            summary.contains("truncated"),
-            "must carry truncation marker"
-        );
-        assert!(summary.contains("请基于此继续推进目标"), "{summary}");
-        assert!(
-            summary.chars().count() < 4000 + 64,
-            "summary must stay near 4000-char budget, got {}",
-            summary.chars().count()
-        );
-    }
 
     #[test]
     fn keep_budget_defaults_allow_start() {

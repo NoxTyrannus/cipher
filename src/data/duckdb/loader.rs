@@ -25,11 +25,9 @@ fn default_api_protocol_for_serde() -> String {
 }
 
 pub fn default_api_protocol(api_type: &str) -> String {
-    if api_type.eq_ignore_ascii_case("anthropic") {
-        "anthropic-messages".to_string()
-    } else {
-        "openai-v1".to_string()
-    }
+    // Anthropic 已移除（只保留 Chat Completions + Responses 两种接入），一律按 openai-v1 处理。
+    let _ = api_type;
+    "openai-v1".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -345,6 +343,13 @@ fn load_models(conn: &duckdb::Connection, registry: &mut Registry) -> Result<(),
     for row in rows {
         let (id, name, provider, api_url, api_type, api_protocol, api_key, model_id, config) =
             row.map_err(|error| AgentError::Bootstrap(format!("row model: {error}")))?;
+        // TE 兼容：旧 DB 已存 api_type=Anthropic 模型行 —— 读取时忽略+warn（不迁移、不静默删除）。
+        if api_type.eq_ignore_ascii_case("anthropic") {
+            tracing::warn!(
+                model_id = %id,
+                "loader: 模型行 api_type=Anthropic 已不支持（只保留 Chat Completions + Responses），该模型将无法使用；如需使用请重新配置模型（不迁移、不删除该行）"
+            );
+        }
         let config = parse_optional_json(config, &format!("model '{id}'.config"))?;
         let api_key = (!api_key.is_empty()).then_some(api_key);
         registry.models.insert(

@@ -1,6 +1,6 @@
 use super::config::Config;
 #[cfg(test)]
-use super::config::{CollaborationSection, ContextSection, ModeStyles};
+use super::config::{ContextSection, ModeStyles};
 use crate::common::AgentError;
 use std::path::Path;
 
@@ -31,12 +31,11 @@ mod tests {
         let path = tmp.join("config.toml");
 
         let saved = Config {
-            provider: "anthropic".into(),
-            model_id: "claude-3-5-sonnet".into(),
+            provider: "openai".into(),
+            model_id: "gpt-4o".into(),
             api_key: "sk-test".into(),
             data_dir: PathBuf::from("/tmp/data"),
             default_mode: "keep".into(),
-            collaboration: CollaborationSection::default(),
             mode_styles: ModeStyles::default(),
             default_model: None,
             context: ContextSection::default(),
@@ -44,7 +43,7 @@ mod tests {
         saved.save(&path).unwrap();
 
         let loaded = init(&path).expect("init loads existing");
-        assert_eq!(loaded.provider, "anthropic");
+        assert_eq!(loaded.provider, "openai");
         assert_eq!(loaded.default_mode, "keep");
 
         std::fs::remove_dir_all(&tmp).ok();
