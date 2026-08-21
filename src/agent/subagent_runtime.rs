@@ -428,6 +428,32 @@ async fn run_once(params: &SubagentRunParams) -> std::result::Result<CompletedOu
 
         match parse_capability_output(&response.content) {
             CapabilityAction::Done { summary } => {
+                // T0 契约（任务书_subagent失败重试闭环_v0.3.1 §2.0）：累计调用存在失败且
+                // 全程零成功时拒绝 done —— 不以 summary 收口，回填失败摘要强制下一轮重试；
+                // 至少一次成功或 calls 为空则维持现状收口。
+                let has_success = calls.iter().any(|c| c.ok);
+                let has_failure = calls.iter().any(|c| !c.ok);
+                if has_failure && !has_success {
+                    let failed: Vec<String> = calls
+                        .iter()
+                        .filter(|c| !c.ok)
+                        .map(|c| {
+                            format!(
+                                "{}: {}",
+                                c.capability_id,
+                                c.error.as_deref().unwrap_or("未知错误")
+                            )
+                        })
+                        .collect();
+                    logs.push(format!("DONE rejected (no successful call yet): {summary}"));
+                    messages.push(ChatMessage::User {
+                        text: format!(
+                            "上一轮调用全部失败（{}）。分析错误、调整参数后重新调用，不要直接结束；除非能力永久不可用，输出明确失败说明。",
+                            failed.join("；")
+                        ),
+                    });
+                    continue;
+                }
                 logs.push(format!("DONE: {summary}"));
                 return Ok(CompletedOutcome {
                     summary,
@@ -1457,5 +1483,157 @@ mod tests {
             }
             other => panic!("expected Failed outcome, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn done_after_all_failed_is_rejected_then_retry_succeeds() {
+        let temporary = tempfile::tempdir().unwrap();
+        let storage = temporary.path().to_path_buf();
+        let (pool, _receivers) = AgentPool::new();
+        let pool = Arc::new(pool);
+        register_running(&pool).await;
+
+        let (finish, recorded) = recorded_finish();
+        // turn0: 未知能力 -> 调用失败；turn1: 模型输出 done 被拒绝（回填强制重试）；
+        // turn2: 重试成功；turn3: done 正常收口。
+        let responses = vec![
+            r#"{"capability_calls": [{"capability_id": "unknown.cap"}]}"#.to_string(),
+            r#"{"done": true, "summary": "give up"}"#.to_string(),
+            r#"{"capability_calls": [{"capability_id": "probe.a"}]}"#.to_string(),
+            r#"{"done": true, "summary": "retry succeeded"}"#.to_string(),
+        ];
+        let provider = Arc::new(ScriptedProvider::new(responses, None));
+        let params = make_params(
+            test_definition(),
+            storage.clone(),
+            provider,
+            pool.clone(),
+            test_registry(),
+            Arc::new(test_executor(Arc::new(Mutex::new(Vec::new())))),
+            Some(8),
+            finish,
+        );
+        spawn_subagent(params).await.unwrap();
+
+        // 拒绝 done 后强制重试成功：turns>=3、summary 为最终成功收口。
+        {
+            let calls = recorded.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert!(
+                calls[0].turns >= 3,
+                "turns must be >= 3, got: {}",
+                calls[0].turns
+            );
+            assert_eq!(
+                calls[0].outcome,
+                SubagentOutcome::Done {
+                    summary: "retry succeeded".to_string()
+                }
+            );
+        }
+
+        // 最终 calls 含成功记录（memory actions），失败记录与拒绝痕迹都进 evidence。
+        let states = pool.subagent_states().await;
+        assert_eq!(states[0].lifecycle, SubagentLifecycle::Idle);
+        let last = read_last_output(&storage, "sg_test").unwrap().unwrap();
+        assert_eq!(last.summary, "retry succeeded");
+        let memory = read_memory(&storage, "sg_test").unwrap();
+        let actions = &memory.entries[0].actions;
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.contains("capability_id=probe.a status=OK")),
+            "calls must contain a success record, got: {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.contains("capability_id=unknown.cap status=FAIL")),
+            "calls must contain the failure record, got: {actions:?}"
+        );
+        assert!(memory.entries[0]
+            .evidence
+            .iter()
+            .any(|line| line.contains("DONE rejected")));
+    }
+
+    #[tokio::test]
+    async fn done_after_successful_call_still_accepted() {
+        let temporary = tempfile::tempdir().unwrap();
+        let storage = temporary.path().to_path_buf();
+        let (pool, _receivers) = AgentPool::new();
+        let pool = Arc::new(pool);
+        register_running(&pool).await;
+
+        let (finish, recorded) = recorded_finish();
+        // turn0: probe.a 成功；turn1: done -> 正常收口（回归保护：有成功调用后 done 不被拒绝）。
+        let responses = vec![
+            r#"{"capability_calls": [{"capability_id": "probe.a"}]}"#.to_string(),
+            r#"{"done": true, "summary": "finished"}"#.to_string(),
+        ];
+        let provider = Arc::new(ScriptedProvider::new(responses, None));
+        let params = make_params(
+            test_definition(),
+            storage.clone(),
+            provider,
+            pool.clone(),
+            test_registry(),
+            Arc::new(test_executor(Arc::new(Mutex::new(Vec::new())))),
+            Some(8),
+            finish,
+        );
+        spawn_subagent(params).await.unwrap();
+
+        {
+            let calls = recorded.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].turns, 2);
+            assert_eq!(
+                calls[0].outcome,
+                SubagentOutcome::Done {
+                    summary: "finished".to_string()
+                }
+            );
+        }
+        let states = pool.subagent_states().await;
+        assert_eq!(states[0].lifecycle, SubagentLifecycle::Idle);
+        let last = read_last_output(&storage, "sg_test").unwrap().unwrap();
+        assert_eq!(last.summary, "finished");
+    }
+
+    #[tokio::test]
+    async fn all_failed_done_exhausts_max_turns_fails() {
+        let temporary = tempfile::tempdir().unwrap();
+        let storage = temporary.path().to_path_buf();
+        let (pool, _receivers) = AgentPool::new();
+        let pool = Arc::new(pool);
+        register_running(&pool).await;
+
+        // 每轮「失败调用 -> done」；max_turns=2 -> turn1 的 done 被拒绝后轮数耗尽 -> 失败收口。
+        let responses = vec![
+            r#"{"capability_calls": [{"capability_id": "unknown.cap"}]}"#.to_string(),
+            r#"{"done": true, "summary": "give up"}"#.to_string(),
+        ];
+        let provider = Arc::new(ScriptedProvider::new(responses, None));
+        let provider_calls = provider.calls.clone();
+        let params = make_params(
+            test_definition(),
+            storage.clone(),
+            provider,
+            pool.clone(),
+            test_registry(),
+            Arc::new(test_executor(Arc::new(Mutex::new(Vec::new())))),
+            Some(2),
+            noop_finish(),
+        );
+        spawn_subagent(params).await.unwrap();
+
+        // 2 次 provider 调用（失败调用 + 被拒绝的 done），无第三次。
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+        let states = pool.subagent_states().await;
+        assert_eq!(states[0].lifecycle, SubagentLifecycle::Failed);
+        let last = read_last_output(&storage, "sg_test").unwrap().unwrap();
+        assert_eq!(last.status, "failed");
+        assert!(last.summary.contains("max_turns"), "got: {}", last.summary);
     }
 }
