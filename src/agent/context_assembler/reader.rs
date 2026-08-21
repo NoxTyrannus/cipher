@@ -74,21 +74,22 @@ pub(super) fn build_pool_snapshot_text(
         return String::new();
     }
 
-    let mut platform_status: HashMap<&'static str, &AgentStatus> = HashMap::new();
+    let mut platform_status: HashMap<&'static str, (AgentStatus, f32)> = HashMap::new();
     let mut thinking_count = 0usize;
     let mut subagent_running = 0usize;
     let mut subagent_pending = 0usize;
 
     for entry in snapshot {
+        let heartbeat_age = entry.last_heartbeat.elapsed().as_secs_f32();
         match &entry.identity {
             AgentIdentity::ExecutionPlatform => {
-                platform_status.insert("执行中台", &entry.status);
+                platform_status.insert("执行中台", (entry.status.clone(), heartbeat_age));
             }
             AgentIdentity::InsightPlatform => {
-                platform_status.insert("洞察中台", &entry.status);
+                platform_status.insert("洞察中台", (entry.status.clone(), heartbeat_age));
             }
             AgentIdentity::MemoryPlatform => {
-                platform_status.insert("记忆中台", &entry.status);
+                platform_status.insert("记忆中台", (entry.status.clone(), heartbeat_age));
             }
             AgentIdentity::ThinkingEngine { .. } => {
                 thinking_count += 1;
@@ -117,8 +118,14 @@ pub(super) fn build_pool_snapshot_text(
     for name in &platforms {
         let status = platform_status
             .get(name)
-            .map(|s| status_str(s))
-            .unwrap_or("unregistered");
+            .map(|(status, heartbeat_age)| {
+                format!(
+                    "{} (heartbeat {:.1}s ago)",
+                    status_str(status),
+                    heartbeat_age
+                )
+            })
+            .unwrap_or_else(|| "unregistered".to_string());
         lines.push(format!("- {}: {}", name, status));
     }
 

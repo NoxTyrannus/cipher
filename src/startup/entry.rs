@@ -1,19 +1,19 @@
-use super::config::{CollaborationStyle, Config, ModeStyles, TriggerNode};
+use super::config::{Config, RuntimeStyles, TriggerNode};
 use super::{init, self_check};
 use crate::agent::context_assembler::{ContextAssembler, ContextConfig};
 use crate::common::AgentError;
 use crate::data::duckdb::loader::{
-    has_configured_model, insert_model, load_all_into_memory, rename_agent,
-    update_model_api_key_by_provider, ModelRow,
+    count_models, delete_model, has_configured_model, insert_model, load_all_into_memory,
+    rename_agent, update_model_api_key_by_provider, ModelRow,
 };
 use crate::logic::model::stream::StreamChunk;
 use crate::mode_runtime::ModeManager;
+use crate::startup::manifest::{self, UpgradeChoice};
 use crate::ui::backend::UiBackend;
 use crate::ui::tui::config_panel::{ActionResult, ConfigView, DbRequest};
 use crate::ui::tui::event::{key_event_to_action, TuiAction, BACKTAB_SENTINEL};
 use crate::ui::tui::state::{TuiMode, TuiState};
 use secrecy::SecretString;
-use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -22,9 +22,9 @@ use tokio::time;
 use tracing_subscriber::EnvFilter;
 
 fn init_tracing() {
-    let log_dir = dirs::data_dir()
+    let log_dir = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("cipher");
+        .join(".cipher");
     let log_path = log_dir.join("cipher.log");
     let _ = std::fs::create_dir_all(&log_dir);
     let _ = tracing_subscriber::fmt()
@@ -41,181 +41,60 @@ fn init_tracing() {
         .try_init();
 }
 
-const LEGACY_DEFAULT_PROMPT_SHA256: [(&str, &str); 24] = [
-    (
-        "system.md",
-        "a3e6f5e733ad55b953092b7f2b980d28540e2c18970615cd2fe6eac23ff3ebd4",
-    ),
-    (
-        "mode_unni.md",
-        "27e594c8521f912e1be178c4259bfbe209e9558fe099ba7ffd1285823157940b",
-    ),
-    (
-        "mode_keep.md",
-        "5a1f25824a9ed22366eca179f9b89d2f6f70bcaa09f0cb7a7a4ee3877e29d7e7",
-    ),
-    (
-        "mode_loop.md",
-        "8df327d53f1cb7c672ee25667d8b4f4cfd1e42463d1ca578fae50c2828722afd",
-    ),
-    // v0.2.6 出厂版本（本轮 v0.3.0 提示词重构前的旧默认值）
-    (
-        "system.md",
-        "0b58bb08ab4401da0dc577cd56c357ffc81bf1d3c3406c5eb112111d4230ebf3",
-    ),
-    (
-        "mode_unni.md",
-        "225b9b8f80749d27296664df11eeee2dbf9b17179c00d812f1d5b4c0b38b5e0a",
-    ),
-    (
-        "mode_keep.md",
-        "8f109418b5bf46df6fa5b851386a6a68411137c0a0e93a83cb50b67de66631b6",
-    ),
-    (
-        "mode_loop.md",
-        "32e5818ede42ea5fff031a9d2f27ddb2fb4fd4aad818c02882a4de70e4c6c2c8",
-    ),
-    // v0.3.0 出厂版本（v0.3.1 上下文工程分层重构前）
-    (
-        "system.md",
-        "706cc23d73b26e3dd3a85c9df036c03f2d238b1953ad0b0e9d3ad69121e5685a",
-    ),
-    (
-        "mode_unni.md",
-        "ffc113372e325745ab307fd31c8588fda21630ce425d6b6b4c2b3c13b3edb1a4",
-    ),
-    (
-        "mode_keep.md",
-        "e0ba5abeef3e0e00f2f35c2fa6f49cf4d7a91171c22e2e7809610a0bf2f35a48",
-    ),
-    (
-        "mode_loop.md",
-        "16d403e3c612cc01cb422ab6a40972bdcaebfba5ee17fa3ce73e98a3705bf4a1",
-    ),
-    // v0.3.1 三模式提示词最小化前
-    (
-        "mode_unni.md",
-        "543379fde888c5797ff825f766631d091dc6db9f4479af9ca25a78ef663514e0",
-    ),
-    (
-        "mode_keep.md",
-        "2c65fe42e7fab4874da52d35c4a61ce34b8781a2ae1e61d69e6acda7612f421f",
-    ),
-    (
-        "mode_loop.md",
-        "1e9ac1d869ad03697a429c256ccc0a793240571bf6092b3a63d7c4990ed42c3d",
-    ),
-    (
-        "execution_platform.md",
-        "05a9fb25d879b533b3bb9386a2d5969a2328141adfd99b20e542ed68a939902b",
-    ),
-    (
-        "insight_platform.md",
-        "17dafb1fbec2dd44f7ab7fe4aeae31c73b417cfd9ee607661c8fc73b9bfcda8e",
-    ),
-    // v0.3.1 洞察输出单 insight 字段前
-    (
-        "insight_platform.md",
-        "5e7144c8adf143bf816480e5db5fd3d955fe2766314605670ae8b1a5d5c5359d",
-    ),
-    (
-        "execution_platform.md",
-        "b823ae4de996af91ff4e3ea3cadbcf62574a53c2677f1e3282788c15da08cb7f",
-    ),
-    (
-        "insight_platform.md",
-        "12f80b0dbd7af353874a781235ed018d7f595dd943ca12210d2bddaf7f556ca8",
-    ),
-    (
-        "memory_attention.md",
-        "6ad9bb4811b7c859b620daf515f64434e8aa9d63fea3084cd93474d30f0d5148",
-    ),
-    (
-        "memory_experience.md",
-        "ba41710538354e05e791034907c14e0b851a8cab6412bb57b5e90e4e1dcdd264",
-    ),
-    (
-        "memory_preference.md",
-        "fc6b7fca92ba9da97847d367275fe869a15809da0197718ac8dbb01afdfe7e81",
-    ),
-    (
-        "memory_cognitive.md",
-        "61a00a1086ae32931b54b5b14c952c303dc2a7effd9f6cc9f200b30961524e74",
-    ),
-];
-
-fn ensure_default_prompts(data_dir: &Path) -> Result<(), AgentError> {
-    ensure_default_prompts_with_legacy_hashes(data_dir, &LEGACY_DEFAULT_PROMPT_SHA256)
-}
-
-fn ensure_default_prompts_with_legacy_hashes(
-    data_dir: &Path,
-    legacy_hashes: &[(&str, &str)],
-) -> Result<(), AgentError> {
-    let prompts_dir = data_dir.join("prompts");
-    std::fs::create_dir_all(&prompts_dir)
-        .map_err(|e| AgentError::Io(format!("create prompts dir: {e}")))?;
-
-    let obsolete = prompts_dir.join("5_state_cycle.md");
-    if obsolete.exists() {
-        let _ = std::fs::remove_file(&obsolete);
-        tracing::info!("ensure_default_prompts: removed obsolete 5_state_cycle.md");
-    }
-    for (name, content) in crate::logic::model::prompts::DEFAULT_PROMPTS {
-        let path = prompts_dir.join(name);
-
-        if name == "SOUL.md" {
-            match std::fs::read(&path) {
-                Ok(existing) => {
-                    if existing != content.as_bytes() {
-                        tracing::info!(
-                            "ensure_default_prompts: 数据目录 SOUL.md 与出厂默认不同 \
-                             (用户自定义或旧版本) — 以文件内容为准, 不覆盖; \
-                             若需恢复出厂默认请删除该文件后重启"
-                        );
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    std::fs::write(&path, content)
-                        .map_err(|e| AgentError::Io(format!("write SOUL.md: {e}")))?;
-                }
-                Err(error) => {
-                    return Err(AgentError::Io(format!("read SOUL.md: {error}")));
-                }
-            }
-            continue;
-        }
-        match std::fs::read(&path) {
-            Ok(existing) => {
-                let is_legacy_default = legacy_hashes
-                    .iter()
-                    .find_map(|(legacy_name, hash)| (*legacy_name == name).then_some(*hash))
-                    .is_some_and(|hash| sha256_bytes(&existing) == hash);
-                if is_legacy_default {
-                    std::fs::write(&path, content)
-                        .map_err(|e| AgentError::Io(format!("upgrade {name}: {e}")))?;
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::write(&path, content)
-                    .map_err(|e| AgentError::Io(format!("write {name}: {e}")))?;
-            }
-            Err(error) => {
-                return Err(AgentError::Io(format!("read {name}: {error}")));
-            }
-        }
+#[allow(dead_code)]
+fn ensure_default_prompts(unified_root: &Path) -> Result<(), AgentError> {
+    // 非交互安全模式：用户改过的文件默认跳过（保留用户内容）。
+    let report = manifest::upgrade_prompts(
+        unified_root,
+        &crate::logic::model::prompts::DEFAULT_PROMPTS,
+        |_| UpgradeChoice::Cancel,
+    )
+    .map_err(|e| AgentError::Io(format!("ensure_default_prompts: {e}")))?;
+    if !report.skipped.is_empty() {
+        tracing::info!(
+            "ensure_default_prompts: skipped user-modified files: {:?}",
+            report.skipped
+        );
     }
     Ok(())
 }
 
-fn sha256_bytes(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut output = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as _;
-        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+fn ensure_default_prompts_interactive(unified_root: &Path) -> Result<(), AgentError> {
+    let defaults = crate::logic::model::prompts::DEFAULT_PROMPTS;
+    // 如果没有 manifest，先全新安装（不会询问）。
+    if !unified_root.join("manifest.json").exists() {
+        manifest::ensure_fresh_install(unified_root, &defaults)
+            .map_err(|e| AgentError::Io(format!("fresh install: {e}")))?;
+        return Ok(());
     }
-    output
+
+    let report = manifest::upgrade_prompts(unified_root, &defaults, |name| {
+        let items = vec![
+            "备份后升级".to_string(),
+            "销毁旧文件升级".to_string(),
+            "取消（保留用户文件）".to_string(),
+        ];
+        let sel = dialoguer::Select::new()
+            .with_prompt(format!("提示词 {name} 已被用户修改，如何处理？"))
+            .items(&items)
+            .default(0)
+            .interact()
+            .unwrap_or(2);
+        match sel {
+            0 => UpgradeChoice::Backup,
+            1 => UpgradeChoice::Overwrite,
+            _ => UpgradeChoice::Cancel,
+        }
+    })
+    .map_err(|e| AgentError::Io(format!("upgrade prompts: {e}")))?;
+
+    if !report.skipped.is_empty() {
+        tracing::info!(
+            "ensure_default_prompts_interactive: skipped {:?}",
+            report.skipped
+        );
+    }
+    Ok(())
 }
 
 fn load_config(
@@ -238,7 +117,8 @@ pub async fn run_setup(
     super::config::migrate_data_dir()?;
     let config = load_config(&config_path, data_dir_override)?;
     let app_state = crate::data::bootstrap(&config.data_dir)?;
-    ensure_default_prompts(&config.data_dir)?;
+    let unified_root = crate::startup::manifest::unified_root();
+    ensure_default_prompts_interactive(&unified_root)?;
     crate::data::cognitive_seed::ensure_default_cognitive_seed(&config.data_dir)?;
     tracing::info!(data_dir = ?config.data_dir, "setup: bootstrap ready");
     if has_configured_model(&app_state.duckdb)? {
@@ -262,7 +142,8 @@ pub async fn run_normal(
     super::config::migrate_data_dir()?;
     let config = load_config(&config_path, data_dir_override)?;
     let mut app_state = crate::data::bootstrap(&config.data_dir)?;
-    ensure_default_prompts(&config.data_dir)?;
+    let unified_root = crate::startup::manifest::unified_root();
+    ensure_default_prompts_interactive(&unified_root)?;
     tracing::info!(data_dir = ?config.data_dir, "normal: bootstrap ready");
     crate::data::cognitive_seed::ensure_default_cognitive_seed(&config.data_dir)?;
 
@@ -305,7 +186,7 @@ pub async fn run_normal(
     let insight_provider = std::sync::Arc::clone(&exec_provider);
     let memory_provider = std::sync::Arc::clone(&exec_provider);
     let memory_api_key = exec_api_key.clone();
-    let prompts_dir = Some(config.data_dir.join("prompts"));
+    let prompts_dir = Some(unified_root.join("prompts"));
 
     let (pool, receivers) = crate::agent::agent_pool::AgentPool::new();
     let pool = std::sync::Arc::new(pool);
@@ -451,6 +332,7 @@ pub async fn run_normal(
         let runtime_hook = crate::agent::subagent_runtime::RuntimeSpawnHook::new(
             std::sync::Arc::clone(&pool),
             app_state.registry.clone(),
+            Some(std::sync::Arc::clone(&exec_duckdb_conn)),
             std::sync::Arc::clone(&exec_executor),
             app_state.paths.storage_root().to_path_buf(),
             subagent_provider_registry,
@@ -682,6 +564,7 @@ pub async fn run_normal(
     assembler.set_thought_store(std::sync::Arc::clone(&thought_store));
     assembler.set_memory_db(std::sync::Arc::clone(&memory_db));
     assembler.set_shared_trivium(std::sync::Arc::clone(&trivium_db));
+    assembler.set_agent_pool(std::sync::Arc::clone(&pool));
 
     let duckdb_for_mgr = {
         let duckdb_path = app_state.paths.duckdb();
@@ -701,6 +584,17 @@ pub async fn run_normal(
         pool,
         duckdb_for_mgr,
     );
+    let mode_styles_shared =
+        std::sync::Arc::new(std::sync::Mutex::new(RuntimeStyles::from_config(&config)));
+    let keep_budget_tracker = std::sync::Arc::new(std::sync::Mutex::new(KeepBudgetTracker::new(
+        config.mode_styles.keep.token_budget,
+        config.mode_styles.keep.time_budget_secs,
+    )));
+    crate::startup::self_monitor::spawn_self_monitor(
+        unified_root.clone(),
+        mode_styles_shared.clone(),
+        keep_budget_tracker.clone(),
+    );
     tracing::info!("mode_init: ModeManager ready (default: UNNI)");
 
     if !config.default_mode.eq_ignore_ascii_case("unni") {
@@ -718,12 +612,6 @@ pub async fn run_normal(
     if std::io::stdout().is_terminal() {
         tracing::info!("tui_run: 真 ratatui TUI streaming loop starting");
 
-        let mode_styles_shared = std::sync::Arc::new(std::sync::Mutex::new(config.mode_styles));
-        let keep_budget_tracker =
-            std::sync::Arc::new(std::sync::Mutex::new(KeepBudgetTracker::new(
-                config.mode_styles.keep.token_budget,
-                config.mode_styles.keep.time_budget_secs,
-            )));
         run_streaming_loop(
             &mut mode_manager,
             trigger_fwd_rx,
@@ -737,7 +625,14 @@ pub async fn run_normal(
         let mut tui = crate::ui::TuiBackend::new();
         tracing::info!("tui_run: non-TTY blocking loop");
         run_main_loop(&mut mode_manager, &mut tui, || {
-            crate::startup::config_flow::run(&app_state)
+            crate::startup::config_flow::run(&app_state)?;
+            if let Ok(Some(cfg)) = Config::load(&Config::default_path()) {
+                *mode_styles_shared.lock().unwrap() = RuntimeStyles::from_config(&cfg);
+                let mut tracker = keep_budget_tracker.lock().unwrap();
+                tracker.set_token_budget(cfg.mode_styles.keep.token_budget);
+                tracker.set_time_budget_secs(cfg.mode_styles.keep.time_budget_secs);
+            }
+            Ok(())
         })
         .await?;
     }
@@ -764,7 +659,8 @@ pub async fn run_config(
     super::config::migrate_data_dir()?;
     let config = load_config(&config_path, data_dir_override)?;
     let app_state = crate::data::bootstrap(&config.data_dir)?;
-    ensure_default_prompts(&config.data_dir)?;
+    let unified_root = crate::startup::manifest::unified_root();
+    ensure_default_prompts_interactive(&unified_root)?;
     tracing::info!(data_dir = ?config.data_dir, "config: bootstrap ready");
     crate::data::cognitive_seed::ensure_default_cognitive_seed(&config.data_dir)?;
     crate::data::cognitive_seed::ensure_default_capabilities(&config.data_dir)?;
@@ -834,7 +730,7 @@ pub async fn run_streaming_loop(
     mut trigger_rx: mpsc::Receiver<crate::agent::agent_pool::channels::TriggerEvent>,
     app: &crate::data::bootstrap::AppState,
     pool: std::sync::Arc<crate::agent::agent_pool::AgentPool>,
-    mode_styles_shared: std::sync::Arc<std::sync::Mutex<ModeStyles>>,
+    mode_styles_shared: std::sync::Arc<std::sync::Mutex<RuntimeStyles>>,
     keep_budget_tracker: std::sync::Arc<std::sync::Mutex<KeepBudgetTracker>>,
 ) -> Result<(), AgentError> {
     use crossterm::event::{Event, EventStream};
@@ -896,17 +792,6 @@ pub async fn run_streaming_loop(
                                 state.config_panel.reload_models(reg.models.values().cloned().collect());
                                 state.config_panel.clear_db_request();
                             }
-                            DbRequest::LoadProviders => {
-                                let reg = load_all_into_memory(&app.duckdb)?;
-                                let mut providers: Vec<String> = reg.models.values()
-                                    .filter(|m| m.api_key.as_ref().map(|k| !k.is_empty()).unwrap_or(false))
-                                    .map(|m| m.provider.clone())
-                                    .collect();
-                                providers.sort(); providers.dedup();
-                                if let ConfigView::QuickAddSelectProvider { providers: p, .. } = &mut state.config_panel.view {
-                                    *p = providers;
-                                }
-                            }
                             DbRequest::LoadDefaultCandidates => {
                                 let reg = load_all_into_memory(&app.duckdb)?;
                                 let candidates: Vec<ModelRow> = reg.models.values()
@@ -936,43 +821,47 @@ pub async fn run_streaming_loop(
                                 }
                                 state.config_panel.clear_db_request();
                             }
-                            DbRequest::SubmitQuickAdd { provider, name, model_id } => {
-
-                                let reg = load_all_into_memory(&app.duckdb)?;
-                                let sample = reg.models.values()
-                                    .find(|m| m.provider == provider && m.api_key.as_ref().map(|k| !k.is_empty()).unwrap_or(false))
-                                    .cloned();
-                                match sample {
-                                    Some(em) => {
-                                        let row = ModelRow {
-                                            id: format!("{}-{}", provider, model_id),
-                                            name, provider: provider.clone(),
-                                            api_protocol: crate::data::duckdb::loader::default_api_protocol(&em.api_type),
-                                            api_url: em.api_url, api_type: em.api_type, model_id,
-                                            api_key: em.api_key.clone(), config: None,
-                                        };
-                                        insert_model(&app.duckdb, &row)?;
-                                        let n = update_model_api_key_by_provider(&app.duckdb, &provider, &SecretString::new(em.api_key.unwrap()))?;
-                                        state.config_panel.message = Some((format!("已快速新增 {} ({} 行同步)", row.id, n), false));
-                                        state.config_panel.view = ConfigView::ModelList;
-                                    }
-                                    None => state.config_panel.message = Some(("找不到该 provider 的带 key 样本行".into(), true)),
-                                }
-                                state.config_panel.clear_db_request();
-                            }
-                            DbRequest::SubmitChangeKey { provider, api_key } => {
-                                let secret = SecretString::new(api_key);
-                                let n = update_model_api_key_by_provider(&app.duckdb, &provider, &secret)?;
-                                state.config_panel.message = Some((format!("已 update provider={} 的 {} 行 api_key", provider, n), n > 0));
-                                state.config_panel.view = ConfigView::ModelList;
-                                state.config_panel.clear_db_request();
-                            }
                             DbRequest::SubmitSetDefault { model_id } => {
                                 let config_path = crate::startup::Config::default_path();
                                 let mut config = crate::startup::init::init(&config_path)?;
                                 config.default_model = Some(model_id.clone());
                                 config.save(&config_path)?;
                                 state.config_panel.message = Some((format!("已切默认模型 → {}", model_id), false));
+                                state.config_panel.view = ConfigView::ModelList;
+                                state.config_panel.clear_db_request();
+                            }
+                            DbRequest::DeleteModel { model_id } => {
+                                let config_path = crate::startup::Config::default_path();
+                                let mut config = crate::startup::init::init(&config_path)?;
+                                let total = count_models(&app.duckdb)?;
+                                if total <= 1 {
+                                    state.config_panel.message = Some((
+                                        "至少保留一个模型，当前仅剩 1 个模型，不能删除".to_string(),
+                                        true,
+                                    ));
+                                } else {
+                                    let was_default = config.default_model.as_deref() == Some(model_id.as_str());
+                                    match delete_model(&app.duckdb, &model_id) {
+                                        Ok(_) => {
+                                            let mut msg = format!("已删除模型 {model_id}");
+                                            if was_default {
+                                                let reg = load_all_into_memory(&app.duckdb)?;
+                                                let next_default = reg.models.values().next().map(|model| model.id.clone());
+                                                config.default_model = next_default;
+                                                config.save(&config_path)?;
+                                                if let Some(default_id) = &config.default_model {
+                                                    msg.push_str(&format!("；默认模型已切换 → {default_id}"));
+                                                }
+                                            }
+                                            let reg = load_all_into_memory(&app.duckdb)?;
+                                            state.config_panel.reload_models(reg.models.values().cloned().collect());
+                                            state.config_panel.message = Some((msg, false));
+                                        }
+                                        Err(error) => {
+                                            state.config_panel.message = Some((format!("删除失败: {error}"), true));
+                                        }
+                                    }
+                                }
                                 state.config_panel.view = ConfigView::ModelList;
                                 state.config_panel.clear_db_request();
                             }
@@ -983,44 +872,56 @@ pub async fn run_streaming_loop(
                                 let msg = match target {
                                     0 => {
                                         let next = match value.as_str() {
-                                            "follow" => CollaborationStyle::Follow,
-                                            _ => CollaborationStyle::Autonomous,
-                                        };
-                                        config.mode_styles.unni.style = next;
-                                        styles.unni.style = next;
-                                        format!("UNNI 协同方式已切换 → {:?}", next)
-                                    }
-                                    1 => {
-                                        let next = match value.as_str() {
                                             "insight" => TriggerNode::Insight,
                                             "memory" => TriggerNode::Memory,
                                             _ => TriggerNode::Execution,
                                         };
-                                        config.mode_styles.unni.node = next;
-                                        styles.unni.node = next;
-                                        format!("UNNI 协同节点已切换 → {:?}", next)
+                                        config.collaboration.node = next;
+                                        styles.collaboration.node = next;
+                                        if next == TriggerNode::Execution {
+                                            config.collaboration.mix_thinking = false;
+                                            styles.collaboration.mix_thinking = false;
+                                            "协同节点已切换 → 执行中台（Mix 思考自动关闭）".to_string()
+                                        } else {
+                                            format!("协同节点已切换 → {next:?}")
+                                        }
+                                    }
+                                    1 => {
+                                        let on = value == "on";
+                                        if config.collaboration.node == TriggerNode::Execution && on {
+                                            "协同节点为执行中台时 Mix 思考自动关闭，请先切换协同节点".to_string()
+                                        } else {
+                                            config.collaboration.mix_thinking = on;
+                                            styles.collaboration.mix_thinking = on;
+                                            format!("Mix 思考已切换 → {}", if on { "开" } else { "关" })
+                                        }
                                     }
                                     2 => {
-                                        let budget = value.parse::<u64>().unwrap_or(100_000).max(100_000);
+                                        // 0=无限；非 0 时 clamp 到默认最小值 100K。
+                                        let budget = normalize_keep_token_budget(&value);
                                         config.mode_styles.keep.token_budget = budget;
                                         styles.keep.token_budget = budget;
                                         // 同步运行时预算追踪器（保持周期内已用 token 不回退）
                                         keep_budget_tracker.lock().unwrap().token_budget = budget;
-                                        format!("KEEP Token 预算已切换 → {}K", budget / 1000)
+                                        if budget == 0 {
+                                            "KEEP Token 预算已切换 → 无限 (0)".to_string()
+                                        } else {
+                                            format!("KEEP Token 预算已切换 → {}K", budget / 1000)
+                                        }
                                     }
                                     3 => {
-                                        let secs = value.parse::<u64>().unwrap_or(300).max(300);
+                                        // 0=无限；非 0 时 clamp 到默认最小值 5min。
+                                        let secs = normalize_keep_time_budget_secs(&value);
                                         config.mode_styles.keep.time_budget_secs = secs;
                                         styles.keep.time_budget_secs = secs;
                                         keep_budget_tracker.lock().unwrap().time_budget_secs = secs;
-                                        format!("KEEP 时间预算已切换 → {}min", secs / 60)
+                                        if secs == 0 {
+                                            "KEEP 时间预算已切换 → 无限 (0)".to_string()
+                                        } else {
+                                            format!("KEEP 时间预算已切换 → {}min", secs / 60)
+                                        }
                                     }
-                                    _ => {
-                                        let on = value == "on";
-                                        config.mode_styles.r#loop.mix_thinking = on;
-                                        styles.r#loop.mix_thinking = on;
-                                        format!("LOOP 融合思考已切换 → {}", if on { "开" } else { "关" })
-                                    }
+                                    _ => "未知协作设置项".to_string(),
                                 };
                                 config.save(&config_path)?;
                                 *mode_styles_shared.lock().unwrap() = styles;
@@ -1103,21 +1004,11 @@ pub async fn run_streaming_loop(
                                 }
                                 state.push_user(input.clone());
 
-                                // 跟随模式：合并 pending context（协同节点完成后的摘要）进本次输入
-                                let spawn_input = if let Some((pending_turn, pending_summary)) =
-                                    state.take_pending_context()
-                                {
-                                    tracing::info!(
-                                        "streaming_loop: merging pending context (thought_id={pending_turn}) into user input"
-                                    );
-                                    format!(
-                                        "[上一轮整理上下文 (thought_id={pending_turn})]\n{pending_summary}\n\n——用户新输入——\n{input}"
-                                    )
-                                } else {
-                                    input
-                                };
+                                // 用户输入最高优先级：打断后台空转/反思循环。
+                                mode_manager.cancel_all_active();
+                                mode_manager.loop_reset_idle();
 
-                                match mode_manager.spawn(spawn_input).await {
+                                match mode_manager.spawn(input).await {
                                     Ok(id) => {
 
                                         state.push_streaming(id);
@@ -1281,7 +1172,33 @@ pub async fn run_streaming_loop(
                 // 3. 仅当 platform == 协同节点时触发/暂存；协同节点后的异步中台只沉淀不触发。
                 let mode_name = mode_manager.current_name().to_ascii_lowercase();
                 let styles = *mode_styles_shared.lock().unwrap();
-                let style = styles.style_for(&mode_name);
+                let node = styles.node();
+
+                // subagent 完成事件：异步结果回传，触发新一轮思考/echo 让用户看到结果。
+                if event.reason == "subagent_complete" {
+                    if let Some(summary) = build_subagent_complete_summary(&pool, &event.turn_id).await {
+                        match mode_manager
+                            .spawn_with_override(
+                                summary.clone(),
+                                Some(crate::agent::thought::ThinkingInput::PlatformEcho {
+                                    platform: crate::agent::thought::InternalPlatform::Memory,
+                                    summary,
+                                    artifact_refs: vec![],
+                                }),
+                            )
+                            .await
+                        {
+                            Ok(id) => state.push_streaming(id),
+                            Err(e) => state.set_error(e.to_string()),
+                        }
+                    } else {
+                        tracing::warn!(
+                            "streaming_loop: subagent_complete event without subagent state: {}",
+                            event.turn_id
+                        );
+                    }
+                    continue;
+                }
 
                 let platform = match event.reason.as_str() {
                     "execution_complete" => Some(TriggerNode::Execution),
@@ -1297,41 +1214,77 @@ pub async fn run_streaming_loop(
                     continue;
                 };
 
-                // LOOP + 融合思考（Mix Thinking）on：三阶段流水线并行 + 拼接合并。
+                // 全局 Mix Thinking（仅 LOOP 使用；node=execution 时配置层已自动关闭）。
                 //
-                // 轮结构（每个执行实例 = 一轮 think_0 及其后继）：
-                //   execution_complete(T) → 实例1 (ReflectOnly, 执行反思)
-                //   insight_complete(T)   → 实例2 (ReflectOnly, 洞察反思, 拼接实例1)
-                //   memory_complete(T)    → 实例3 (PlatformEcho, 记忆综合, 拼接实例1+2) = 下一轮 think_0
-                //
-                // 并行：实例1 spawn 时洞察中台已被 ExecutionDone 并行驱动；实例2 同理。
-                // join：事件到达时对应中台结果已写入 ctx；实例1/2 的 think 从 store 读取。
-                // 反思实例（ReflectOnly）think 后不执行、不驱动中台，故不会产生新完成事件。
-                let mix_on = mode_name == "loop"
-                    && styles.r#loop.mix_thinking
-                    && style.node == TriggerNode::Memory;
+                // node=Memory：三阶段流水线（执行反思 → 洞察反思 → 记忆综合 final）。
+                // node=Insight：两阶段流水线（执行反思 → insight_complete 直接 final，跳过实例2）。
+                let mix_on = mode_name == "loop" && styles.mix_on(node);
+
+                // LOOP 收敛：无论 mix 开关，触发节点轮若空转达到阈值则停止 spawn。
+                if mode_name == "loop" && platform == node {
+                    let ctx = pool.get_turn_context(&event.turn_id).await;
+                    let actions_empty = ctx
+                        .as_ref()
+                        .and_then(|c| c.execution.as_ref())
+                        .map(|e| e.lifecycle_actions.is_empty())
+                        .unwrap_or(true);
+                    let subagents_running = pool
+                        .subagent_states()
+                        .await
+                        .iter()
+                        .any(|s| s.lifecycle == crate::agent::execution_types::SubagentLifecycle::Running);
+                    if actions_empty && !subagents_running {
+                        mode_manager.loop_note_noop();
+                        if mode_manager.loop_should_stop_idle() {
+                            tracing::info!(
+                                "streaming_loop: LOOP idle convergence reached, waiting for user input (thought_id={})",
+                                event.turn_id
+                            );
+                            continue;
+                        }
+                    } else {
+                        mode_manager.loop_reset_idle();
+                    }
+                }
+
                 if mix_on {
                     match platform {
                         TriggerNode::Execution => {
                             // 新一轮开始（执行实例完成）
                             mix_state.begin_round(&event.turn_id);
-                            // 防御：上一轮 final 尚未 spawn 时不会到达这里（顺序保证），
-                            // 若异常残留则清空 pending，避免跨轮错配。
                             mix_join = None;
                             final_wanted = false;
                             let summary = mix_summary(&pool, &event.turn_id, None, None, &event.reason).await;
-                            let new_id = spawn_mix_reflect(
-                                mode_manager, &mut state, &summary,
-                            )
-                            .await;
+                            let new_id = spawn_mix_reflect(mode_manager, &mut state, &summary).await;
                             if let Some(id1) = &new_id {
                                 mix_state.set_reflect1(Some(id1.clone()), &event.turn_id);
                                 mix_registry.register(id1.clone());
                             }
                         }
                         TriggerNode::Insight => {
-                            if mix_state.is_current_round(&event.turn_id) {
-                                // join：等实例1 就绪后 spawn 实例2（事件驱动，不阻塞）
+                            if !mix_state.is_current_round(&event.turn_id) {
+                                tracing::debug!(
+                                    "streaming_loop: mix insight_complete for non-current round ({}) ignored",
+                                    event.turn_id
+                                );
+                                continue;
+                            }
+                            if node == TriggerNode::Insight {
+                                // node=Insight：等实例1 就绪后直接 spawn final（输入=base+反思1）。
+                                final_wanted = true;
+                                if let Some(r1) = mix_state.reflect1() {
+                                    mix_join = Some(PendingMix::AwaitFinalFromInsight {
+                                        base: event.turn_id.clone(),
+                                        reflect1: r1.to_string(),
+                                    });
+                                }
+                                try_progress_mix(
+                                    mode_manager, &mut state, &pool, &mut mix_state,
+                                    &mix_registry, &mut mix_join, &mut final_wanted,
+                                )
+                                .await;
+                            } else {
+                                // node=Memory：等实例1 就绪后 spawn 实例2。
                                 if let Some(r1) = mix_state.reflect1() {
                                     mix_join = Some(PendingMix::AwaitReflect1 {
                                         base: event.turn_id.clone(),
@@ -1343,16 +1296,17 @@ pub async fn run_streaming_loop(
                                     &mix_registry, &mut mix_join, &mut final_wanted,
                                 )
                                 .await;
-                            } else {
-                                tracing::debug!(
-                                    "streaming_loop: mix insight_complete for non-current round ({}) ignored",
-                                    event.turn_id
-                                );
                             }
                         }
                         TriggerNode::Memory => {
+                            if node != TriggerNode::Memory {
+                                tracing::debug!(
+                                    "streaming_loop: mix memory_complete is async-after for node={node:?} (thought_id={})",
+                                    event.turn_id
+                                );
+                                continue;
+                            }
                             if mix_state.is_current_round(&event.turn_id) {
-                                // join：base 记忆完成，等实例1+2 就绪后 spawn final（事件驱动，不阻塞）
                                 final_wanted = true;
                                 try_progress_mix(
                                     mode_manager, &mut state, &pool, &mut mix_state,
@@ -1370,49 +1324,35 @@ pub async fn run_streaming_loop(
                     continue;
                 }
 
-                if platform == style.node {
-                    // 协同节点完成 → 按协同方式处理
-                    match style.style {
-                        CollaborationStyle::Autonomous => {
-                            // KEEP 预算检查：预算耗尽则暂停（不 spawn）
-                            if mode_name == "keep" {
-                                let mut tracker = keep_budget_tracker.lock().unwrap();
-                                if !keep_budget_allows(&mut tracker, &mut state, &event.turn_id) {
-                                    continue;
-                                }
-                                tracker.record_instance();
-                            }
-                            spawn_flywheel_echo(
-                                mode_manager,
-                                &mut state,
-                                &pool,
-                                &event.turn_id,
-                                &event.reason,
-                            )
-                            .await;
+                if platform == node {
+                    // 协同节点完成 → 立即触发新一轮思考引擎（Follow/pending 机制已删除）。
+                    if mode_name == "keep" {
+                        let mut tracker = keep_budget_tracker.lock().unwrap();
+                        if !keep_budget_allows(&mut tracker, &mut state, &event.turn_id) {
+                            continue;
                         }
-                        CollaborationStyle::Follow => {
-                            // 跟随：暂存为 pending context，等用户下次输入合并
-                            let ctx = pool.get_turn_context(&event.turn_id).await;
-                            let summary = match &ctx {
-                                Some(c) => build_echo_summary(c, &event.turn_id, &event.reason),
-                                None => summary_closing(&event.turn_id, &event.reason),
-                            };
-                            state.stash_pending_context(&event.turn_id, &summary);
-                        }
+                        tracker.record_instance();
                     }
-                } else if style.node.async_after().contains(&platform) {
+                    spawn_flywheel_echo(
+                        mode_manager,
+                        &mut state,
+                        &pool,
+                        &event.turn_id,
+                        &event.reason,
+                    )
+                    .await;
+                } else if node.async_after().contains(&platform) {
                     // 协同节点后的异步中台：只沉淀记忆，不触发新实例
                     tracing::info!(
                         "streaming_loop: async platform {platform:?} after trigger node {:?} — \
                          only sinking memory, not triggering (thought_id={})",
-                        style.node, event.turn_id
+                        node, event.turn_id
                     );
                 } else {
                     // 协同节点前的中台：忽略
                     tracing::debug!(
                         "streaming_loop: trigger ignored (platform {platform:?} before trigger node {:?})",
-                        style.node
+                        node
                     );
                 }
             }
@@ -1512,33 +1452,8 @@ fn summary_closing(turn_id: &str, reason: &str) -> String {
     }
 }
 
-/// KEEP 周期是否应停止飞轮续跑。
-///
-/// - say 配额已用（KEEP 周期内成功 say 过一次，用于目标对齐）
-/// - 且当前轮决策既不是执行（Execute）也不是失败（Failure）
-///
-/// 失败轮（think 解析失败）不属于"任务结束"信号，应继续修复续跑。
-fn should_stop_keep_flywheel(
-    decision: Option<crate::agent::communication::ThinkDecision>,
-    say_consumed: bool,
-) -> bool {
-    if !say_consumed {
-        return false;
-    }
-    decision.is_some_and(|d| {
-        d != crate::agent::communication::ThinkDecision::Execute
-            && d != crate::agent::communication::ThinkDecision::Failure
-    })
-}
-
-/// KEEP 预算追踪器：Token 累计（按每实例估值）+ 时间累计。
-///
-/// - `token_budget`：KEEP 周期内累计输出 token 上限（默认 100K）
-/// - `time_budget_secs`：KEEP 周期内累计执行时间上限（默认 5min）
-/// - 每实例 token 估值 `ESTIMATED_TOKENS_PER_INSTANCE`（8K），因为 provider usage
-///   未贯通到调度层；时间按周期起点精确计时。
-/// - 周期起点由 KEEP 首次触发时置为 now；`token_exceeded`/`time_exceeded` 任一为真
-///   表示预算耗尽（暂停 + 提示）。
+/// KEEP 预算追踪器：token 与时间预算，0=无限。
+/// 周期起点由 KEEP 首次触发时置为 now；`token_exceeded`/`time_exceeded` 任一为真表示预算耗尽（暂停 + 提示）。
 #[derive(Debug, Clone)]
 pub struct KeepBudgetTracker {
     token_budget: u64,
@@ -1563,6 +1478,14 @@ impl KeepBudgetTracker {
         }
     }
 
+    pub fn set_token_budget(&mut self, budget: u64) {
+        self.token_budget = budget;
+    }
+
+    pub fn set_time_budget_secs(&mut self, secs: u64) {
+        self.time_budget_secs = secs;
+    }
+
     /// 开始一个 KEEP 周期（首次飞轮触发时调用）。
     pub fn start_period(&mut self) {
         if self.period_started_at.is_none() {
@@ -1580,14 +1503,16 @@ impl KeepBudgetTracker {
 
     /// Token 预算是否耗尽。
     pub fn token_exceeded(&self) -> bool {
-        self.tokens_used >= self.token_budget
+        self.token_budget != 0 && self.tokens_used >= self.token_budget
     }
 
     /// 时间预算是否耗尽。
     pub fn time_exceeded(&self) -> bool {
-        self.period_started_at
-            .map(|t| t.elapsed().as_secs() >= self.time_budget_secs)
-            .unwrap_or(false)
+        self.time_budget_secs != 0
+            && self
+                .period_started_at
+                .map(|t| t.elapsed().as_secs() >= self.time_budget_secs)
+                .unwrap_or(false)
     }
 
     /// 预算是否耗尽（任一维度）。
@@ -1608,6 +1533,26 @@ impl KeepBudgetTracker {
             time,
             self.time_budget_secs
         )
+    }
+}
+
+/// 解析 TUI/CLI 输入的 KEEP Token 预算：0=无限，非 0 clamp 到默认最小值 100K。
+fn normalize_keep_token_budget(value: &str) -> u64 {
+    match value.trim().parse::<u64>() {
+        // TUI 输入单位为 K；保存到 config 的单位为 token。
+        Ok(0) => 0,
+        Ok(budget_k) => budget_k.saturating_mul(1000).max(100_000),
+        Err(_) => 100_000,
+    }
+}
+
+/// 解析 TUI/CLI 输入的 KEEP 时间预算：0=无限，非 0 clamp 到默认最小值 5min。
+fn normalize_keep_time_budget_secs(value: &str) -> u64 {
+    match value.trim().parse::<u64>() {
+        // TUI 输入单位为 min；保存到 config 的单位为秒。
+        Ok(0) => 0,
+        Ok(minutes) => minutes.saturating_mul(60).max(300),
+        Err(_) => 300,
     }
 }
 
@@ -1742,6 +1687,11 @@ enum PendingMix {
         base: String,
         reflect1: String,
     },
+    /// node=Insight：等实例1 就绪后直接 spawn final（无实例2）。
+    AwaitFinalFromInsight {
+        base: String,
+        reflect1: String,
+    },
     AwaitFinal {
         base: String,
         reflect1: String,
@@ -1801,6 +1751,34 @@ async fn try_progress_mix(
                     reflect2: new_id.unwrap_or_default(),
                 });
                 // 继续循环：若 reflect2 已就绪，则顺势推进 final
+            }
+            PendingMix::AwaitFinalFromInsight { base, reflect1 } => {
+                if !*final_wanted {
+                    return;
+                }
+                let s1 = registry.state(&reflect1);
+                if matches!(s1, MixDepState::Running) {
+                    return;
+                }
+                if let MixDepState::Permanent(err) = &s1 {
+                    tracing::warn!(
+                        "streaming_loop: mix dep reflect1 ({reflect1}) permanent failed: {err}"
+                    );
+                    state.set_error(format!("反思实例1 永久失败（{err}），final 将缺该段继续"));
+                }
+                let r1_for_summary = matches!(s1, MixDepState::Ready).then(|| reflect1.clone());
+                let summary = mix_summary(
+                    pool,
+                    &base,
+                    r1_for_summary.as_deref(),
+                    None,
+                    "insight_complete",
+                )
+                .await;
+                let new_id = spawn_mix_final(mode_manager, state, &summary).await;
+                mix_state.advance_round(new_id);
+                *mix_join = None;
+                *final_wanted = false;
             }
             PendingMix::AwaitFinal {
                 base,
@@ -1925,6 +1903,20 @@ async fn spawn_mix_final(
     }
 }
 
+/// subagent 完成事件摘要：从 AgentPool 中读取 subagent 最新 last_output。
+async fn build_subagent_complete_summary(
+    pool: &std::sync::Arc<crate::agent::agent_pool::AgentPool>,
+    subagent_id: &str,
+) -> Option<String> {
+    let states = pool.subagent_states().await;
+    let state = states.iter().find(|s| s.subagent_id == subagent_id)?;
+    let last_output = state.last_output_truncated.as_deref().unwrap_or("(none)");
+    Some(format!(
+        "既定目标: subagent 已完成\nsubagent_id: {}\nlast_output: {}",
+        subagent_id, last_output
+    ))
+}
+
 async fn spawn_flywheel_echo(
     mode_manager: &mut ModeManager,
     state: &mut TuiState,
@@ -1932,38 +1924,6 @@ async fn spawn_flywheel_echo(
     turn_id: &str,
     reason: &str,
 ) {
-    if state.current_mode == crate::mode_runtime::ModeKind::Keep {
-        let say_consumed = mode_manager.keep_say_quota_consumed();
-        let decision = pool
-            .get_turn_context(turn_id)
-            .await
-            .map(|ctx| ctx.thinking.decision);
-        if should_stop_keep_flywheel(decision, say_consumed) {
-            tracing::info!(
-                "streaming_loop: KEEP period finished (final report), \
-                 flywheel stops for thought_id={turn_id}"
-            );
-            return;
-        }
-    }
-    if state.current_mode == crate::mode_runtime::ModeKind::Unni {
-        let ctx = pool.get_turn_context(turn_id).await;
-        let period_done = ctx
-            .as_ref()
-            .is_some_and(|c| c.input_kind == "echo" && c.say_published);
-        let say_only_user_round = ctx.as_ref().is_some_and(|c| {
-            c.thinking.decision == crate::agent::communication::ThinkDecision::Reply
-                && c.input_kind == "user"
-        });
-        if period_done || say_only_user_round {
-            tracing::info!(
-                "streaming_loop: UNNI period finished (say-only user round or echo reported), \
-                 flywheel stops for thought_id={turn_id}"
-            );
-            return;
-        }
-    }
-
     let echo_ctx = pool.get_turn_context(turn_id).await;
     let summary = match &echo_ctx {
         Some(ctx) => build_echo_summary(ctx, turn_id, reason),
@@ -2082,7 +2042,7 @@ mod prompt_install_tests {
     use super::*;
 
     #[test]
-    fn fresh_install_writes_every_factory_prompt() {
+    fn fresh_install_writes_every_factory_prompt_and_manifest() {
         let temporary = tempfile::tempdir().unwrap();
 
         ensure_default_prompts(temporary.path()).unwrap();
@@ -2093,88 +2053,44 @@ mod prompt_install_tests {
                 expected
             );
         }
+        assert!(temporary.path().join("manifest.json").exists());
     }
 
     #[test]
-    fn matching_legacy_factory_prompt_is_upgraded() {
+    fn matching_manifest_default_is_upgraded() {
         let temporary = tempfile::tempdir().unwrap();
-        let prompts_dir = temporary.path().join("prompts");
-        std::fs::create_dir_all(&prompts_dir).unwrap();
-        let legacy = b"synthetic legacy factory prompt";
-        std::fs::write(prompts_dir.join("system.md"), legacy).unwrap();
-        let legacy_hash = sha256_bytes(legacy);
+        let root = temporary.path();
+        let old_defaults = [("system.md", "old-default")];
+        crate::startup::manifest::ensure_fresh_install(root, &old_defaults).unwrap();
 
-        ensure_default_prompts_with_legacy_hashes(
-            temporary.path(),
-            &[("system.md", legacy_hash.as_str())],
-        )
-        .unwrap();
+        let new_defaults = [("system.md", "new-default")];
+        crate::startup::manifest::upgrade_prompts(root, &new_defaults, |_| UpgradeChoice::Cancel)
+            .unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(prompts_dir.join("system.md")).unwrap(),
-            crate::logic::model::prompts::SYSTEM_DEFAULT
+            std::fs::read_to_string(root.join("prompts/system.md")).unwrap(),
+            "new-default"
         );
     }
 
     #[test]
-    fn customized_and_unrelated_existing_prompts_are_preserved() {
+    fn customized_file_is_preserved_with_cancel() {
         let temporary = tempfile::tempdir().unwrap();
-        let prompts_dir = temporary.path().join("prompts");
-        std::fs::create_dir_all(&prompts_dir).unwrap();
-        std::fs::write(prompts_dir.join("mode_loop.md"), "custom loop contract").unwrap();
-        std::fs::write(prompts_dir.join("local_notes.md"), "keep this too").unwrap();
+        let root = temporary.path();
+        let defaults = crate::logic::model::prompts::DEFAULT_PROMPTS;
+        crate::startup::manifest::ensure_fresh_install(root, &defaults).unwrap();
+        std::fs::write(root.join("prompts/mode_loop.md"), "custom loop contract").unwrap();
+        std::fs::write(root.join("prompts/local_notes.md"), "keep this too").unwrap();
 
-        ensure_default_prompts(temporary.path()).unwrap();
+        ensure_default_prompts(root).unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(prompts_dir.join("mode_loop.md")).unwrap(),
+            std::fs::read_to_string(root.join("prompts/mode_loop.md")).unwrap(),
             "custom loop contract"
         );
         assert_eq!(
-            std::fs::read_to_string(prompts_dir.join("local_notes.md")).unwrap(),
+            std::fs::read_to_string(root.join("prompts/local_notes.md")).unwrap(),
             "keep this too"
-        );
-    }
-
-    use crate::agent::communication::ThinkDecision as D;
-
-    #[test]
-    fn keep_flywheel_failure_decision_does_not_stop() {
-        assert!(
-            !should_stop_keep_flywheel(Some(D::Failure), true),
-            "失败轮(think 解析失败)不应停止 KEEP 飞轮, 应继续修复续跑"
-        );
-        assert!(
-            !should_stop_keep_flywheel(Some(D::Execute), true),
-            "执行轮不应停止"
-        );
-        assert!(
-            !should_stop_keep_flywheel(Some(D::Execute), false),
-            "say 未消耗时不应停止"
-        );
-    }
-
-    #[test]
-    fn keep_flywheel_stops_only_on_non_exec_intent_after_say() {
-        assert!(
-            should_stop_keep_flywheel(Some(D::Reply), true),
-            "say 已用 + 非执行/非失败决策 → 停止"
-        );
-        assert!(
-            should_stop_keep_flywheel(Some(D::Inherit), true),
-            "say 已用 + Inherit → 停止"
-        );
-        assert!(
-            should_stop_keep_flywheel(Some(D::Cancel), true),
-            "say 已用 + Cancel → 停止"
-        );
-        assert!(
-            !should_stop_keep_flywheel(None, true),
-            "上下文缺失(None) → 保守不停止, 避免临时丢失终止循环"
-        );
-        assert!(
-            !should_stop_keep_flywheel(Some(D::Reply), false),
-            "say 未消耗 → 不停止"
         );
     }
 
@@ -2266,7 +2182,6 @@ mod echo_summary_tests {
             status: TurnStatus::Memorizing,
             user_message: String::new(),
             input_kind: "echo".into(),
-            say_published: true,
         }
     }
 
@@ -2396,5 +2311,18 @@ mod echo_summary_tests {
         let s = t.status();
         assert!(s.contains("token 8/100K"), "got: {s}");
         assert!(s.contains("300s"), "time budget visible: {s}");
+    }
+
+    #[test]
+    fn keep_budget_normalizers_zero_means_unlimited() {
+        assert_eq!(normalize_keep_token_budget("0"), 0);
+        assert_eq!(normalize_keep_token_budget("50"), 100_000);
+        assert_eq!(normalize_keep_token_budget("200"), 200_000);
+        assert_eq!(normalize_keep_token_budget("bad"), 100_000);
+
+        assert_eq!(normalize_keep_time_budget_secs("0"), 0);
+        assert_eq!(normalize_keep_time_budget_secs("2"), 300);
+        assert_eq!(normalize_keep_time_budget_secs("10"), 600);
+        assert_eq!(normalize_keep_time_budget_secs("bad"), 300);
     }
 }

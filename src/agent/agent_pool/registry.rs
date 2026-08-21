@@ -124,6 +124,25 @@ impl InstanceRegistry {
         self.entries.remove(id)
     }
 
+    /// 核心 agent 主动心跳：只允许四组核心身份，subagent 心跳走 touch_subagent_heartbeat。
+    pub fn touch_core_heartbeat(&mut self, id: &str, source: &str) -> Option<()> {
+        let entry = self.entries.get_mut(id)?;
+        if entry.identity.is_subagent() {
+            return None;
+        }
+        entry.touch_heartbeat(Some(source));
+        Some(())
+    }
+
+    /// 移除核心 agent（思考引擎实例完成后退池）；拒绝误删 subagent。
+    pub fn remove_core(&mut self, id: &str) -> Option<AgentEntry> {
+        let entry = self.entries.get(id)?;
+        if entry.identity.is_subagent() {
+            return None;
+        }
+        self.entries.remove(id)
+    }
+
     pub fn get(&self, id: &str) -> Option<&AgentEntry> {
         self.entries.get(id)
     }

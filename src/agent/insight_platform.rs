@@ -116,6 +116,8 @@ impl InsightPlatform {
     pub fn spawn(mut self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             tracing::info!("insight_platform: started, polling rx");
+            let heartbeat =
+                AgentPool::spawn_core_heartbeat(&self.pool, "insight-platform", "insight-platform");
 
             while let Some(msg) = self.insight_rx.recv().await {
                 let pending = self.insight_rx.len();
@@ -127,7 +129,13 @@ impl InsightPlatform {
                         self.pool
                             .update_platform_status(|s| s.insight_active = Some(turn_id.clone()))
                             .await;
+                        self.pool
+                            .set_core_agent_status("insight-platform", AgentStatus::Running)
+                            .await;
                         self.handle_insight(&turn_id).await;
+                        self.pool
+                            .set_core_agent_status("insight-platform", AgentStatus::Idle)
+                            .await;
                         self.pool
                             .update_platform_status(|s| s.insight_active = None)
                             .await;
@@ -141,6 +149,7 @@ impl InsightPlatform {
                 self.pool.snapshot_detailed().await;
             }
 
+            heartbeat.abort();
             tracing::info!("insight_platform: rx closed, shutting down");
         })
     }
@@ -162,15 +171,8 @@ impl InsightPlatform {
             self.prompts_dir.as_deref(),
         );
 
-        let messages = vec![
-            ChatMessage::System {
-                text: prompt,
-                kind: SystemKind::Primary,
-            },
-            ChatMessage::User {
-                text: "判断本轮方向是否仍然正确，并输出 JSON。".to_string(),
-            },
-        ];
+        // §8.4.2：洞察中台序列 [System(平台提示词+分析), User(原始用户输入), System(判断指令)]。
+        let messages = build_insight_messages(prompt, &ctx.user_message);
         let req = match LlmRequest::from_model_row(&self.model_row, messages, self.api_key.clone())
         {
             Ok(req) => req,
@@ -359,6 +361,22 @@ async fn publish_insight(pool: &AgentPool, turn_id: &str, insight: InsightResult
         tracing::warn!("insight_platform: send_trigger insight_complete failed: {e}");
     }
     pool.publish_event("insight_complete", turn_id.to_string());
+}
+
+fn build_insight_messages(prompt: String, user_input: &str) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage::System {
+            text: prompt,
+            kind: SystemKind::Primary,
+        },
+        ChatMessage::User {
+            text: user_input.to_string(),
+        },
+        ChatMessage::System {
+            text: "判断本轮方向是否仍然正确，并输出 JSON。".to_string(),
+            kind: SystemKind::Primary,
+        },
+    ]
 }
 
 fn build_insight_prompt(
@@ -782,6 +800,32 @@ mod tests {
         let prompt = build_insight_prompt("turn-1", "用户说你好", &[], None, &[], None);
         assert!(prompt.contains("say-only"));
         assert!(prompt.contains("用户说你好"));
+    }
+
+    #[test]
+    fn insight_messages_include_original_user_input_and_system_instruction() {
+        let messages = build_insight_messages("PLATFORM_PROMPT".to_string(), "用户原始输入");
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(
+            &messages[0],
+            ChatMessage::System {
+                kind: SystemKind::Primary,
+                ..
+            }
+        ));
+        assert_eq!(
+            messages[1],
+            ChatMessage::User {
+                text: "用户原始输入".to_string()
+            }
+        );
+        assert!(matches!(
+            &messages[2],
+            ChatMessage::System {
+                kind: SystemKind::Primary,
+                ..
+            }
+        ));
     }
 
     #[test]

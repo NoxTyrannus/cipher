@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 /// 所有 subagent.* 分子 id 的判定前缀。
 pub const SUBAGENT_MOLECULE_PREFIX: &str = "subagent.";
@@ -88,6 +88,9 @@ pub struct SubagentConfig {
     /// 软删除时间（非 None 表示 tombstoned）。
     #[serde(default)]
     pub tombstoned_at: Option<String>,
+    /// 创建时携带的初始 task_input；subagent.run 未提供时回退使用。
+    #[serde(default)]
+    pub task_input: Option<String>,
 }
 
 /// subagent 模板行的 `config.subagent` 配置（§5.1）。
@@ -269,25 +272,36 @@ struct MoleculeOutcome {
     output: serde_json::Value,
 }
 
+/// 修法 2（任务书 §3.3）：分子内部短锁辅助 —— 分子自行获取 duckdb 锁，
+/// 调用方（CapabilityExecutor）不再持锁作用域内调用分子，避免同锁重入死锁。
+fn lock_molecule_duckdb<'a>(
+    duckdb: &'a Arc<Mutex<duckdb::Connection>>,
+    name: &str,
+) -> std::result::Result<MutexGuard<'a, duckdb::Connection>, SubagentError> {
+    duckdb
+        .lock()
+        .map_err(|e| SubagentError::failed(format!("{name}: duckdb lock poisoned: {e}")))
+}
+
 /// 分发入口：由 CapabilityExecutor::execute_builtin 调用。
 ///
 /// 每个分子在副作用前先 `invocation.prewrite`；预写失败直接报错且不产生副作用。
 /// 执行完成后（成功或失败）都会闭合 invocation 终态（`<id>.result.json`）。
 pub fn execute_subagent_capability(
-    conn: &duckdb::Connection,
+    duckdb: &Arc<std::sync::Mutex<duckdb::Connection>>,
     storage_root: &Path,
     capability_id: &str,
     args: &serde_json::Value,
     spawn_hook: Option<&dyn SubagentSpawnHook>,
 ) -> Result<serde_json::Value> {
     let outcome = match capability_id {
-        "subagent.create" => subagent_create(conn, storage_root, args, spawn_hook),
-        "subagent.update" => subagent_update(conn, storage_root, args),
-        "subagent.run" => subagent_run(conn, storage_root, args, spawn_hook),
-        "subagent.sleep" => subagent_sleep(conn, storage_root, args),
-        "subagent.wake" => subagent_wake(conn, storage_root, args),
-        "subagent.delete" => subagent_delete(conn, storage_root, args),
-        USAGE_METHOD_OBSERVE_ID => usage_observe(conn, storage_root, args),
+        "subagent.create" => subagent_create(duckdb, storage_root, args, spawn_hook),
+        "subagent.update" => subagent_update(duckdb, storage_root, args),
+        "subagent.run" => subagent_run(duckdb, storage_root, args, spawn_hook),
+        "subagent.sleep" => subagent_sleep(duckdb, storage_root, args),
+        "subagent.wake" => subagent_wake(duckdb, storage_root, args),
+        "subagent.delete" => subagent_delete(duckdb, storage_root, args),
+        USAGE_METHOD_OBSERVE_ID => usage_observe(duckdb, storage_root, args),
         other => Err(SubagentError::rejected(format!(
             "unknown subagent molecule: {other}"
         ))),
@@ -323,11 +337,14 @@ pub fn execute_subagent_capability(
 // ---------------------------------------------------------------------------
 
 fn subagent_create(
-    conn: &duckdb::Connection,
+    duckdb: &Arc<std::sync::Mutex<duckdb::Connection>>,
     storage_root: &Path,
     args: &serde_json::Value,
     spawn_hook: Option<&dyn SubagentSpawnHook>,
 ) -> std::result::Result<MoleculeOutcome, SubagentError> {
+    // 修法 2（任务书 §3.3）：分子内部短锁，不在 executor 持锁作用域内调用分子。
+    let guard = lock_molecule_duckdb(duckdb, "subagent.create")?;
+    let conn: &duckdb::Connection = &guard;
     let template_id = required_str(args, "template_id")?;
 
     // 1) resolve 模板：mode='subagent_template'，未启用/tombstoned 拒绝。
@@ -360,6 +377,11 @@ fn subagent_create(
 
     // 4) 生成 sg_<uuid> 实例行（prompt 从模板复制）。
     let subagent_id = format!("sg_{}", uuid_simple());
+    let task_input = args
+        .get("task_input")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
     let instance_config = SubagentConfig {
         template_id: template_id.to_string(),
         lifecycle: LIFECYCLE_IDLE.to_string(),
@@ -371,6 +393,7 @@ fn subagent_create(
         memory_window_pct: template_config.memory_window_pct,
         briefing: template_config.briefing,
         tombstoned_at: None,
+        task_input: task_input.clone(),
     };
     let row = AgentRow {
         id: subagent_id.clone(),
@@ -404,6 +427,7 @@ fn subagent_create(
             "lifecycle": "idle",
             "capability_allowlist": allowlist,
             "model_id": model_id,
+            "task_input": task_input.clone(),
             "memory_ref": format!("subagents/{subagent_id}/memory.json"),
             "last_output_ref": format!("subagents/{subagent_id}/last_output.json"),
         }),
@@ -413,10 +437,12 @@ fn subagent_create(
 }
 
 fn subagent_update(
-    conn: &duckdb::Connection,
+    duckdb: &Arc<std::sync::Mutex<duckdb::Connection>>,
     storage_root: &Path,
     args: &serde_json::Value,
 ) -> std::result::Result<MoleculeOutcome, SubagentError> {
+    let guard = lock_molecule_duckdb(duckdb, "subagent.update")?;
+    let conn: &duckdb::Connection = &guard;
     let subagent_id = required_str(args, "subagent_id")?;
 
     // 1) resolve 实例：mode='subagent' 且未 tombstoned。
@@ -543,11 +569,13 @@ fn subagent_update(
 }
 
 fn subagent_run(
-    conn: &duckdb::Connection,
+    duckdb: &Arc<std::sync::Mutex<duckdb::Connection>>,
     storage_root: &Path,
     args: &serde_json::Value,
     spawn_hook: Option<&dyn SubagentSpawnHook>,
 ) -> std::result::Result<MoleculeOutcome, SubagentError> {
+    let guard = lock_molecule_duckdb(duckdb, "subagent.run")?;
+    let conn: &duckdb::Connection = &guard;
     let subagent_id = required_str(args, "subagent_id")?;
     let instance = resolve_subagent_instance(conn, subagent_id)?;
     let config = instance
@@ -587,8 +615,10 @@ fn subagent_run(
     let task_input = args
         .get("task_input")
         .and_then(|value| value.as_str())
-        .unwrap_or("")
-        .to_string();
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| config.task_input.clone())
+        .unwrap_or_default();
 
     // 冻结本次 run 的定义快照。
     let definition = SubagentDefinition {
@@ -609,6 +639,13 @@ fn subagent_run(
         SubagentError::failed(format!("subagent.run persist running: {error}"))
             .with_invocation(invocation_id.clone())
     })?;
+
+    // 受理后先写 running 占位，便于区分“未启动”和“运行中”。
+    if let Err(e) =
+        crate::agent::subagent_memory::write_last_output(storage_root, subagent_id, "running", "")
+    {
+        tracing::warn!("subagent.run: write running placeholder failed: {e}");
+    }
 
     // 通知 runtime spawn（hook 未安装时分子仍完成持久化并正常返回 accepted）。
     if let Some(hook) = spawn_hook {
@@ -631,10 +668,12 @@ fn subagent_run(
 }
 
 fn subagent_sleep(
-    conn: &duckdb::Connection,
+    duckdb: &Arc<std::sync::Mutex<duckdb::Connection>>,
     storage_root: &Path,
     args: &serde_json::Value,
 ) -> std::result::Result<MoleculeOutcome, SubagentError> {
+    let guard = lock_molecule_duckdb(duckdb, "subagent.sleep")?;
+    let conn: &duckdb::Connection = &guard;
     let subagent_id = required_str(args, "subagent_id")?;
     let instance = resolve_subagent_instance(conn, subagent_id)?;
     let config = instance
@@ -691,10 +730,12 @@ fn subagent_sleep(
 }
 
 fn subagent_wake(
-    conn: &duckdb::Connection,
+    duckdb: &Arc<std::sync::Mutex<duckdb::Connection>>,
     storage_root: &Path,
     args: &serde_json::Value,
 ) -> std::result::Result<MoleculeOutcome, SubagentError> {
+    let guard = lock_molecule_duckdb(duckdb, "subagent.wake")?;
+    let conn: &duckdb::Connection = &guard;
     let subagent_id = required_str(args, "subagent_id")?;
     let instance = resolve_subagent_instance(conn, subagent_id)?;
     let config = instance
@@ -728,10 +769,12 @@ fn subagent_wake(
 }
 
 fn subagent_delete(
-    conn: &duckdb::Connection,
+    duckdb: &Arc<std::sync::Mutex<duckdb::Connection>>,
     storage_root: &Path,
     args: &serde_json::Value,
 ) -> std::result::Result<MoleculeOutcome, SubagentError> {
+    let guard = lock_molecule_duckdb(duckdb, "subagent.delete")?;
+    let conn: &duckdb::Connection = &guard;
     let subagent_id = required_str(args, "subagent_id")?;
     let instance = resolve_subagent_instance(conn, subagent_id)?;
     let config = instance
@@ -807,10 +850,12 @@ fn subagent_delete(
 }
 
 fn usage_observe(
-    conn: &duckdb::Connection,
+    duckdb: &Arc<std::sync::Mutex<duckdb::Connection>>,
     storage_root: &Path,
     args: &serde_json::Value,
 ) -> std::result::Result<MoleculeOutcome, SubagentError> {
+    let guard = lock_molecule_duckdb(duckdb, "usage_method.observe")?;
+    let conn: &duckdb::Connection = &guard;
     let capability_id = required_str(args, "capability_id")?;
     let observation = required_str(args, "observation")?;
     let suggestion = required_str(args, "suggestion")?;
@@ -1724,6 +1769,10 @@ mod tests {
         }
     }
 
+    fn test_conn_arc() -> Arc<Mutex<duckdb::Connection>> {
+        Arc::new(Mutex::new(test_conn()))
+    }
+
     fn test_conn() -> duckdb::Connection {
         let conn = duckdb::Connection::open_in_memory().unwrap();
         create_all_tables(&conn).unwrap();
@@ -1788,17 +1837,20 @@ mod tests {
     }
 
     fn call(
-        conn: &duckdb::Connection,
+        db: &Arc<Mutex<duckdb::Connection>>,
         storage_root: &Path,
         capability_id: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        execute_subagent_capability(conn, storage_root, capability_id, &args, None)
+        execute_subagent_capability(db, storage_root, capability_id, &args, None)
     }
 
-    fn create_default(conn: &duckdb::Connection, storage_root: &Path) -> serde_json::Value {
+    fn create_default(
+        db: &Arc<Mutex<duckdb::Connection>>,
+        storage_root: &Path,
+    ) -> serde_json::Value {
         call(
-            conn,
+            db,
             storage_root,
             "subagent.create",
             serde_json::json!({
@@ -1808,6 +1860,14 @@ mod tests {
             }),
         )
         .expect("create should succeed")
+    }
+
+    fn with_conn<T>(
+        db: &Arc<Mutex<duckdb::Connection>>,
+        f: impl FnOnce(&duckdb::Connection) -> T,
+    ) -> T {
+        let guard = db.lock().unwrap();
+        f(&guard)
     }
 
     fn subagent_id(output: &serde_json::Value) -> String {
@@ -1821,9 +1881,9 @@ mod tests {
 
     #[test]
     fn create_makes_idle_instance_with_memory_files() {
-        let conn = test_conn();
+        let db = test_conn_arc();
         let storage_root = tempfile::tempdir().unwrap();
-        let output = create_default(&conn, storage_root.path());
+        let output = create_default(&db, storage_root.path());
 
         let id = subagent_id(&output);
         assert!(id.starts_with("sg_"), "id should be sg_*: {id}");
@@ -1835,7 +1895,7 @@ mod tests {
             format!("subagents/{id}/last_output.json")
         );
 
-        let row = resolve_agent_row(&conn, &id).unwrap().unwrap();
+        let row = with_conn(&db, |conn| resolve_agent_row(conn, &id).unwrap().unwrap());
         assert_eq!(row.mode, "subagent");
         assert_eq!(
             row.capability_allowlist,
@@ -1880,10 +1940,10 @@ mod tests {
 
     #[test]
     fn create_rejects_unknown_template() {
-        let conn = test_conn();
+        let db = test_conn_arc();
         let storage_root = tempfile::tempdir().unwrap();
         let result = call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.create",
             serde_json::json!({
@@ -1893,16 +1953,16 @@ mod tests {
         );
         assert!(matches!(result, Err(AgentError::Parse(_))));
         // 无副作用：agent 表无新 subagent 行。
-        let agents = resolve_agent_row(&conn, "sg_whatever").unwrap();
+        let agents = with_conn(&db, |conn| resolve_agent_row(conn, "sg_whatever").unwrap());
         assert!(agents.is_none());
     }
 
     #[test]
     fn create_rejects_allowlist_superset() {
-        let conn = test_conn();
+        let db = test_conn_arc();
         let storage_root = tempfile::tempdir().unwrap();
         let result = call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.create",
             serde_json::json!({
@@ -1916,10 +1976,10 @@ mod tests {
 
     #[test]
     fn create_rejects_unknown_model() {
-        let conn = test_conn();
+        let db = test_conn_arc();
         let storage_root = tempfile::tempdir().unwrap();
         let result = call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.create",
             serde_json::json!({
@@ -1932,10 +1992,10 @@ mod tests {
 
     #[test]
     fn create_uses_shrunk_allowlist_and_overrides() {
-        let conn = test_conn();
+        let db = test_conn_arc();
         let storage_root = tempfile::tempdir().unwrap();
         let output = call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.create",
             serde_json::json!({
@@ -1953,7 +2013,7 @@ mod tests {
             output["capability_allowlist"],
             serde_json::json!(["file.read"])
         );
-        let row = resolve_agent_row(&conn, &id).unwrap().unwrap();
+        let row = with_conn(&db, |conn| resolve_agent_row(conn, &id).unwrap().unwrap());
         let config = row.subagent_config().unwrap();
         assert_eq!(config.lifecycle_kind, SubagentLifecycleKind::Resident);
         assert_eq!(config.startup, SubagentStartup::Scheduled);
@@ -1965,14 +2025,14 @@ mod tests {
 
     #[test]
     fn run_from_idle_accepts_and_persists_running_and_fires_hook() {
-        let conn = test_conn();
+        let db = test_conn_arc();
         let storage_root = tempfile::tempdir().unwrap();
-        let output = create_default(&conn, storage_root.path());
+        let output = create_default(&db, storage_root.path());
         let id = subagent_id(&output);
 
         let (hook, events) = RecordingHook::new();
         let run_output = execute_subagent_capability(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.run",
             &serde_json::json!({"subagent_id": id, "task_input": "do the thing"}),
@@ -1981,7 +2041,11 @@ mod tests {
         .unwrap();
         assert_eq!(run_output["accepted"], true);
         assert_eq!(run_output["lifecycle"], "running");
-        assert_eq!(lifecycle_of(&conn, &id), "running");
+        assert_eq!(with_conn(&db, |conn| lifecycle_of(conn, &id)), "running");
+        let last = crate::agent::subagent_memory::read_last_output(storage_root.path(), &id)
+            .unwrap()
+            .expect("last_output should exist after run accepted");
+        assert_eq!(last.status, "running");
 
         let events = events.lock().unwrap();
         assert_eq!(events.len(), 1);
@@ -1990,14 +2054,50 @@ mod tests {
     }
 
     #[test]
-    fn run_rejects_duplicate_and_sleeping_and_tombstoned() {
-        let conn = test_conn();
+    fn run_without_task_input_falls_back_to_create_task_input() {
+        let db = test_conn_arc();
         let storage_root = tempfile::tempdir().unwrap();
-        let output = create_default(&conn, storage_root.path());
+        let output = call(
+            &db,
+            storage_root.path(),
+            "subagent.create",
+            serde_json::json!({
+                "template_id": TEMPLATE_NORMAL,
+                "model_id": MODEL_MINI,
+                "task_input": "initial task",
+            }),
+        )
+        .expect("create should succeed");
+        let id = subagent_id(&output);
+
+        let (hook, events) = RecordingHook::new();
+        let run_output = execute_subagent_capability(
+            &db,
+            storage_root.path(),
+            "subagent.run",
+            &serde_json::json!({"subagent_id": id}),
+            Some(&hook),
+        )
+        .unwrap();
+        assert_eq!(run_output["accepted"], true);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].contains("initial task"),
+            "run should fallback to create task_input, got: {}",
+            events[0]
+        );
+    }
+
+    #[test]
+    fn run_rejects_duplicate_and_sleeping_and_tombstoned() {
+        let db = test_conn_arc();
+        let storage_root = tempfile::tempdir().unwrap();
+        let output = create_default(&db, storage_root.path());
         let id = subagent_id(&output);
 
         call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.run",
             serde_json::json!({"subagent_id": id}),
@@ -2005,7 +2105,7 @@ mod tests {
         .unwrap();
         // running -> run rejected
         let result = call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.run",
             serde_json::json!({"subagent_id": id}),
@@ -2013,9 +2113,11 @@ mod tests {
         assert!(matches!(result, Err(AgentError::Parse(_))));
 
         // 回到 idle（runtime 收口语义用 set_subagent_lifecycle）
-        set_subagent_lifecycle(&conn, &id, SubagentLifecycle::Idle).unwrap();
+        with_conn(&db, |conn| {
+            set_subagent_lifecycle(conn, &id, SubagentLifecycle::Idle).unwrap()
+        });
         call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.sleep",
             serde_json::json!({"subagent_id": id}),
@@ -2023,7 +2125,7 @@ mod tests {
         .unwrap();
         // sleeping -> run rejected
         let result = call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.run",
             serde_json::json!({"subagent_id": id}),
@@ -2033,13 +2135,13 @@ mod tests {
 
     #[test]
     fn sleep_requires_idle_or_failed() {
-        let conn = test_conn();
+        let db = test_conn_arc();
         let storage_root = tempfile::tempdir().unwrap();
-        let output = create_default(&conn, storage_root.path());
+        let output = create_default(&db, storage_root.path());
         let id = subagent_id(&output);
 
         call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.run",
             serde_json::json!({"subagent_id": id}),
@@ -2047,35 +2149,37 @@ mod tests {
         .unwrap();
         // running -> sleep rejected
         let result = call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.sleep",
             serde_json::json!({"subagent_id": id}),
         );
         assert!(result.is_err());
 
-        set_subagent_lifecycle(&conn, &id, SubagentLifecycle::Idle).unwrap();
+        with_conn(&db, |conn| {
+            set_subagent_lifecycle(conn, &id, SubagentLifecycle::Idle).unwrap()
+        });
         let output = call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.sleep",
             serde_json::json!({"subagent_id": id}),
         )
         .unwrap();
         assert_eq!(output["lifecycle"], "sleeping");
-        assert_eq!(lifecycle_of(&conn, &id), "sleeping");
+        assert_eq!(with_conn(&db, |conn| lifecycle_of(conn, &id)), "sleeping");
     }
 
     #[test]
     fn wake_requires_sleeping() {
-        let conn = test_conn();
+        let db = test_conn_arc();
         let storage_root = tempfile::tempdir().unwrap();
-        let output = create_default(&conn, storage_root.path());
+        let output = create_default(&db, storage_root.path());
         let id = subagent_id(&output);
 
         // idle -> wake rejected
         let result = call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.wake",
             serde_json::json!({"subagent_id": id}),
@@ -2083,28 +2187,28 @@ mod tests {
         assert!(result.is_err());
 
         call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.sleep",
             serde_json::json!({"subagent_id": id}),
         )
         .unwrap();
         let output = call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.wake",
             serde_json::json!({"subagent_id": id}),
         )
         .unwrap();
         assert_eq!(output["lifecycle"], "idle");
-        assert_eq!(lifecycle_of(&conn, &id), "idle");
+        assert_eq!(with_conn(&db, |conn| lifecycle_of(conn, &id)), "idle");
     }
 
     #[test]
     fn delete_soft_archives_idempotent_and_rejects_running() {
-        let conn = test_conn();
+        let db = test_conn_arc();
         let storage_root = tempfile::tempdir().unwrap();
-        let output = create_default(&conn, storage_root.path());
+        let output = create_default(&db, storage_root.path());
         let id = subagent_id(&output);
         let memory_path = storage_root
             .path()
@@ -2114,7 +2218,7 @@ mod tests {
         assert!(memory_path.exists());
 
         call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.run",
             serde_json::json!({"subagent_id": id}),
@@ -2122,16 +2226,18 @@ mod tests {
         .unwrap();
         // running -> delete rejected
         let result = call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.delete",
             serde_json::json!({"subagent_id": id}),
         );
         assert!(result.is_err());
 
-        set_subagent_lifecycle(&conn, &id, SubagentLifecycle::Failed).unwrap();
+        with_conn(&db, |conn| {
+            set_subagent_lifecycle(conn, &id, SubagentLifecycle::Failed).unwrap()
+        });
         let output = call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.delete",
             serde_json::json!({"subagent_id": id}),
@@ -2140,12 +2246,12 @@ mod tests {
         assert_eq!(output["lifecycle"], "tombstoned");
         assert_eq!(output["archived"], true);
         assert!(memory_path.exists(), "memory files must be retained");
-        let row = resolve_agent_row(&conn, &id).unwrap().unwrap();
+        let row = with_conn(&db, |conn| resolve_agent_row(conn, &id).unwrap().unwrap());
         assert!(row.subagent_config().unwrap().tombstoned_at.is_some());
 
         // tombstoned -> delete idempotent
         let output = call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.delete",
             serde_json::json!({"subagent_id": id}),
@@ -2156,7 +2262,7 @@ mod tests {
 
         // tombstoned -> run rejected
         let result = call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.run",
             serde_json::json!({"subagent_id": id}),
@@ -2166,13 +2272,13 @@ mod tests {
 
     #[test]
     fn update_shrinks_allowlist_and_persists() {
-        let conn = test_conn();
+        let db = test_conn_arc();
         let storage_root = tempfile::tempdir().unwrap();
-        let output = create_default(&conn, storage_root.path());
+        let output = create_default(&db, storage_root.path());
         let id = subagent_id(&output);
 
         let updated = call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.update",
             serde_json::json!({
@@ -2189,7 +2295,7 @@ mod tests {
             serde_json::json!(["prompt", "capability_allowlist", "budget"])
         );
 
-        let row = resolve_agent_row(&conn, &id).unwrap().unwrap();
+        let row = with_conn(&db, |conn| resolve_agent_row(conn, &id).unwrap().unwrap());
         assert_eq!(row.prompt, "new role");
         assert_eq!(row.capability_allowlist, vec!["file.read".to_string()]);
         let config = row.subagent_config().unwrap();
@@ -2200,13 +2306,13 @@ mod tests {
 
     #[test]
     fn update_rejects_superset_and_unknown_model() {
-        let conn = test_conn();
+        let db = test_conn_arc();
         let storage_root = tempfile::tempdir().unwrap();
-        let output = create_default(&conn, storage_root.path());
+        let output = create_default(&db, storage_root.path());
         let id = subagent_id(&output);
 
         let result = call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.update",
             serde_json::json!({
@@ -2217,7 +2323,7 @@ mod tests {
         assert!(result.is_err());
 
         let result = call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.update",
             serde_json::json!({
@@ -2230,12 +2336,12 @@ mod tests {
 
     #[test]
     fn update_while_running_only_writes_persistent_row() {
-        let conn = test_conn();
+        let db = test_conn_arc();
         let storage_root = tempfile::tempdir().unwrap();
-        let output = create_default(&conn, storage_root.path());
+        let output = create_default(&db, storage_root.path());
         let id = subagent_id(&output);
         call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.run",
             serde_json::json!({"subagent_id": id}),
@@ -2243,29 +2349,30 @@ mod tests {
         .unwrap();
 
         let updated = call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.update",
             serde_json::json!({"subagent_id": id, "prompt": "persisted while running"}),
         )
         .unwrap();
         assert_eq!(updated["lifecycle"], "running");
-        let row = resolve_agent_row(&conn, &id).unwrap().unwrap();
+        let row = with_conn(&db, |conn| resolve_agent_row(conn, &id).unwrap().unwrap());
         assert_eq!(row.prompt, "persisted while running");
-        assert_eq!(lifecycle_of(&conn, &id), "running");
+        assert_eq!(with_conn(&db, |conn| lifecycle_of(conn, &id)), "running");
     }
 
     #[test]
     fn invocation_prewrite_failure_has_no_side_effects() {
-        let conn = test_conn();
+        let db = test_conn_arc();
         let storage_root = tempfile::tempdir().unwrap();
         // 让 invocations 路径成为文件，prewrite 必然失败。
         std::fs::write(storage_root.path().join("invocations"), b"not a dir").unwrap();
-        let agent_count_before: i64 = conn
-            .query_row("SELECT COUNT(*) FROM agent", [], |row| row.get(0))
-            .unwrap();
+        let agent_count_before: i64 = with_conn(&db, |conn| {
+            conn.query_row("SELECT COUNT(*) FROM agent", [], |row| row.get(0))
+                .unwrap()
+        });
         let result = call(
-            &conn,
+            &db,
             storage_root.path(),
             "subagent.create",
             serde_json::json!({
@@ -2274,9 +2381,10 @@ mod tests {
             }),
         );
         assert!(result.is_err(), "prewrite failure must propagate as error");
-        let agent_count_after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM agent", [], |row| row.get(0))
-            .unwrap();
+        let agent_count_after: i64 = with_conn(&db, |conn| {
+            conn.query_row("SELECT COUNT(*) FROM agent", [], |row| row.get(0))
+                .unwrap()
+        });
         assert_eq!(
             agent_count_before, agent_count_after,
             "no side effects expected"
@@ -2285,10 +2393,10 @@ mod tests {
 
     #[test]
     fn usage_observe_rejects_when_capability_not_in_latest_log() {
-        let conn = test_conn();
+        let db = test_conn_arc();
         let storage_root = tempfile::tempdir().unwrap();
         let result = call(
-            &conn,
+            &db,
             storage_root.path(),
             "usage_method.observe",
             serde_json::json!({
@@ -2302,7 +2410,7 @@ mod tests {
 
     #[test]
     fn usage_observe_writes_only_usage_method_row() {
-        let conn = test_conn();
+        let db = test_conn_arc();
         let storage_root = tempfile::tempdir().unwrap();
         // 手动写入最新能力调用事实（file.read）。
         let invocations = storage_root.path().join("invocations");
@@ -2322,8 +2430,8 @@ mod tests {
         )
         .unwrap();
 
-        let base_before = conn
-            .query_row(
+        let base_before = with_conn(&db, |conn| {
+            conn.query_row(
                 "SELECT name, description, executor FROM base_capability WHERE id = 'file.read'",
                 [],
                 |row| {
@@ -2334,13 +2442,15 @@ mod tests {
                     ))
                 },
             )
-            .unwrap();
-        let agent_count_before: i64 = conn
-            .query_row("SELECT COUNT(*) FROM agent", [], |row| row.get(0))
-            .unwrap();
+            .unwrap()
+        });
+        let agent_count_before: i64 = with_conn(&db, |conn| {
+            conn.query_row("SELECT COUNT(*) FROM agent", [], |row| row.get(0))
+                .unwrap()
+        });
 
         let output = call(
-            &conn,
+            &db,
             storage_root.path(),
             "usage_method.observe",
             serde_json::json!({
@@ -2353,8 +2463,8 @@ mod tests {
         assert_eq!(output["success"], true);
         assert_eq!(output["created"], true);
 
-        let base_after = conn
-            .query_row(
+        let base_after = with_conn(&db, |conn| {
+            conn.query_row(
                 "SELECT name, description, executor FROM base_capability WHERE id = 'file.read'",
                 [],
                 |row| {
@@ -2365,20 +2475,23 @@ mod tests {
                     ))
                 },
             )
-            .unwrap();
+            .unwrap()
+        });
         assert_eq!(base_before, base_after, "stable contract must not change");
-        let agent_count_after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM agent", [], |row| row.get(0))
-            .unwrap();
+        let agent_count_after: i64 = with_conn(&db, |conn| {
+            conn.query_row("SELECT COUNT(*) FROM agent", [], |row| row.get(0))
+                .unwrap()
+        });
         assert_eq!(agent_count_before, agent_count_after);
 
-        let (prompt, metadata): (String, Option<String>) = conn
-            .query_row(
+        let (prompt, metadata): (String, Option<String>) = with_conn(&db, |conn| {
+            conn.query_row(
                 "SELECT prompt, CAST(metadata AS VARCHAR) FROM usage_method WHERE capability_id = 'file.read'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .unwrap();
+            .unwrap()
+        });
         assert!(prompt.contains("chunk read for large files"));
         let metadata: serde_json::Value = serde_json::from_str(&metadata.unwrap()).unwrap();
         assert_eq!(
@@ -2389,12 +2502,14 @@ mod tests {
 
     #[test]
     fn usage_observe_updates_existing_usage_method() {
-        let conn = test_conn();
+        let db = test_conn_arc();
         let storage_root = tempfile::tempdir().unwrap();
-        conn.execute_batch(
-            "INSERT INTO usage_method (id, capability_id, name, prompt)              VALUES ('um_existing', 'file.read', 'read_lessons', 'original prompt');",
-        )
-        .unwrap();
+        with_conn(&db, |conn| {
+            conn.execute_batch(
+                "INSERT INTO usage_method (id, capability_id, name, prompt)                  VALUES ('um_existing', 'file.read', 'read_lessons', 'original prompt');",
+            )
+            .unwrap();
+        });
         let invocations = storage_root.path().join("invocations");
         std::fs::create_dir_all(&invocations).unwrap();
         std::fs::write(
@@ -2413,7 +2528,7 @@ mod tests {
         .unwrap();
 
         let output = call(
-            &conn,
+            &db,
             storage_root.path(),
             "usage_method.observe",
             serde_json::json!({
@@ -2426,13 +2541,14 @@ mod tests {
         assert_eq!(output["usage_method_id"], "um_existing");
         assert_eq!(output["updated"], true);
         assert_eq!(output["created"], false);
-        let (prompt, metadata): (String, Option<String>) = conn
-            .query_row(
+        let (prompt, metadata): (String, Option<String>) = with_conn(&db, |conn| {
+            conn.query_row(
                 "SELECT prompt, CAST(metadata AS VARCHAR) FROM usage_method WHERE id = 'um_existing'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .unwrap();
+            .unwrap()
+        });
         assert!(
             prompt.starts_with("original prompt"),
             "existing prompt preserved: {prompt}"
@@ -2496,9 +2612,9 @@ mod tests {
     #[test]
     fn memory_files_have_0600_permissions() {
         use std::os::unix::fs::PermissionsExt;
-        let conn = test_conn();
+        let db = test_conn_arc();
         let storage_root = tempfile::tempdir().unwrap();
-        let output = create_default(&conn, storage_root.path());
+        let output = create_default(&db, storage_root.path());
         let id = subagent_id(&output);
         let dir = storage_root.path().join("subagents").join(&id);
         assert_eq!(

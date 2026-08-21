@@ -48,7 +48,11 @@ fn payload_text(payload: &Value) -> String {
 }
 
 pub fn memory_list(db: &TriviumDb, args: &Value) -> Result<Value, String> {
-    let memory_type = arg_str(args, "memory_type", "memory.list")?;
+    let memory_type = args
+        .get("memory_type")
+        .and_then(Value::as_str)
+        .unwrap_or("attention")
+        .to_string();
     let limit = arg_limit(args);
     let ids = db.db().get_all_ids();
     let mut items = Vec::new();
@@ -60,7 +64,7 @@ pub fn memory_list(db: &TriviumDb, args: &Value) -> Result<Value, String> {
             Some(p) => p,
             None => continue,
         };
-        if !memory_type_match(&payload, memory_type) {
+        if !memory_type_match(&payload, &memory_type) {
             continue;
         }
         items.push(serde_json::json!({"id": id, "payload": payload}));
@@ -138,7 +142,20 @@ pub fn memory_delete(db: &mut TriviumDb, args: &Value) -> Result<Value, String> 
 }
 
 pub fn memory_attention_write(db: &mut TriviumDb, args: &Value) -> Result<Value, String> {
-    let entries = arg_array(args, "entries", "memory.attention.write")?;
+    let entries = match args.get("entries") {
+        Some(Value::Array(items)) => items.clone(),
+        Some(single @ Value::Object(_)) => vec![single.clone()],
+        // 兼容调用方直接传顶层 focus/content 的单条写法
+        None if args.get("focus").is_some() || args.get("content").is_some() => {
+            vec![args.clone()]
+        }
+        _ => {
+            return err(
+                "memory.attention.write: 'entries' is required and must be an array or object"
+                    .to_string(),
+            )
+        }
+    };
     if entries.is_empty() || entries.len() > MAX_WRITE_ENTRIES {
         return err(format!(
             "memory.attention.write: entries must contain 1..={MAX_WRITE_ENTRIES} items"
@@ -200,7 +217,14 @@ pub fn memory_attention_write(db: &mut TriviumDb, args: &Value) -> Result<Value,
 }
 
 pub fn memory_attention_retire(db: &mut TriviumDb, args: &Value) -> Result<Value, String> {
-    let focus = arg_array(args, "focus", "memory.attention.retire")?;
+    let focus = match args.get("focus") {
+        Some(Value::Array(items)) => items.clone(),
+        Some(single @ Value::String(_)) => vec![single.clone()],
+        _ => return err(
+            "memory.attention.retire: 'focus' is required and must be a string or array of strings"
+                .to_string(),
+        ),
+    };
     let focus: Vec<String> = focus
         .iter()
         .filter_map(|v| v.as_str().map(|s| s.to_string()))
