@@ -40,7 +40,9 @@
 }
 ```
 
-本轮能力调用的执行结果不会回到本轮 LLM。全部处理完成时输出结束：
+The execution result of each capability call will be fed back to you in the next turn.
+If a call fails, analyze the error, adjust the arguments and retry. Only output `done`
+when the task is truly complete:
 
 ```json
 { "done": true, "summary": "本轮处理摘要" }
