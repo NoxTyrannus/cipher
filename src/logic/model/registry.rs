@@ -2,7 +2,7 @@ use super::provider::LlmProvider;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ProviderRegistry {
     providers: HashMap<String, Arc<dyn LlmProvider>>,
 }

@@ -237,6 +237,36 @@ impl AgentPool {
         self.registry.write().await.register_subagent(state, status);
     }
 
+    /// 注册一个思考引擎实例（新实例触发时调用，状态 running）。
+    pub async fn register_thinking_instance(&self, instance_id: &str) {
+        let entry = AgentEntry {
+            id: instance_id.to_string(),
+            identity: AgentIdentity::ThinkingEngine {
+                instance_id: instance_id.to_string(),
+            },
+            status: AgentStatus::Running,
+            created_at: std::time::Instant::now(),
+            last_heartbeat: std::time::Instant::now(),
+            heartbeat_source: None,
+        };
+        self.registry.write().await.register(entry);
+    }
+
+    /// 更新核心 agent（四组核心身份）运行状态；subagent 身份会被拒绝。
+    pub async fn set_core_agent_status(&self, id: &str, status: AgentStatus) {
+        self.registry.write().await.update_status(id, status);
+    }
+
+    /// 核心 agent 主动心跳（1 秒频率由各 agent 侧保证；AgentPool 不轮询业务文件）。
+    pub async fn touch_core_agent_heartbeat(&self, id: &str, source: &str) {
+        self.registry.write().await.touch_core_heartbeat(id, source);
+    }
+
+    /// 思考引擎实例完成后退池。
+    pub async fn remove_core_agent(&self, id: &str) {
+        self.registry.write().await.remove_core(id);
+    }
+
     /// 更新 subagent 运行身份状态（idle/running/pending）。
     pub async fn update_subagent_status(&self, id: &str, status: AgentStatus) {
         self.registry
@@ -272,6 +302,24 @@ impl AgentPool {
     /// 移除 subagent（tombstoned 移出池）。
     pub async fn remove_subagent(&self, id: &str) {
         self.registry.write().await.remove_subagent(id);
+    }
+
+    /// 启动核心 agent 心跳任务：每秒主动上报一次；心跳结束后需调用方 abort。
+    pub fn spawn_core_heartbeat(
+        pool: &Arc<AgentPool>,
+        id: &str,
+        source: &str,
+    ) -> tokio::task::JoinHandle<()> {
+        let pool = Arc::clone(pool);
+        let id = id.to_string();
+        let source = source.to_string();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                pool.touch_core_agent_heartbeat(&id, &source).await;
+            }
+        })
     }
 
     /// subagent 展示状态快照（思考引擎自感知来源）。
@@ -349,7 +397,6 @@ mod tests {
             status: TurnStatus::Executing,
             user_message: String::new(),
             input_kind: "user".into(),
-            say_published: false,
         };
         pool.create_turn_context(ctx).await;
 
@@ -506,6 +553,62 @@ mod tests {
                 .status,
             AgentStatus::Idle,
             "核心身份状态不应被业务路径改动"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_core_agents_heartbeat_and_thinking_instance_lifecycle() {
+        let (pool, _receivers) = AgentPool::new();
+        let pool = Arc::new(pool);
+        pool.register_platform("execution-platform", AgentIdentity::ExecutionPlatform)
+            .await;
+        pool.register_platform("insight-platform", AgentIdentity::InsightPlatform)
+            .await;
+        pool.register_platform("memory-platform", AgentIdentity::MemoryPlatform)
+            .await;
+
+        pool.register_thinking_instance("think-1").await;
+        let entries = pool.snapshot().await;
+        let think = entries
+            .iter()
+            .find(|e| e.id == "think-1")
+            .expect("thinking instance registered");
+        assert_eq!(think.status, AgentStatus::Running);
+
+        pool.set_core_agent_status("execution-platform", AgentStatus::Running)
+            .await;
+        pool.touch_core_agent_heartbeat("execution-platform", "execution-heartbeat")
+            .await;
+        let exec = pool
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|e| e.id == "execution-platform")
+            .expect("execution platform present");
+        assert_eq!(exec.status, AgentStatus::Running);
+        assert_eq!(
+            exec.heartbeat_source.as_deref(),
+            Some("execution-heartbeat")
+        );
+
+        pool.remove_core_agent("think-1").await;
+        assert!(pool.snapshot().await.iter().all(|e| e.id != "think-1"));
+
+        // 思考引擎实例心跳任务可运行并被 abort。
+        let heartbeat =
+            AgentPool::spawn_core_heartbeat(&pool, "insight-platform", "insight-heartbeat");
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        heartbeat.abort();
+        let insight = pool
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|e| e.id == "insight-platform")
+            .expect("insight platform present");
+        assert_eq!(
+            insight.heartbeat_source.as_deref(),
+            Some("insight-heartbeat"),
+            "1s heartbeat should touch core agent"
         );
     }
 

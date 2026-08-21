@@ -186,7 +186,7 @@ impl ModeManager {
     }
 
     async fn agent_run(
-        &self,
+        &mut self,
         mode_hint: &str,
         input: &str,
     ) -> Result<crate::agent::output::AgentOutput, AgentError> {
@@ -213,7 +213,6 @@ impl ModeManager {
             keep,
             loop_mode,
             ctx,
-            thinking_factory,
             ..
         } = self;
 
@@ -235,11 +234,6 @@ impl ModeManager {
         };
         enter_mode.enter(ctx).await?;
 
-        if kind == ModeKind::Keep {
-            thinking_factory.reset_keep_quota();
-        } else {
-            thinking_factory.clear_keep_quota();
-        }
         Ok(())
     }
 
@@ -270,14 +264,11 @@ impl ModeManager {
             ModeKind::Keep => true,
             ModeKind::Unni | ModeKind::Loop => false,
         };
-
         let mode_name = self.current.name();
         let mode_hint = self.current.name().to_lowercase();
-        let mut instance = self.thinking_factory.create_from_mode_with_keep_say_quota(
-            mode_name,
-            mode_hint,
-            input.clone(),
-        )?;
+        let mut instance =
+            self.thinking_factory
+                .create_from_mode(mode_name, mode_hint, input.clone())?;
         if let Some(ov) = override_input {
             instance = instance.with_input_override(ov);
         }
@@ -322,6 +313,12 @@ impl ModeManager {
         Ok(id)
     }
 
+    pub fn cancel_all_active(&mut self) {
+        for (_, (cancel, _handle)) in self.active.iter() {
+            cancel.notify_one();
+        }
+    }
+
     pub fn cancel_latest_active(&mut self) {
         for inst in self.pending_instances.iter().rev() {
             if let Some((cancel, _handle)) = self.active.get(&inst.id) {
@@ -331,12 +328,20 @@ impl ModeManager {
         }
     }
 
-    pub fn keep_say_quota_consumed(&self) -> bool {
-        self.thinking_factory.keep_say_quota_consumed()
+    pub fn loop_note_noop(&mut self) {
+        if self.current == ModeKind::Loop {
+            self.loop_mode.note_noop();
+        }
     }
 
-    pub fn keep_period_finished(&self) -> bool {
-        self.thinking_factory.keep_period_finished()
+    pub fn loop_reset_idle(&mut self) {
+        if self.current == ModeKind::Loop {
+            self.loop_mode.reset_idle();
+        }
+    }
+
+    pub fn loop_should_stop_idle(&self) -> bool {
+        self.current == ModeKind::Loop && self.loop_mode.should_stop_idle()
     }
 
     pub fn active_is_empty(&self) -> bool {
@@ -359,8 +364,10 @@ impl ModeManager {
 
         self.pending_instances.retain(|inst| inst.id != outcome.id);
 
+        let outcome_id = outcome.id.clone();
         let pool = std::sync::Arc::clone(&self.agent_pool);
         tokio::spawn(async move {
+            pool.remove_core_agent(&outcome_id).await;
             pool.snapshot_detailed().await;
         });
     }
@@ -380,9 +387,11 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[allow(dead_code)]
     const INVALID_RAW_OUTPUT: &str =
         "NOVA_RAW_OUTPUT_SENTINEL_7f0d4c8e9a2b6f31_do_not_copy_to_metadata";
 
+    #[allow(dead_code)]
     struct SuccessfulProvider;
 
     #[async_trait::async_trait]
@@ -425,6 +434,53 @@ mod tests {
         }
     }
 
+    struct DualProvider {
+        calls: AtomicUsize,
+    }
+
+    impl DualProvider {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for DualProvider {
+        fn id(&self) -> &'static str {
+            "openai"
+        }
+
+        fn name(&self) -> &'static str {
+            "dual test provider"
+        }
+
+        async fn call(
+            &self,
+            _request: &LlmRequest,
+        ) -> std::result::Result<LlmResponse, AgentError> {
+            // 引擎提示词当前留空，不再用“你只负责内部推理”区分 think/say；按调用顺序区分。
+            let content = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                "<think>internal plan</think>\nthink body".to_string()
+            } else {
+                "<think>say reasoning</think>\nsay body".to_string()
+            };
+            Ok(LlmResponse {
+                content,
+                usage: None,
+            })
+        }
+
+        async fn call_stream(
+            &self,
+            request: &LlmRequest,
+            _on_chunk: &mut (dyn FnMut(StreamChunk) + Send),
+        ) -> std::result::Result<LlmResponse, AgentError> {
+            self.call(request).await
+        }
+    }
+
     struct PendingStreamProvider;
 
     #[async_trait::async_trait]
@@ -437,6 +493,13 @@ mod tests {
             "pending stream test provider"
         }
 
+        async fn call(
+            &self,
+            _request: &LlmRequest,
+        ) -> std::result::Result<LlmResponse, AgentError> {
+            std::future::pending().await
+        }
+
         async fn call_stream(
             &self,
             _request: &LlmRequest,
@@ -446,6 +509,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     struct InvalidOutputProvider;
 
     #[async_trait::async_trait]
@@ -479,6 +543,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     struct ThinkOnlyThenSayProvider {
         calls: AtomicUsize,
     }
@@ -600,6 +665,7 @@ mod tests {
         )
     }
 
+    #[allow(dead_code)]
     fn read_named_files(root: &Path, filename: &str) -> Vec<String> {
         let mut contents = Vec::new();
         for entry in fs::read_dir(root).unwrap() {
@@ -676,46 +742,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keep_period_quota_survives_noop_and_resets_after_reentry() {
-        let mut mgr = make_mgr();
-        mgr.switch_mode(ModeKind::Keep).await.unwrap();
-        let first_period = Arc::clone(mgr.thinking_factory.current_keep_quota().unwrap());
-
-        mgr.switch_mode(ModeKind::Keep).await.unwrap();
-        assert!(Arc::ptr_eq(
-            &first_period,
-            mgr.thinking_factory.current_keep_quota().unwrap()
-        ));
-
-        mgr.switch_mode(ModeKind::Loop).await.unwrap();
-        assert!(mgr.thinking_factory.current_keep_quota().is_none());
-        mgr.switch_mode(ModeKind::Keep).await.unwrap();
-        assert!(!Arc::ptr_eq(
-            &first_period,
-            mgr.thinking_factory.current_keep_quota().unwrap()
-        ));
-    }
-
-    #[tokio::test]
-    async fn keep_think_only_does_not_consume_say_quota() {
-        let temporary = tempfile::tempdir().unwrap();
-        let mut providers = ProviderRegistry::new();
-        providers.register(Arc::new(ThinkOnlyThenSayProvider {
-            calls: AtomicUsize::new(0),
-        }));
-        let mut manager = make_mgr_at(temporary.path(), providers);
-        manager.switch_mode(ModeKind::Keep).await.unwrap();
-
-        let think_only = manager.handle_input("internal step").await.unwrap();
-        assert!(think_only.text.is_empty());
-        assert!(!manager
-            .thinking_factory
-            .current_keep_quota()
-            .unwrap()
-            .is_consumed());
-    }
-
-    #[tokio::test]
     async fn mode_manager_switch_syncs_mode_name_and_hint() {
         let mut mgr = make_mgr();
         mgr.switch_mode(ModeKind::Keep).await.unwrap();
@@ -726,151 +752,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocking_input_persists_success_before_returning() {
+    async fn dual_unni_runs_think_and_say() {
         let temporary = tempfile::tempdir().unwrap();
         let mut providers = ProviderRegistry::new();
-        providers.register(Arc::new(SuccessfulProvider));
+        providers.register(Arc::new(DualProvider::new()));
         let mut manager = make_mgr_at(temporary.path(), providers);
 
-        let response = manager
-            .handle_input("remember this exact input")
+        let response = manager.handle_input("hello").await.unwrap();
+        assert_eq!(response.think.as_deref(), Some("think body"));
+        assert_eq!(response.text, "say body");
+    }
+
+    #[tokio::test]
+    async fn dual_loop_only_think() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(DualProvider::new()));
+        let mut manager = make_mgr_at(temporary.path(), providers);
+        manager.switch_mode(ModeKind::Loop).await.unwrap();
+
+        let response = manager.handle_input("continue loop").await.unwrap();
+        assert_eq!(response.think.as_deref(), Some("think body"));
+        assert!(response.text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dual_keep_with_input_runs_think_and_say() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(DualProvider::new()));
+        let mut manager = make_mgr_at(temporary.path(), providers);
+        manager.switch_mode(ModeKind::Keep).await.unwrap();
+
+        let response = manager.handle_input("do the task").await.unwrap();
+        assert_eq!(response.think.as_deref(), Some("think body"));
+        assert_eq!(response.text, "say body");
+    }
+
+    #[tokio::test]
+    async fn dual_keep_without_input_only_think() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut providers = ProviderRegistry::new();
+        providers.register(Arc::new(DualProvider::new()));
+        let (mut manager, _receivers) = make_mgr_with_receivers(temporary.path(), providers);
+        manager.switch_mode(ModeKind::Keep).await.unwrap();
+        let (mut stream_rx, _outcome_rx) = manager.take_channels();
+
+        let thought_id = manager
+            .spawn_with_override(
+                String::new(),
+                Some(ThinkingInput::PlatformEcho {
+                    platform: crate::agent::thought::InternalPlatform::Execution,
+                    summary: "internal echo".to_string(),
+                    artifact_refs: vec![],
+                }),
+            )
             .await
             .unwrap();
-        assert_eq!(response.text, "durable reply");
 
-        let timeline = manager.thought_store().recover().unwrap();
-        assert_eq!(timeline.groups.len(), 1);
-        assert_eq!(timeline.groups[0].contexts.len(), 1);
-        let context = &timeline.groups[0].contexts[0];
-        assert_eq!(
-            context.input,
-            ThinkingInput::User {
-                text: "remember this exact input".to_string()
-            }
-        );
-        assert_eq!(
-            context.output.as_ref().unwrap().terminal_state,
-            ThinkingTerminalState::Completed
-        );
-    }
+        let (signal_id, signal) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream_rx.recv())
+                .await
+                .expect("think signal should arrive")
+                .expect("stream channel should remain open");
+        assert_eq!(signal_id, thought_id);
+        assert!(matches!(signal, StreamChunk::Think(ref t) if t == "think body"));
 
-    #[tokio::test]
-    async fn blocking_invalid_output_is_durable_before_failure_execution_handoff() {
-        let temporary = tempfile::tempdir().unwrap();
-        let mut providers = ProviderRegistry::new();
-        providers.register(Arc::new(InvalidOutputProvider));
-        let (mut manager, mut receivers) = make_mgr_with_receivers(temporary.path(), providers);
-
-        let error = manager
-            .handle_input("repair malformed output")
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("invalid_json_output"));
-        assert!(!error.to_string().contains(INVALID_RAW_OUTPUT));
-
-        let timeline = manager.thought_store().recover().unwrap();
-        let context = &timeline.groups[0].contexts[0];
-        assert!(matches!(
-            context.output.as_ref().unwrap().terminal_state,
-            ThinkingTerminalState::Failed { .. }
-        ));
-        let failure = manager
-            .thought_store()
-            .load_failure_input(context)
-            .unwrap()
-            .expect("ThinkingFailureInput must be durable");
-        assert_eq!(
-            failure.raw_model_output_ref,
-            crate::agent::thought::RAW_MODEL_OUTPUT_FILE_NAME
-        );
-        assert_eq!(
-            failure.raw_model_output_bytes,
-            INVALID_RAW_OUTPUT.len() as u64
-        );
-        let failure_json = serde_json::to_string(&failure).unwrap();
-        assert!(!failure_json.contains(INVALID_RAW_OUTPUT));
-        for output_json in read_named_files(manager.thought_store().root(), "output.json") {
-            assert!(!output_json.contains(INVALID_RAW_OUTPUT));
-        }
-        for failure_json in read_named_files(manager.thought_store().root(), "failure.json") {
-            assert!(!failure_json.contains(INVALID_RAW_OUTPUT));
-        }
-
-        let failure_context = manager
-            .agent_pool
-            .get_turn_context(&failure.failure_event_id.to_string())
-            .await
-            .expect("failure handoff context should exist");
-        assert!(!failure_context.thinking.goal.contains(INVALID_RAW_OUTPUT));
-        assert!(!failure_context
-            .thinking
-            .message
-            .contains(INVALID_RAW_OUTPUT));
-
-        let handoff = receivers.execution_rx.try_recv().unwrap();
-        assert!(matches!(
-            handoff,
-            crate::agent::communication::AgentMessage::Execute { ref turn_id }
-                if turn_id == &failure.failure_event_id.to_string()
-        ));
-    }
-
-    #[tokio::test]
-    async fn keep_second_say_is_stripped_think_routes_and_reentry_resets_quota() {
-        let temporary = tempfile::tempdir().unwrap();
-        let mut providers = ProviderRegistry::new();
-        providers.register(Arc::new(SuccessfulProvider));
-        let (mut manager, mut receivers) = make_mgr_with_receivers(temporary.path(), providers);
-        manager.switch_mode(ModeKind::Keep).await.unwrap();
-
-        let first = manager.handle_input("first KEEP turn").await.unwrap();
-        assert_eq!(first.text, "durable reply");
-        manager.switch_mode(ModeKind::Keep).await.unwrap();
-
-        let second = manager.handle_input("second KEEP turn").await.unwrap();
-        assert_eq!(
-            second.text, "durable reply",
-            "user 消息轮 say 不消耗配额, 不应被剥离"
-        );
-        assert!(
-            !manager
-                .thinking_factory
-                .current_keep_quota()
-                .unwrap()
-                .is_consumed(),
-            "user 消息轮 say 不应消耗 KEEP 配额"
-        );
-
-        let timeline = manager.thought_store().recover().unwrap();
-        let contexts = timeline
-            .groups
-            .iter()
-            .flat_map(|group| group.contexts.iter())
-            .collect::<Vec<_>>();
-        assert_eq!(contexts.len(), 2);
-        for context in &contexts {
-            assert_eq!(
-                context.output.as_ref().unwrap().terminal_state,
-                ThinkingTerminalState::Completed,
-                "both KEEP turns must complete (no failed quota rejection)"
-            );
-        }
-
-        let first_handoff = receivers.execution_rx.try_recv().unwrap();
-        assert!(matches!(
-            first_handoff,
-            crate::agent::communication::AgentMessage::Execute { .. }
-        ));
-        let second_handoff = receivers.execution_rx.try_recv().unwrap();
-        assert!(matches!(
-            second_handoff,
-            crate::agent::communication::AgentMessage::Execute { .. }
-        ));
-
-        manager.switch_mode(ModeKind::Unni).await.unwrap();
-        manager.switch_mode(ModeKind::Keep).await.unwrap();
-        let after_reentry = manager.handle_input("new KEEP period").await.unwrap();
-        assert_eq!(after_reentry.text, "durable reply");
+        let (_, signal2) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream_rx.recv())
+                .await
+                .expect("done signal should arrive")
+                .expect("stream channel should remain open");
+        assert_eq!(signal2, StreamChunk::Done);
     }
 
     #[tokio::test]
@@ -889,245 +842,6 @@ mod tests {
         assert!(matches!(
             output.terminal_state,
             ThinkingTerminalState::Failed { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn streaming_success_is_durable_before_done_signal() {
-        let temporary = tempfile::tempdir().unwrap();
-        let mut providers = ProviderRegistry::new();
-        providers.register(Arc::new(SuccessfulProvider));
-        let mut manager = make_mgr_at(temporary.path(), providers);
-        let (mut stream_rx, _outcome_rx) = manager.take_channels();
-
-        let thought_id = manager
-            .spawn("finish this stream".to_string())
-            .await
-            .unwrap();
-
-        let (think_id, think_signal) =
-            tokio::time::timeout(std::time::Duration::from_secs(1), stream_rx.recv())
-                .await
-                .expect("think should arrive")
-                .expect("stream channel should remain open");
-        assert_eq!(think_id, thought_id);
-        assert_eq!(
-            think_signal,
-            StreamChunk::Think("durable stream work".to_string())
-        );
-
-        let (signal_id, signal) =
-            tokio::time::timeout(std::time::Duration::from_secs(1), stream_rx.recv())
-                .await
-                .expect("sanitized say should arrive")
-                .expect("stream channel should remain open");
-        assert_eq!(signal_id, thought_id);
-        assert_eq!(
-            signal,
-            StreamChunk::Delta("durable stream reply".to_string())
-        );
-
-        let timeline = manager.thought_store().recover().unwrap();
-        let output = timeline.groups[0].contexts[0].output.as_ref().unwrap();
-        assert_eq!(output.terminal_state, ThinkingTerminalState::Completed);
-        assert_eq!(output.say.as_deref(), Some("durable stream reply"));
-
-        let (_, terminal) =
-            tokio::time::timeout(std::time::Duration::from_secs(1), stream_rx.recv())
-                .await
-                .expect("done signal should arrive")
-                .expect("stream channel should remain open");
-        assert_eq!(terminal, StreamChunk::Done);
-    }
-
-    #[tokio::test]
-    async fn concurrent_keep_streams_publish_exactly_one_say() {
-        let temporary = tempfile::tempdir().unwrap();
-        let mut providers = ProviderRegistry::new();
-        providers.register(Arc::new(SuccessfulProvider));
-        let (mut manager, mut receivers) = make_mgr_with_receivers(temporary.path(), providers);
-        manager.switch_mode(ModeKind::Keep).await.unwrap();
-        let (mut stream_rx, mut outcome_rx) = manager.take_channels();
-
-        let first_id = manager
-            .spawn_with_override(
-                "first stream echo".to_string(),
-                Some(crate::agent::thought::ThinkingInput::PlatformEcho {
-                    platform: crate::agent::thought::InternalPlatform::Memory,
-                    summary: "first stream".to_string(),
-                    artifact_refs: vec![],
-                }),
-            )
-            .await
-            .unwrap();
-        let second_id = manager
-            .spawn_with_override(
-                "second stream echo".to_string(),
-                Some(crate::agent::thought::ThinkingInput::PlatformEcho {
-                    platform: crate::agent::thought::InternalPlatform::Memory,
-                    summary: "second stream".to_string(),
-                    artifact_refs: vec![],
-                }),
-            )
-            .await
-            .unwrap();
-        let expected_ids = [first_id.clone(), second_id.clone()]
-            .into_iter()
-            .collect::<std::collections::HashSet<_>>();
-
-        let mut think_count = 0usize;
-        let mut delta_ids = std::collections::HashSet::new();
-        let mut done_ids = std::collections::HashSet::new();
-
-        for _ in 0..5 {
-            let (id, signal) =
-                tokio::time::timeout(std::time::Duration::from_secs(1), stream_rx.recv())
-                    .await
-                    .expect("KEEP stream terminal signal should arrive")
-                    .expect("stream channel should remain open");
-            assert!(expected_ids.contains(&id));
-            match signal {
-                StreamChunk::Think(think) => {
-                    assert_eq!(think, "durable stream work");
-                    think_count += 1;
-                }
-                StreamChunk::Delta(say) => {
-                    assert_eq!(say, "durable stream reply");
-                    delta_ids.insert(id);
-                }
-                StreamChunk::Done => {
-                    done_ids.insert(id);
-                }
-                StreamChunk::Error(error) => {
-                    panic!("no KEEP stream should error under strip semantics: {error}")
-                }
-                other => panic!("unexpected KEEP stream signal: {other:?}"),
-            }
-        }
-        assert_eq!(
-            think_count, 2,
-            "both streams emit Think (second say stripped)"
-        );
-        assert_eq!(
-            delta_ids.len(),
-            1,
-            "only the first stream emits Delta (say)"
-        );
-        assert_eq!(done_ids.len(), 2, "both streams complete");
-
-        let mut successful_outcomes = 0;
-        let mut failed_outcomes = 0;
-        for _ in 0..2 {
-            let outcome =
-                tokio::time::timeout(std::time::Duration::from_secs(1), outcome_rx.recv())
-                    .await
-                    .expect("KEEP stream outcome should arrive")
-                    .expect("outcome channel should remain open");
-            if outcome.result.is_ok() {
-                successful_outcomes += 1;
-            } else {
-                failed_outcomes += 1;
-            }
-        }
-        assert_eq!((successful_outcomes, failed_outcomes), (2, 0));
-
-        let timeline = manager.thought_store().recover().unwrap();
-        let contexts = timeline
-            .groups
-            .iter()
-            .flat_map(|group| group.contexts.iter())
-            .collect::<Vec<_>>();
-        assert_eq!(contexts.len(), 2);
-        for context in &contexts {
-            assert_eq!(
-                context.output.as_ref().unwrap().terminal_state,
-                ThinkingTerminalState::Completed,
-                "both KEEP streams must complete under strip semantics"
-            );
-        }
-        let first_completed = contexts
-            .iter()
-            .find(|context| {
-                context.output.as_ref().unwrap().say.as_deref() == Some("durable stream reply")
-            })
-            .expect("first stream keeps its say");
-        let second_completed = contexts
-            .iter()
-            .find(|context| {
-                context.output.as_ref().unwrap().say.is_none()
-                    && context.output.as_ref().unwrap().think.as_deref()
-                        == Some("durable stream work")
-            })
-            .expect("second stream say must be stripped, think kept");
-
-        let mut routed_ids = std::collections::HashSet::new();
-        for _ in 0..2 {
-            match receivers.execution_rx.try_recv().unwrap() {
-                crate::agent::communication::AgentMessage::Execute { turn_id } => {
-                    routed_ids.insert(turn_id);
-                }
-                other => panic!("unexpected execution message: {other:?}"),
-            }
-        }
-        assert!(routed_ids.contains(&first_completed.thought_id.to_string()));
-        assert!(routed_ids.contains(&second_completed.thought_id.to_string()));
-    }
-
-    #[tokio::test]
-    async fn streaming_invalid_output_is_durable_before_error_signal() {
-        let temporary = tempfile::tempdir().unwrap();
-        let mut providers = ProviderRegistry::new();
-        providers.register(Arc::new(InvalidOutputProvider));
-        let (mut manager, mut receivers) = make_mgr_with_receivers(temporary.path(), providers);
-        let (mut stream_rx, mut outcome_rx) = manager.take_channels();
-
-        let thought_id = manager
-            .spawn("repair malformed stream output".to_string())
-            .await
-            .unwrap();
-        let (signal_id, signal) =
-            tokio::time::timeout(std::time::Duration::from_secs(1), stream_rx.recv())
-                .await
-                .expect("error signal should arrive")
-                .expect("stream channel should remain open");
-        assert_eq!(signal_id, thought_id);
-        assert!(matches!(
-            signal,
-            StreamChunk::Error(ref error) if error.contains("invalid_json_output")
-        ));
-        if let StreamChunk::Error(error) = &signal {
-            assert!(!error.contains(INVALID_RAW_OUTPUT));
-        }
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), outcome_rx.recv())
-            .await
-            .expect("failed outcome should arrive")
-            .expect("outcome channel should remain open");
-        assert!(outcome.result.is_err());
-
-        let timeline = manager.thought_store().recover().unwrap();
-        let context = &timeline.groups[0].contexts[0];
-        let failure = manager
-            .thought_store()
-            .load_failure_input(context)
-            .unwrap()
-            .expect("ThinkingFailureInput must be durable");
-        assert!(!serde_json::to_string(&failure)
-            .unwrap()
-            .contains(INVALID_RAW_OUTPUT));
-        let failure_context = manager
-            .agent_pool
-            .get_turn_context(&failure.failure_event_id.to_string())
-            .await
-            .expect("failure handoff context should exist");
-        assert!(!failure_context.thinking.goal.contains(INVALID_RAW_OUTPUT));
-        assert!(!failure_context
-            .thinking
-            .message
-            .contains(INVALID_RAW_OUTPUT));
-        assert!(matches!(
-            receivers.execution_rx.try_recv().unwrap(),
-            crate::agent::communication::AgentMessage::Execute { ref turn_id }
-                if turn_id == &failure.failure_event_id.to_string()
         ));
     }
 

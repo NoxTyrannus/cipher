@@ -389,7 +389,7 @@ pub fn seed_memory_agents(conn: &duckdb::Connection) -> Result<()> {
 ///
 /// `mode = 'subagent_template'`，可读不可改；capability_allowlist 非空（安全集合）；
 /// config.subagent 含 lifecycle/startup/trigger/memory_window_pct/briefing/预算字段。
-/// ON CONFLICT DO NOTHING：重复执行不破坏已有行（含用户改动）。
+/// 模板能力集按需演进；冲突时更新 capability_allowlist，保证旧数据目录启动后自动获得新授权。
 pub fn seed_subagent_templates(conn: &duckdb::Connection) -> Result<()> {
     // (id, display_name, lifecycle_kind, startup, allowlist)
     let templates: &[(&str, &str, &str, &str, &[&str])] = &[
@@ -398,7 +398,14 @@ pub fn seed_subagent_templates(conn: &duckdb::Connection) -> Result<()> {
             "Normal Subagent Template",
             "temporary",
             "normal",
-            &["file.read", "file.list", "path.exists", "text.grep"],
+            &[
+                "file.read",
+                "file.list",
+                "path.exists",
+                "text.grep",
+                "file.write",
+                "shell.exec",
+            ],
         ),
         (
             "subagent.template.resident",
@@ -456,7 +463,7 @@ pub fn seed_subagent_templates(conn: &duckdb::Connection) -> Result<()> {
         conn.execute(
             "INSERT INTO agent (id, name, mode, prompt, capability_allowlist, config, display_name, is_default) \
              VALUES (?, ?, 'subagent_template', ?, CAST(? AS JSON), CAST(? AS JSON), ?, false) \
-             ON CONFLICT (id) DO NOTHING",
+             ON CONFLICT (id) DO UPDATE SET capability_allowlist = excluded.capability_allowlist",
             duckdb::params![
                 id,
                 name,

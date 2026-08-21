@@ -201,16 +201,14 @@ impl CapabilityExecutor {
         let storage_root = self.storage_root.as_ref().ok_or_else(|| {
             AgentError::NotFound(format!("{builtin_name}: storage_root not configured"))
         })?;
-        let guard = db.lock().map_err(|error| {
-            AgentError::Script(format!("{builtin_name}: duckdb lock poisoned: {error}"))
-        })?;
         let hook = self
             .subagent_spawn_hook
             .read()
             .ok()
             .and_then(|slot| slot.clone());
+        // 修法 2（任务书 §3.3）：分子内部自行短锁，本层不再持 duckdb 锁调用分子。
         crate::agent::subagent_capability::execute_subagent_capability(
-            &guard,
+            db,
             storage_root,
             builtin_name,
             input,

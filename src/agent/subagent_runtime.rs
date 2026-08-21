@@ -124,9 +124,11 @@ pub enum RuntimeSpawnEvent {
 }
 
 /// RuntimeSpawnHook：按 RunAccepted 查 model 表 -> 解析 API key -> 选 provider -> spawn。
+#[derive(Clone)]
 pub struct RuntimeSpawnHook {
     pool: Arc<AgentPool>,
-    registry: Registry,
+    registry: Arc<std::sync::Mutex<Registry>>,
+    duckdb: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
     executor: Arc<CapabilityExecutor>,
     storage_root: PathBuf,
     providers: crate::logic::model::registry::ProviderRegistry,
@@ -139,6 +141,7 @@ impl RuntimeSpawnHook {
     pub fn new(
         pool: Arc<AgentPool>,
         registry: Registry,
+        duckdb: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
         executor: Arc<CapabilityExecutor>,
         storage_root: PathBuf,
         providers: crate::logic::model::registry::ProviderRegistry,
@@ -147,7 +150,8 @@ impl RuntimeSpawnHook {
     ) -> Self {
         Self {
             pool,
-            registry,
+            registry: Arc::new(std::sync::Mutex::new(registry)),
+            duckdb,
             executor,
             storage_root,
             providers,
@@ -170,8 +174,29 @@ impl RuntimeSpawnHook {
                 task_input,
                 invocation_id,
             } => {
-                if let Err(e) = self.spawn_for(definition, task_input, invocation_id) {
-                    tracing::error!("subagent spawn failed: {e}");
+                // 修法 1（任务书 §3.3）：异步化 spawn —— 执行中台持 duckdb 锁时若同步
+                // spawn_for 会再次 lock 同一把 std Mutex 造成同线程重入死锁。
+                // spawn_for 含同步阻塞的 load_all_into_memory 与锁等待，放入 spawn_blocking；
+                // spawn 失败时回滚 lifecycle（running → failed）+ last_output + invocation。
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let hook = self.clone();
+                    let subagent_id = definition.subagent_id.clone();
+                    let invocation_id = invocation_id.clone();
+                    handle.spawn_blocking(move || {
+                        if let Err(e) =
+                            hook.spawn_for(definition, task_input, invocation_id.clone())
+                        {
+                            tracing::error!("subagent spawn failed for {subagent_id}: {e}");
+                            hook.rollback_spawn_failure(&subagent_id, &invocation_id, &e);
+                        }
+                    });
+                } else {
+                    // 非 tokio 上下文（单元测试）：保持同步语义
+                    let subagent_id = definition.subagent_id.clone();
+                    if let Err(e) = self.spawn_for(definition, task_input, invocation_id.clone()) {
+                        tracing::error!("subagent spawn failed for {subagent_id}: {e}");
+                        self.rollback_spawn_failure(&subagent_id, &invocation_id, &e);
+                    }
                 }
             }
         }
@@ -183,8 +208,16 @@ impl RuntimeSpawnHook {
         task_input: String,
         invocation_id: String,
     ) -> Result<tokio::task::JoinHandle<()>> {
-        let model_row = self
-            .registry
+        // 每次 run 前刷新注册表，确保运行时创建的 subagent actor 行对能力服务可见。
+        if let Some(duckdb) = &self.duckdb {
+            if let Ok(conn) = duckdb.lock() {
+                if let Ok(registry) = crate::data::duckdb::loader::load_all_into_memory(&conn) {
+                    *self.registry.lock().unwrap() = registry;
+                }
+            }
+        }
+        let registry = self.registry.lock().unwrap().clone();
+        let model_row = registry
             .models
             .get(&definition.model_id)
             .cloned()
@@ -202,7 +235,8 @@ impl RuntimeSpawnHook {
                     model_row.api_type
                 ))
             })?;
-        Ok(spawn_subagent(SubagentRunParams {
+        let subagent_id = definition.subagent_id.clone();
+        let handle = spawn_subagent(SubagentRunParams {
             definition,
             task_input,
             invocation_id,
@@ -211,11 +245,54 @@ impl RuntimeSpawnHook {
             api_key,
             provider,
             pool: self.pool.clone(),
-            registry: self.registry.clone(),
+            registry,
             executor: self.executor.clone(),
             max_turns: self.max_turns,
             finish: self.finish.clone(),
-        }))
+        });
+        tracing::info!("subagent runtime spawned for {subagent_id}");
+        Ok(handle)
+    }
+
+    /// 修法 1（任务书 §3.3）：spawn 失败回滚 —— lifecycle running → failed、
+    /// last_output 写失败、close_invocation(failed)，避免 lifecycle 悬挂 running
+    /// （现状：悬挂后后续 run 被 "already running" 拒绝，只能手动 sleep/delete）。
+    fn rollback_spawn_failure(&self, subagent_id: &str, invocation_id: &str, error: &AgentError) {
+        if let Some(duckdb) = &self.duckdb {
+            if let Ok(conn) = duckdb.lock() {
+                if let Err(e) = crate::agent::subagent_capability::set_subagent_lifecycle(
+                    &conn,
+                    subagent_id,
+                    SubagentLifecycle::Failed,
+                ) {
+                    tracing::warn!("subagent spawn rollback: set_subagent_lifecycle failed: {e}");
+                }
+            }
+        }
+        if let Err(e) = crate::agent::subagent_capability::close_subagent_invocation(
+            &self.storage_root,
+            invocation_id,
+            "failed",
+            Some(&error.to_string()),
+        ) {
+            tracing::warn!("subagent spawn rollback: close_subagent_invocation failed: {e}");
+        }
+        if let Err(e) = write_last_output(
+            &self.storage_root,
+            subagent_id,
+            "failed",
+            &format!("spawn failed: {error}"),
+        ) {
+            tracing::warn!("subagent spawn rollback: write_last_output failed: {e}");
+        }
+        let pool = Arc::clone(&self.pool);
+        let subagent_id = subagent_id.to_string();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                pool.update_subagent_lifecycle(&subagent_id, SubagentLifecycle::Failed)
+                    .await;
+            });
+        }
     }
 }
 
@@ -315,6 +392,12 @@ async fn run_once(params: &SubagentRunParams) -> std::result::Result<CompletedOu
     let memory =
         read_memory(&params.storage_root, &params.definition.subagent_id).unwrap_or_default();
     let system_prompt = compose_system_prompt(params, &memory);
+
+    if params.task_input.trim().is_empty() {
+        return Err(RunError::ProviderError(
+            "subagent run messages would be empty: task_input is empty".to_string(),
+        ));
+    }
 
     let mut messages = vec![
         ChatMessage::System {
@@ -619,6 +702,15 @@ async fn finalize_completed(params: &SubagentRunParams, outcome: &CompletedOutco
         .set_subagent_last_output(subagent_id, truncated)
         .await;
 
+    // 异步结果回传：通知主循环 subagent 已完成，触发新一轮思考/echo。
+    if let Err(e) = params
+        .pool
+        .send_trigger(subagent_id, "subagent_complete")
+        .await
+    {
+        tracing::warn!(subagent_id = %subagent_id, "subagent complete trigger failed: {e}");
+    }
+
     // 完成回调：TC 接到 TA 的 set_subagent_lifecycle + invocation result 闭合（持久生命周期）。
     (params.finish)(&SubagentFinish {
         subagent_id: subagent_id.clone(),
@@ -678,6 +770,15 @@ async fn finalize_failed(params: &SubagentRunParams, error: &RunError) {
         .pool
         .set_subagent_last_output(subagent_id, truncated)
         .await;
+
+    // 异步结果回传：失败也通知主循环，便于把失败原因带给用户。
+    if let Err(e) = params
+        .pool
+        .send_trigger(subagent_id, "subagent_complete")
+        .await
+    {
+        tracing::warn!(subagent_id = %subagent_id, "subagent complete trigger failed: {e}");
+    }
 
     // 完成回调：TC 接到 TA 的 set_subagent_lifecycle(failed) + invocation result 失败闭合。
     (params.finish)(&SubagentFinish {

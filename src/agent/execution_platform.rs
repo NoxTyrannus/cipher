@@ -36,6 +36,8 @@ struct ExecutionPlatformRawOutput {
     capability_calls: Vec<RawCapabilityCall>,
 }
 
+const EXECUTION_INSTRUCTION: &str = "现在做一轮 subagent 生命周期管理。输出 JSON。";
+
 #[derive(Debug, Clone, Deserialize)]
 struct RawCapabilityCall {
     capability_id: String,
@@ -127,6 +129,11 @@ impl ExecutionPlatform {
     pub fn spawn(mut self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             tracing::info!("execution_platform: started, polling rx");
+            let heartbeat = AgentPool::spawn_core_heartbeat(
+                &self.pool,
+                "execution-platform",
+                "execution-platform",
+            );
             while let Some(msg) = self.execution_rx.recv().await {
                 let pending = self.execution_rx.len();
                 self.pool
@@ -137,7 +144,23 @@ impl ExecutionPlatform {
                         self.pool
                             .update_platform_status(|s| s.execution_active = Some(turn_id.clone()))
                             .await;
-                        self.handle_execute(&turn_id).await;
+                        self.pool
+                            .set_core_agent_status(
+                                "execution-platform",
+                                crate::agent::agent_pool::registry::AgentStatus::Running,
+                            )
+                            .await;
+
+                        // §8.1 排队合并：执行中台执行中积压的 Execute 全部并入下一次调用。
+                        let batch = self.drain_execute_batch(turn_id);
+                        self.handle_execute_batch(&batch).await;
+
+                        self.pool
+                            .set_core_agent_status(
+                                "execution-platform",
+                                crate::agent::agent_pool::registry::AgentStatus::Idle,
+                            )
+                            .await;
                         self.pool
                             .update_platform_status(|s| s.execution_active = None)
                             .await;
@@ -149,36 +172,66 @@ impl ExecutionPlatform {
                 }
                 self.pool.snapshot_detailed().await;
             }
+            heartbeat.abort();
             tracing::info!("execution_platform: rx closed, shutting down");
         })
     }
 
-    async fn handle_execute(&self, turn_id: &str) {
-        let Some(ctx) = self.pool.get_turn_context(turn_id).await else {
-            tracing::warn!("execution_platform: TurnContext not found for turn_id={turn_id}");
+    fn drain_execute_batch(&mut self, first: String) -> Vec<String> {
+        let mut batch = vec![first];
+        while let Ok(next) = self.execution_rx.try_recv() {
+            match next {
+                AgentMessage::Execute { turn_id } => batch.push(turn_id),
+                AgentMessage::Cancel { .. } => {}
+                other => {
+                    tracing::warn!(
+                        "execution_platform: dropping unexpected queued message: {other:?}"
+                    );
+                }
+            }
+        }
+        batch
+    }
+
+    async fn handle_execute_batch(&self, turn_ids: &[String]) {
+        let mut contexts = Vec::new();
+        for turn_id in turn_ids {
+            match self.pool.get_turn_context(turn_id).await {
+                Some(ctx) => contexts.push(ctx),
+                None => {
+                    tracing::warn!(
+                        "execution_platform: TurnContext not found for turn_id={turn_id}"
+                    );
+                }
+            }
+        }
+        if contexts.is_empty() {
             return;
-        };
+        }
+        // 合并结果落在仍然可解析的最新 turn 上。
+        let representative = contexts
+            .last()
+            .map(|ctx| ctx.turn_id.clone())
+            .unwrap_or_default();
+
+        if let Err(e) = self.refresh_subagent_states().await {
+            tracing::warn!(
+                "execution_platform: refresh_subagent_states failed for turn_id={representative}: {e}"
+            );
+        }
 
         let pool_entries = self.pool.snapshot().await;
         let subagent_states = self.pool.subagent_states().await;
-        let prompt = self.build_execution_prompt(&ctx, &pool_entries, &subagent_states);
-
-        let messages = vec![
-            ChatMessage::System {
-                text: prompt,
-                kind: SystemKind::Primary,
-            },
-            ChatMessage::User {
-                text: "现在做一轮 subagent 生命周期管理。输出 JSON。".to_string(),
-            },
-        ];
+        let prompt = self.build_execution_base_prompt(&pool_entries, &subagent_states);
+        let messages = self.build_execution_messages(&contexts, &prompt);
 
         let req = match LlmRequest::from_model_row(&self.model_row, messages, self.api_key.clone())
         {
             Ok(req) => req,
             Err(e) => {
                 let output = failure_output(format!("build LLM request failed: {e}"));
-                self.publish_execution(turn_id, output).await;
+                self.publish_execution_batch(&representative, turn_ids, output)
+                    .await;
                 return;
             }
         };
@@ -186,20 +239,23 @@ impl ExecutionPlatform {
         let raw = match self.provider.call(&req).await {
             Ok(response) => parse_execution_output(&response.content),
             Err(e) => {
-                tracing::error!("execution_platform: LLM call failed for turn_id={turn_id}: {e}");
+                tracing::error!(
+                    "execution_platform: LLM call failed for turn_id={representative}: {e}"
+                );
                 let output = failure_output(format!("LLM call failed: {e}"));
-                self.publish_execution(turn_id, output).await;
+                self.publish_execution_batch(&representative, turn_ids, output)
+                    .await;
                 return;
             }
         };
 
         let output = self.execute_capability_calls(raw).await;
-        self.publish_execution(turn_id, output).await;
+        self.publish_execution_batch(&representative, turn_ids, output)
+            .await;
     }
 
-    fn build_execution_prompt(
+    fn build_execution_base_prompt(
         &self,
-        ctx: &crate::agent::communication::TurnContext,
         pool_entries: &[crate::agent::agent_pool::registry::AgentEntry],
         subagent_states: &[SubagentRuntimeState],
     ) -> String {
@@ -216,8 +272,61 @@ impl ExecutionPlatform {
         let base_with_capabilities = compose_agent_capability_prompt(&base, &available);
 
         let mut sections = vec![base_with_capabilities];
-        sections.push(format!(
-            "## Thinking Input\n\n**goal:** {}\n\n**constraints:**\n{}\n\n**message:** {}\n\n**user_message:** {}",
+        sections.push(self.full_capability_registry_section());
+        sections.push(self.pool_section(pool_entries, subagent_states));
+        sections.push(self.templates_section());
+        sections.push(self.models_section());
+        sections.join("\n\n")
+    }
+
+    fn build_execution_messages(
+        &self,
+        contexts: &[crate::agent::communication::TurnContext],
+        base_prompt: &str,
+    ) -> Vec<ChatMessage> {
+        let mut system_text = base_prompt.to_string();
+        // 单条时保留 Thinking Input 说明段；N 条合并时按确认序列
+        // [System(平台+池状态), User_i, Assistant_i, ..., System(平台指令)] 组装。
+        if let [ctx] = contexts {
+            system_text.push_str("\n\n");
+            system_text.push_str(&Self::thinking_input_section(ctx));
+        }
+
+        let mut messages = vec![ChatMessage::System {
+            text: system_text,
+            kind: SystemKind::Primary,
+        }];
+        for ctx in contexts {
+            messages.push(ChatMessage::User {
+                text: ctx.user_message.clone(),
+            });
+            messages.push(ChatMessage::Assistant {
+                text: ctx.thinking.message.clone(),
+            });
+        }
+        messages.push(ChatMessage::System {
+            text: EXECUTION_INSTRUCTION.to_string(),
+            kind: SystemKind::Primary,
+        });
+        messages
+    }
+
+    async fn publish_execution_batch(
+        &self,
+        representative: &str,
+        turn_ids: &[String],
+        output: ExecutionOutput,
+    ) {
+        // 合并执行只产出一个结果：关闭较早 turn，结果落在代表 turn（最新一条）。
+        for turn_id in turn_ids.iter().filter(|id| id.as_str() != representative) {
+            self.pool.mark_done(turn_id).await;
+        }
+        self.publish_execution(representative, output).await;
+    }
+
+    fn thinking_input_section(ctx: &crate::agent::communication::TurnContext) -> String {
+        format!(
+            "## Thinking Input\n\n**goal:** {}\n\n**constraints:**\n{}\n\n**message:** {}",
             ctx.thinking.goal,
             if ctx.thinking.constraints.is_empty() {
                 "none".to_string()
@@ -225,12 +334,7 @@ impl ExecutionPlatform {
                 ctx.thinking.constraints.join("\n")
             },
             ctx.thinking.message,
-            ctx.user_message,
-        ));
-        sections.push(self.pool_section(pool_entries, subagent_states));
-        sections.push(self.templates_section());
-        sections.push(self.models_section());
-        sections.join("\n\n")
+        )
     }
 
     fn available_capabilities(&self) -> Vec<CapabilityPromptEntry> {
@@ -251,6 +355,45 @@ impl ExecutionPlatform {
                 description: definition.description,
             })
             .collect()
+    }
+
+    /// 完整能力注册表（供 subagent.capability_allowlist 设计参考）。
+    ///
+    /// 执行中台自己不能直接调用这些能力；它们只能通过 subagent 实例的 allowlist
+    /// 委派给 subagent 执行。
+    fn full_capability_registry_section(&self) -> String {
+        let Some(registry) = &self.registry else {
+            return "## Full Capability Registry\n\n(registry unavailable)".to_string();
+        };
+
+        let mut lines = vec!["## Full Capability Registry".to_string()];
+        lines.push("(Reference only: these are NOT directly callable by you. Choose them for subagent.capability_allowlist.)".to_string());
+        lines.push("".to_string());
+
+        let mut base: Vec<_> = registry.base_capabilities.values().collect();
+        base.sort_by_key(|row| row.id.as_str());
+        let mut composite: Vec<_> = registry.composite_capabilities.values().collect();
+        composite.sort_by_key(|row| row.id.as_str());
+
+        lines.push("### Base capabilities".to_string());
+        for row in base {
+            lines.push(format!(
+                "- `{}` / {}: {}",
+                row.id, row.name, row.description
+            ));
+        }
+        lines.push("".to_string());
+        lines.push("### Composite capabilities".to_string());
+        if composite.is_empty() {
+            lines.push("- (none)".to_string());
+        }
+        for row in composite {
+            lines.push(format!(
+                "- `{}` / {}: {}",
+                row.id, row.name, row.description
+            ));
+        }
+        lines.join("\n")
     }
 
     fn pool_section(
@@ -316,9 +459,10 @@ impl ExecutionPlatform {
             return "## Model Registry\n\n(registry unavailable)".to_string();
         };
         let mut lines = vec!["## Model Registry".to_string()];
+        lines.push("For subagent.create/update, use the registry row `id` as the `model_id` argument, NOT the upstream api model_id.".to_string());
         for row in registry.models.values() {
             lines.push(format!(
-                "- id={} name={} provider={} model_id={} api_type={} config={}",
+                "- id={} (USE THIS AS model_id) name={} provider={} api_model_id={} api_type={} config={}",
                 row.id,
                 row.name,
                 row.provider,
@@ -338,8 +482,71 @@ impl ExecutionPlatform {
 
     async fn execute_capability_calls(&self, raw: ExecutionPlatformRawOutput) -> ExecutionOutput {
         let mut actions = Vec::new();
-        for call in raw.capability_calls {
-            actions.push(self.execute_one_call(call).await);
+        let mut created_real_id: Option<String> = None;
+        let mut created_task_input: Option<String> = None;
+        let known_ids: std::collections::HashSet<String> = self
+            .pool
+            .subagent_states()
+            .await
+            .iter()
+            .map(|s| s.subagent_id.clone())
+            .collect();
+        for mut call in raw.capability_calls {
+            // subagent.run 使用 create 返回的真实 ID，禁止使用计划/语义 ID。
+            if call.capability_id == "subagent.run" {
+                if let Some(args) = call.arguments.as_object_mut() {
+                    // 空 task_input 回退 create 的 task_input。
+                    let task_input_empty = args
+                        .get("task_input")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().is_empty())
+                        .unwrap_or(true);
+                    if task_input_empty {
+                        if let Some(created_task_input) = &created_task_input {
+                            args.insert(
+                                "task_input".to_string(),
+                                serde_json::Value::String(created_task_input.clone()),
+                            );
+                        }
+                    }
+                    // 只有计划/语义 ID（不在池中）才映射到真实 ID；真实 ID 不覆盖。
+                    if let Some(real_id) = created_real_id.as_ref() {
+                        if let Some(subagent_id) =
+                            args.get("subagent_id").and_then(serde_json::Value::as_str)
+                        {
+                            let is_real = subagent_id.starts_with("sg_")
+                                && (known_ids.contains(subagent_id)
+                                    || Some(subagent_id) == created_real_id.as_deref());
+                            if !is_real {
+                                tracing::warn!(
+                                    "execution_platform: rewriting subagent.run semantic id {:?} -> real id {:?}",
+                                    subagent_id, real_id
+                                );
+                                args.insert(
+                                    "subagent_id".to_string(),
+                                    serde_json::Value::String(real_id.clone()),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            let (record, output) = self.execute_one_call(call).await;
+            if record.capability_id == "subagent.create" {
+                if let Some(output) = output {
+                    if let Some(id) = output
+                        .get("subagent_id")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        created_real_id = Some(id.to_string());
+                    }
+                    created_task_input = output
+                        .get("task_input")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                }
+            }
+            actions.push(record);
         }
         let mut subagent_states = self.pool.subagent_states().await;
         if let Err(e) = self.refresh_subagent_states().await {
@@ -355,7 +562,10 @@ impl ExecutionPlatform {
         }
     }
 
-    async fn execute_one_call(&self, call: RawCapabilityCall) -> CapabilityLifecycleRecord {
+    async fn execute_one_call(
+        &self,
+        call: RawCapabilityCall,
+    ) -> (CapabilityLifecycleRecord, Option<serde_json::Value>) {
         let capability_id = call.capability_id.clone();
         let arguments_summary = crate::common::json_util::truncate_head_tail(
             &serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_string()),
@@ -367,13 +577,16 @@ impl ExecutionPlatform {
             logs.push(format!(
                 "FAIL {capability_id}: capability runtime unavailable"
             ));
-            return record(
-                capability_id,
-                capability_name(&call, None),
-                arguments_summary,
-                CapabilityLifecycleState::Rejected,
-                Some("capability runtime unavailable".to_string()),
-                logs,
+            return (
+                record(
+                    capability_id,
+                    capability_name(&call, None),
+                    arguments_summary,
+                    CapabilityLifecycleState::Rejected,
+                    Some("capability runtime unavailable".to_string()),
+                    logs,
+                ),
+                None,
             );
         };
 
@@ -381,13 +594,16 @@ impl ExecutionPlatform {
             Ok(service) => service,
             Err(e) => {
                 logs.push(format!("FAIL {capability_id}: {e}"));
-                return record(
-                    capability_id,
-                    capability_name(&call, None),
-                    arguments_summary,
-                    CapabilityLifecycleState::Rejected,
-                    Some(e.to_string()),
-                    logs,
+                return (
+                    record(
+                        capability_id,
+                        capability_name(&call, None),
+                        arguments_summary,
+                        CapabilityLifecycleState::Rejected,
+                        Some(e.to_string()),
+                        logs,
+                    ),
+                    None,
                 );
             }
         };
@@ -409,25 +625,31 @@ impl ExecutionPlatform {
                     crate::common::json_util::truncate_head_tail(&result.output.to_string(), 1200);
                 logs.push(format!("OK {capability_id}: {truncated}"));
                 let state = accepted_state(&capability_id);
-                record(
-                    capability_id,
-                    Some(result.capability_name),
-                    arguments_summary,
-                    state,
-                    None,
-                    logs,
+                (
+                    record(
+                        capability_id,
+                        Some(result.capability_name),
+                        arguments_summary,
+                        state,
+                        None,
+                        logs,
+                    ),
+                    Some(result.output),
                 )
             }
             Err(e) => {
                 logs.push(format!("FAIL {capability_id}: {e}"));
                 let state = classify_error(&e);
-                record(
-                    capability_id,
-                    capability_name(&call, None),
-                    arguments_summary,
-                    state,
-                    Some(e.to_string()),
-                    logs,
+                (
+                    record(
+                        capability_id,
+                        capability_name(&call, None),
+                        arguments_summary,
+                        state,
+                        Some(e.to_string()),
+                        logs,
+                    ),
+                    None,
                 )
             }
         }
@@ -524,6 +746,9 @@ impl ExecutionPlatform {
         self.pool.set_execution(turn_id, output).await;
         if let Err(e) = self.pool.send_execution_done(turn_id).await {
             tracing::warn!("execution_platform: send_execution_done failed: {e}");
+        }
+        if let Err(e) = self.pool.send_trigger(turn_id, "execution_complete").await {
+            tracing::warn!("execution_platform: send_trigger execution_complete failed: {e}");
         }
         self.pool
             .publish_event("execution_complete", turn_id.to_string());
@@ -848,6 +1073,244 @@ mod tests {
         assert_eq!(parse_lifecycle("sleeping"), SubagentLifecycle::Sleeping);
         assert_eq!(parse_lifecycle("tombstoned"), SubagentLifecycle::Tombstoned);
         assert_eq!(parse_lifecycle("unknown"), SubagentLifecycle::Idle);
+    }
+
+    #[tokio::test]
+    async fn drain_execute_batch_merges_queued_executes_in_order() {
+        let (tx, rx) = mpsc::channel(8);
+        let mut platform = ExecutionPlatform::new(
+            rx,
+            {
+                let (pool, _) = AgentPool::new();
+                Arc::new(pool)
+            },
+            Arc::new(NoopProvider),
+            crate::data::ModelRow {
+                id: "m1".into(),
+                name: "test".into(),
+                provider: "p".into(),
+                api_url: "u".into(),
+                api_type: "openai".into(),
+                api_protocol: "openai-v1".into(),
+                api_key: None,
+                model_id: "model-x".into(),
+                config: None,
+            },
+            SecretString::from("x".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        for turn in ["t1", "t2", "t3"] {
+            tx.send(AgentMessage::Execute {
+                turn_id: turn.to_string(),
+            })
+            .await
+            .unwrap();
+        }
+        tx.send(AgentMessage::Cancel {
+            turn_id: "ignored".into(),
+        })
+        .await
+        .unwrap();
+
+        let batch = platform.drain_execute_batch("t0".into());
+        assert_eq!(batch, vec!["t0", "t1", "t2", "t3"]);
+    }
+
+    fn execution_turn_context(
+        id: &str,
+        user: &str,
+        think: &str,
+    ) -> crate::agent::communication::TurnContext {
+        crate::agent::communication::TurnContext {
+            turn_id: id.into(),
+            thinking: crate::agent::communication::ThinkingOutput {
+                decision: crate::agent::communication::ThinkDecision::Execute,
+                goal: format!("goal {id}"),
+                constraints: vec![],
+                message: think.into(),
+            },
+            execution: None,
+            insight: None,
+            memory: None,
+            status: crate::agent::communication::TurnStatus::Executing,
+            user_message: user.into(),
+            input_kind: "user".into(),
+        }
+    }
+
+    fn execution_message_platform() -> ExecutionPlatform {
+        ExecutionPlatform::new(
+            mpsc::channel(1).1,
+            {
+                let (pool, _) = AgentPool::new();
+                Arc::new(pool)
+            },
+            Arc::new(NoopProvider),
+            crate::data::ModelRow {
+                id: "m1".into(),
+                name: "test".into(),
+                provider: "p".into(),
+                api_url: "u".into(),
+                api_type: "openai".into(),
+                api_protocol: "openai-v1".into(),
+                api_key: None,
+                model_id: "model-x".into(),
+                config: None,
+            },
+            SecretString::from("x".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn execution_messages_single_uses_user_assistant_and_system_instruction() {
+        let platform = execution_message_platform();
+        let ctx = execution_turn_context("t1", "原始用户输入ABC", "执行意图");
+        let messages = platform.build_execution_messages(&[ctx], "BASE_PROMPT");
+
+        assert_eq!(messages.len(), 4);
+        assert!(matches!(
+            &messages[0],
+            ChatMessage::System {
+                kind: SystemKind::Primary,
+                ..
+            }
+        ));
+        assert!(matches!(&messages[1], ChatMessage::User { .. }));
+        assert!(matches!(&messages[2], ChatMessage::Assistant { .. }));
+        assert!(matches!(
+            &messages[3],
+            ChatMessage::System {
+                kind: SystemKind::Primary,
+                ..
+            }
+        ));
+        match &messages[0] {
+            ChatMessage::System { text, .. } => {
+                assert!(text.contains("BASE_PROMPT"));
+                assert!(text.contains("## Thinking Input"));
+                assert!(
+                    !text.contains("原始用户输入ABC"),
+                    "user input moved to User role"
+                );
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_messages_batch_has_n_contiguous_pairs() {
+        let platform = execution_message_platform();
+        let contexts = vec![
+            execution_turn_context("t1", "第一个任务", "执行意图 1"),
+            execution_turn_context("t2", "第二个任务", "执行意图 2"),
+            execution_turn_context("t3", "第三个任务", "执行意图 3"),
+        ];
+        let messages = platform.build_execution_messages(&contexts, "BASE_PROMPT");
+
+        // System(base) + N*(User+Assistant) + System(instruction)
+        assert_eq!(messages.len(), 1 + contexts.len() * 2 + 1);
+        for (i, ctx) in contexts.iter().enumerate() {
+            assert!(matches!(&messages[1 + i * 2], ChatMessage::User { .. }));
+            assert!(matches!(
+                &messages[2 + i * 2],
+                ChatMessage::Assistant { .. }
+            ));
+            match &messages[1 + i * 2] {
+                ChatMessage::User { text } => assert_eq!(text, &ctx.user_message),
+                _ => panic!(),
+            }
+        }
+        match &messages[0] {
+            ChatMessage::System { text, .. } => {
+                assert!(!text.contains("## Thinking Input"));
+            }
+            _ => panic!(),
+        }
+        assert!(matches!(
+            messages.last(),
+            Some(ChatMessage::System {
+                kind: SystemKind::Primary,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn full_capability_registry_lists_base_and_composite_for_subagent_design() {
+        let mut registry = Registry::new();
+        registry.base_capabilities.insert(
+            "shell.exec".to_string(),
+            crate::data::duckdb::loader::BaseCapabilityRow {
+                id: "shell.exec".to_string(),
+                name: "Execute Shell".to_string(),
+                cap_type: "function".to_string(),
+                description: "Run a shell command in the sandbox".to_string(),
+                schema_in: serde_json::json!({}),
+                schema_out: serde_json::json!({}),
+                executor: "builtin:shell.exec".to_string(),
+                version: "1.0.0".to_string(),
+                enabled: true,
+                tombstoned_at: None,
+                metadata: None,
+            },
+        );
+        registry.composite_capabilities.insert(
+            "composite.probe".to_string(),
+            crate::data::duckdb::loader::CompositeCapabilityRow {
+                id: "composite.probe".to_string(),
+                name: "Probe Composite".to_string(),
+                description: "A composite example".to_string(),
+                schema_in: Some(serde_json::json!({})),
+                schema_out: Some(serde_json::json!({})),
+                executor: None,
+                dag: serde_json::json!([]),
+                version: "1.0.0".to_string(),
+                enabled: true,
+                tombstoned_at: None,
+                metadata: None,
+            },
+        );
+        let platform = ExecutionPlatform::new(
+            mpsc::channel(1).1,
+            {
+                let (pool, _) = AgentPool::new();
+                Arc::new(pool)
+            },
+            Arc::new(NoopProvider),
+            crate::data::ModelRow {
+                id: "m1".into(),
+                name: "test".into(),
+                provider: "p".into(),
+                api_url: "u".into(),
+                api_type: "openai".into(),
+                api_protocol: "openai-v1".into(),
+                api_key: None,
+                model_id: "model-x".into(),
+                config: None,
+            },
+            SecretString::from("x".to_string()),
+            None,
+            Some(registry),
+            None,
+            None,
+            None,
+        );
+
+        let section = platform.full_capability_registry_section();
+        assert!(section.contains("Full Capability Registry"));
+        assert!(section.contains("Reference only"));
+        assert!(section.contains("`shell.exec`"));
+        assert!(section.contains("Run a shell command in the sandbox"));
+        assert!(section.contains("`composite.probe`"));
     }
 
     #[tokio::test]

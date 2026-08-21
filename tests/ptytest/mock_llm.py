@@ -28,16 +28,20 @@ from http.client import HTTPConnection, HTTPSConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-MODE_MARKERS = {
-    "unni": "Mode: UNNI",
-    "keep": "Mode: KEEP",
-    "loop": "Mode: LOOP",
-}
+MODE_MARKERS = [
+    ("unni", "Mode: UNNI"),
+    ("keep", "Mode: KEEP"),
+    ("loop", "Mode: LOOP"),
+    ("unni", "Current mode: UNNI"),
+    ("keep", "Current mode: KEEP"),
+    ("loop", "Current mode: LOOP"),
+]
 
 # 洞察中台现在也走流式请求，不能只靠 stream 标志区分 thinking/platform。
 PLATFORM_MARKERS = (
     "You are the result checker",
     "You are the Execution Platform",
+    "You are the Insight Platform",
     "你是注意力记忆 agent",
 )
 
@@ -205,10 +209,16 @@ def classify(messages, stream):
         m.get("content", "") or "" for m in messages if isinstance(m, dict)
     )
     mode = "unknown"
-    for name, marker in MODE_MARKERS.items():
+    for name, marker in MODE_MARKERS:
         if marker in text:
             mode = name
             break
+    # v0.3.1 双脑模式：Think/Say 请求均为非流式，但按系统提示词区分。
+    # 引擎提示词已收敛为英文 Input/Output 引导。
+    if "You are the Think Engine" in text:
+        return "think", mode
+    if "You are the Say Engine" in text:
+        return "say", mode
     if any(marker in text for marker in PLATFORM_MARKERS):
         return "platform", mode
     if not stream:

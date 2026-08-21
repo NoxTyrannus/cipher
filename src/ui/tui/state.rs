@@ -50,10 +50,6 @@ pub struct TuiState {
     pub status_line: StatusLineState,
 
     pub scroll_offset: usize,
-
-    /// 跟随模式（UNNI follow）：协同节点完成后的 pending context（turn_id, summary），
-    /// 等用户下次输入时合并进完整上文。
-    pub pending_context: Option<(String, String)>,
 }
 
 impl TuiState {
@@ -68,7 +64,6 @@ impl TuiState {
             config_panel: ConfigPanel::new(),
             status_line: StatusLineState::new(),
             scroll_offset: 0,
-            pending_context: None,
         }
     }
 
@@ -228,17 +223,6 @@ impl TuiState {
 
     pub fn take_input(&mut self) -> String {
         std::mem::take(&mut self.input)
-    }
-
-    /// 跟随模式：暂存协同节点完成后的上下文摘要。
-    pub fn stash_pending_context(&mut self, turn_id: &str, summary: &str) {
-        tracing::info!("tui_state: stash pending context for thought_id={turn_id} (follow mode)");
-        self.pending_context = Some((turn_id.to_string(), summary.to_string()));
-    }
-
-    /// 取走 pending context（用户下次输入时合并）。若没有则返回 None。
-    pub fn take_pending_context(&mut self) -> Option<(String, String)> {
-        self.pending_context.take()
     }
 }
 

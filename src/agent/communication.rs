@@ -37,8 +37,6 @@ pub struct TurnContext {
     pub user_message: String,
 
     pub input_kind: String,
-
-    pub say_published: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -159,7 +157,6 @@ mod tests {
             status: TurnStatus::Executing,
             user_message: String::new(),
             input_kind: "user".into(),
-            say_published: false,
         };
         assert_eq!(ctx.status, TurnStatus::Executing);
         assert!(ctx.execution.is_none());

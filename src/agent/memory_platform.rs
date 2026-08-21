@@ -95,6 +95,8 @@ impl MemoryPlatform {
     pub fn spawn(mut self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             tracing::info!("memory_platform: started, polling rx");
+            let heartbeat =
+                AgentPool::spawn_core_heartbeat(&self.pool, "memory-platform", "memory-platform");
 
             let mut cognitive_count: u64 = 0;
 
@@ -109,6 +111,12 @@ impl MemoryPlatform {
                         self.pool
                             .update_platform_status(|s| s.memory_active = Some(turn_id.clone()))
                             .await;
+                        self.pool
+                            .set_core_agent_status(
+                                "memory-platform",
+                                crate::agent::agent_pool::registry::AgentStatus::Running,
+                            )
+                            .await;
 
                         cognitive_count += 1;
                         if cognitive_count >= 29 {
@@ -122,6 +130,12 @@ impl MemoryPlatform {
                             .await;
                         self.handle_memory(&turn_id).await;
                         self.pool
+                            .set_core_agent_status(
+                                "memory-platform",
+                                crate::agent::agent_pool::registry::AgentStatus::Idle,
+                            )
+                            .await;
+                        self.pool
                             .update_platform_status(|s| s.memory_active = None)
                             .await;
                     }
@@ -133,6 +147,7 @@ impl MemoryPlatform {
                 self.pool.snapshot_detailed().await;
             }
 
+            heartbeat.abort();
             tracing::info!("memory_platform: rx closed, shutting down");
         })
     }
@@ -187,6 +202,7 @@ impl MemoryPlatform {
         let attention_prompt = build_attention_prompt(
             &base_prompt,
             &ctx.thinking.goal,
+            &ctx.thinking.message,
             insight,
             execution,
             &existing_attention,
@@ -213,6 +229,7 @@ impl MemoryPlatform {
             CapabilityLoopRequest {
                 actor_id: "attention-agent".to_string(),
                 system_prompt,
+                user_input: Some(ctx.user_message.clone()),
                 user_prompt: format!(
                     "提取并维护注意力记忆。当前轮 thought_id = {turn_id}，作为 source_refs 证据索引。开始执行。"
                 ),
@@ -680,6 +697,7 @@ fn parse_memory_agent_output(content: &str) -> MemoryAgentOutput {
 fn build_attention_prompt(
     base_prompt: &str,
     goal: &str,
+    think: &str,
     insight: &InsightOutput,
     execution: Option<&ExecutionOutput>,
     existing_attention: &str,
@@ -709,9 +727,10 @@ fn build_attention_prompt(
         None => "No execution data available.".to_string(),
     };
 
+    let think_summary = crate::common::json_util::truncate_head_tail(think, 2000);
     format!(
-        "{}\n\n## Goal\n{}\n\n## Insight Analysis\n{}\n\n## Execution Results\n{}\n\n## Existing Attention\n{}",
-        base_prompt, goal, insight_summary, execution_summary, existing_attention,
+        "{}\n\n## Goal\n{}\n\n## Think\n{}\n\n## Insight Analysis\n{}\n\n## Execution Results\n{}\n\n## Existing Attention\n{}",
+        base_prompt, goal, think_summary, insight_summary, execution_summary, existing_attention,
     )
 }
 
@@ -773,6 +792,22 @@ mod tests {
             },
             usage_observations: vec![],
         }
+    }
+
+    #[test]
+    fn attention_prompt_includes_think_section_for_judgement() {
+        let prompt = build_attention_prompt(
+            "BASE",
+            "goal text",
+            "think 中发现用户偏好暗色主题",
+            &make_insight_output(),
+            None,
+            "existing attention",
+        );
+        assert!(prompt.contains("## Goal"));
+        assert!(prompt.contains("## Think"));
+        assert!(prompt.contains("think 中发现用户偏好暗色主题"));
+        assert!(prompt.contains("existing attention"));
     }
 
     #[test]

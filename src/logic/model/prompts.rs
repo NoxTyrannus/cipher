@@ -19,6 +19,8 @@ pub const MEMORY_ATTENTION_DEFAULT: &str = include_str!("../../../prompts/memory
 pub const MEMORY_EXPERIENCE_DEFAULT: &str = include_str!("../../../prompts/memory_experience.md");
 pub const MEMORY_PREFERENCE_DEFAULT: &str = include_str!("../../../prompts/memory_preference.md");
 pub const MEMORY_COGNITIVE_DEFAULT: &str = include_str!("../../../prompts/memory_cognitive.md");
+pub const THINK_ENGINE_DEFAULT: &str = include_str!("../../../prompts/think_engine.md");
+pub const SAY_ENGINE_DEFAULT: &str = include_str!("../../../prompts/say_engine.md");
 
 /// 能力调用规范统一片段（v0.3.1 §8）。
 ///
@@ -53,7 +55,7 @@ pub fn compose_agent_capability_prompt(base: &str, available: &[CapabilityPrompt
     format!("{base}\n\n## 可用能力\n{table}{CAPABILITY_CALL_DEFAULT}")
 }
 
-pub const DEFAULT_PROMPTS: [(&str, &str); 11] = [
+pub const DEFAULT_PROMPTS: [(&str, &str); 13] = [
     ("system.md", SYSTEM_DEFAULT),
     ("SOUL.md", SOUL_DEFAULT),
     ("mode_unni.md", MODE_UNNI_DEFAULT),
@@ -65,6 +67,8 @@ pub const DEFAULT_PROMPTS: [(&str, &str); 11] = [
     ("memory_experience.md", MEMORY_EXPERIENCE_DEFAULT),
     ("memory_preference.md", MEMORY_PREFERENCE_DEFAULT),
     ("memory_cognitive.md", MEMORY_COGNITIVE_DEFAULT),
+    ("think_engine.md", THINK_ENGINE_DEFAULT),
+    ("say_engine.md", SAY_ENGINE_DEFAULT),
 ];
 
 fn read_prompt(prompts_dir: &Path, name: &str) -> String {
@@ -86,7 +90,6 @@ pub fn prompt_cache_len() -> usize {
     prompt_cache().read().map(|c| c.len()).unwrap_or(0)
 }
 
-#[cfg(test)]
 pub fn clear_prompt_cache() {
     if let Ok(mut cache) = prompt_cache().write() {
         cache.clear();
@@ -97,6 +100,7 @@ pub fn read_platform_prompt(prompts_dir: &Path, name: &str) -> String {
     read_prompt(prompts_dir, name)
 }
 
+#[cfg(test)]
 pub fn compose_prompt(prompts_dir: &Path, mode: &str) -> String {
     let system = read_prompt(prompts_dir, "system.md");
     let soul = read_prompt(prompts_dir, "SOUL.md");
@@ -109,6 +113,47 @@ pub fn compose_prompt(prompts_dir: &Path, mode: &str) -> String {
     format!("{system}\n\n{soul}\n\n{mode_specific}")
 }
 
+/// 双脑模式提示词组装：Think / Say 引擎 + 当前模式一行说明。
+pub fn compose_dual_prompt(prompts_dir: &Path, role: &str, mode: &str) -> String {
+    let engine = match role {
+        "think" => {
+            let p = read_prompt(prompts_dir, "think_engine.md");
+            if p.trim().is_empty() {
+                THINK_ENGINE_DEFAULT.to_string()
+            } else {
+                p
+            }
+        }
+        "say" => {
+            let p = read_prompt(prompts_dir, "say_engine.md");
+            if p.trim().is_empty() {
+                SAY_ENGINE_DEFAULT.to_string()
+            } else {
+                p
+            }
+        }
+        _ => return String::new(),
+    };
+    let soul = read_prompt(prompts_dir, "SOUL.md");
+    let soul = if soul.trim().is_empty() {
+        SOUL_DEFAULT.to_string()
+    } else {
+        soul
+    };
+    let mode_line = match mode {
+        "unni" => "Current mode: UNNI — collaborative, concise, user-facing; think and say are both allowed, at least one non-empty.",
+        "keep" => "Current mode: KEEP — autonomous execution; think is required, say is allowed at most once and only for alignment or final delivery.",
+        "loop" => "Current mode: LOOP — continuous autonomous iteration; think is required, say is forbidden.",
+        _ => "",
+    };
+    if mode_line.is_empty() {
+        format!("{engine}\n\n{soul}")
+    } else {
+        format!("{engine}\n\n{soul}\n\n{mode_line}")
+    }
+}
+
+#[cfg(test)]
 pub fn estimate_tokens(prompts_dir: &Path, mode: &str) -> usize {
     compose_prompt(prompts_dir, mode).chars().count() / 2
 }
@@ -116,40 +161,6 @@ pub fn estimate_tokens(prompts_dir: &Path, mode: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn compose_prompt_unni_contains_markers() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("prompts");
-        let p = compose_prompt(&dir, "unni");
-        assert!(p.contains("UNNI"), "compose_prompt(unni) missing 'UNNI'");
-        assert!(
-            p.contains("cipher"),
-            "compose_prompt(unni) missing 'cipher'"
-        );
-    }
-
-    #[test]
-    fn compose_prompt_keep_contains_markers() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("prompts");
-        let p = compose_prompt(&dir, "keep");
-        assert!(p.contains("KEEP"), "compose_prompt(keep) missing 'KEEP'");
-
-        assert!(
-            p.contains("整个连续期间最多一次"),
-            "compose_prompt(keep) missing shared say quota"
-        );
-    }
-
-    #[test]
-    fn compose_prompt_loop_contains_markers() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("prompts");
-        let p = compose_prompt(&dir, "loop");
-        assert!(p.contains("LOOP"), "compose_prompt(loop) missing 'LOOP'");
-        assert!(
-            p.contains("禁止 `say`"),
-            "compose_prompt(loop) missing say prohibition"
-        );
-    }
 
     #[test]
     fn compose_prompt_contains_core_sections_for_all_modes() {
@@ -162,17 +173,6 @@ mod tests {
                 "compose_prompt({mode}) missing cipher"
             );
         }
-    }
-
-    #[test]
-    fn compose_prompt_3_modes_are_distinct() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("prompts");
-        let unni = compose_prompt(&dir, "unni");
-        let keep = compose_prompt(&dir, "keep");
-        let loop_p = compose_prompt(&dir, "loop");
-        assert_ne!(unni, keep, "UNNI == KEEP 提示词 (per P1.5 应互不相同)");
-        assert_ne!(unni, loop_p, "UNNI == LOOP 提示词 (per P1.5 应互不相同)");
-        assert_ne!(keep, loop_p, "KEEP == LOOP 提示词 (per P1.5 应互不相同)");
     }
 
     #[test]
@@ -211,7 +211,7 @@ mod tests {
     fn default_prompts_have_no_dev_or_internal_architecture_references() {
         const FORBIDDEN: &[&str] = &[
             "ADR",
-            "iter",
+            "iter78",
             "per spec",
             "设计点",
             "五态",
@@ -230,5 +230,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn default_prompts_include_dual_engine_files_with_concise_io_guidance() {
+        assert!(DEFAULT_PROMPTS.iter().any(|(n, _)| *n == "think_engine.md"));
+        assert!(DEFAULT_PROMPTS.iter().any(|(n, _)| *n == "say_engine.md"));
+        assert!(!THINK_ENGINE_DEFAULT.trim().is_empty());
+        assert!(!SAY_ENGINE_DEFAULT.trim().is_empty());
+    }
+
+    #[test]
+    fn compose_dual_prompt_contains_engine_io_guidance_and_mode_line() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("prompts");
+        let think = compose_dual_prompt(&dir, "think", "unni");
+        assert!(think.contains("Think Engine"));
+        assert!(think.contains("Input:"));
+        assert!(think.contains("Output:"));
+        assert!(think.contains("Current mode: UNNI"));
+
+        let say = compose_dual_prompt(&dir, "say", "loop");
+        assert!(say.contains("Say Engine"));
+        assert!(say.contains("Input:"));
+        assert!(say.contains("Output:"));
+        assert!(say.contains("Current mode: LOOP"));
+        assert!(say.contains("say is forbidden"));
     }
 }

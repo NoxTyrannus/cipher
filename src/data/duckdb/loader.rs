@@ -692,6 +692,18 @@ pub fn write_usage_observation(
     Ok(())
 }
 
+pub fn count_models(conn: &duckdb::Connection) -> Result<usize, AgentError> {
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM model", [], |row| row.get(0))
+        .map_err(|error| AgentError::Bootstrap(format!("count_models: {error}")))?;
+    Ok(count as usize)
+}
+
+pub fn delete_model(conn: &duckdb::Connection, model_id: &str) -> Result<usize, AgentError> {
+    conn.execute("DELETE FROM model WHERE id = ?", duckdb::params![model_id])
+        .map_err(|error| AgentError::Bootstrap(format!("delete_model {model_id}: {error}")))
+}
+
 pub fn insert_model(conn: &duckdb::Connection, row: &ModelRow) -> Result<(), AgentError> {
     let config = row.config.as_ref().map(serde_json::Value::to_string);
     conn.execute(
@@ -1034,5 +1046,31 @@ mod tests {
         assert_eq!(base.version, "1.2.3");
         assert!(base.enabled);
         assert_eq!(registry.usage_methods["usage"].capability_id, "base");
+    }
+
+    #[test]
+    fn count_and_delete_model_rows() {
+        let connection = duckdb::Connection::open_in_memory().expect("open DuckDB");
+        create_all_tables(&connection).expect("create schema");
+        assert_eq!(count_models(&connection).unwrap(), 0);
+
+        let row = ModelRow {
+            id: "m1".to_string(),
+            name: "one".to_string(),
+            provider: "test".to_string(),
+            api_url: "http://x".to_string(),
+            api_type: "OpenAI".to_string(),
+            api_protocol: "openai-v1".to_string(),
+            api_key: Some("sk".to_string()),
+            model_id: "one".to_string(),
+            config: None,
+        };
+        insert_model(&connection, &row).unwrap();
+        assert_eq!(count_models(&connection).unwrap(), 1);
+
+        let removed = delete_model(&connection, "m1").unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(count_models(&connection).unwrap(), 0);
+        assert_eq!(delete_model(&connection, "missing").unwrap(), 0);
     }
 }

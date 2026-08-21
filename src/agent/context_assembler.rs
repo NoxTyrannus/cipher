@@ -13,6 +13,7 @@ use crate::logic::model::message::{ChatMessage, SystemKind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct ContextAssembler {
     config: ContextConfig,
     conversations_dir: PathBuf,
@@ -51,7 +52,6 @@ impl ContextAssembler {
             shared_trivium: None,
         }
     }
-
     pub fn set_agent_pool(&mut self, pool: Arc<AgentPool>) {
         self.agent_pool = Some(pool);
     }
@@ -114,6 +114,7 @@ impl ContextAssembler {
         }
     }
 
+    #[cfg(test)]
     pub async fn build_messages(
         &self,
         user_input: &str,
@@ -185,6 +186,74 @@ impl ContextAssembler {
         messages.extend(experience_msgs);
         messages.extend(preference_msgs);
 
+        messages.push(ChatMessage::User {
+            text: user_input.to_string(),
+        });
+
+        (system_prompt, messages)
+    }
+
+    /// 双脑模式专用：按 role（think/say）组装 system prompt 和 messages。
+    pub async fn build_dual_messages(
+        &self,
+        role: &str,
+        user_input: &str,
+        mode_hint: &str,
+    ) -> (String, Vec<ChatMessage>) {
+        let window = self.config.context_window;
+
+        let system_prompt =
+            crate::logic::model::prompts::compose_dual_prompt(&self.prompts_dir, role, mode_hint);
+        let system_tokens = estimate_tokens(&system_prompt);
+        let user_tokens = estimate_tokens(user_input);
+
+        let cognitive_quota = pct_of(window, self.config.cognitive_quota_pct);
+        let attention_quota = pct_of(window, self.config.attention_quota_pct);
+        let experience_quota = pct_of(window, self.config.experience_quota_pct);
+        let preference_quota = pct_of(window, self.config.preference_quota_pct);
+
+        use crate::agent::memory::memory_version::MemoryVersionKind;
+        let cognitive_msgs = if self.memory_kind_active(MemoryVersionKind::Cognitive) {
+            self.read_trivium_memories("cognitive", cognitive_quota)
+                .await
+        } else {
+            Vec::new()
+        };
+        let experience_msgs = self
+            .read_trivium_memories("experience", experience_quota)
+            .await;
+        let preference_msgs = self
+            .read_trivium_memories("preference", preference_quota)
+            .await;
+
+        let cognitive_tokens = total_tokens(&cognitive_msgs);
+        let experience_tokens = total_tokens(&experience_msgs);
+        let preference_tokens = total_tokens(&preference_msgs);
+
+        let fixed_tokens =
+            system_tokens + cognitive_tokens + experience_tokens + preference_tokens + user_tokens;
+        let dynamic_budget = window.saturating_sub(fixed_tokens);
+        let rag_reserve = pct_of(dynamic_budget, self.config.rag_reserve_pct);
+        let history_budget = dynamic_budget.saturating_sub(rag_reserve);
+
+        let (recent_messages, history_truncated) = self.read_conversation_history(history_budget);
+
+        let attention_msgs =
+            if history_truncated && self.memory_kind_active(MemoryVersionKind::Attention) {
+                self.read_trivium_memories("attention", attention_quota)
+                    .await
+            } else {
+                Vec::new()
+            };
+
+        let mut messages = Vec::new();
+        messages.extend(cognitive_msgs);
+        messages.extend(attention_msgs);
+        for msg in &recent_messages {
+            messages.push(chat_message_of(msg));
+        }
+        messages.extend(experience_msgs);
+        messages.extend(preference_msgs);
         messages.push(ChatMessage::User {
             text: user_input.to_string(),
         });
@@ -366,22 +435,13 @@ impl ContextAssembler {
                     continue;
                 }
 
-                let has_say = output.say.as_ref().is_some_and(|s| !s.is_empty());
-                if !has_say {
-                    continue;
-                }
-
+                // 双脑模式：A 方案，think-only 也保留。
                 messages.push(parsed_thinking_input(context.input));
-
-                let mut parts: Vec<String> = Vec::new();
                 if let Some(think) = output.think.filter(|think| !think.is_empty()) {
-                    parts.push(think);
+                    messages.push(parsed_message("assistant", think));
                 }
                 if let Some(say) = output.say.filter(|say| !say.is_empty()) {
-                    parts.push(say);
-                }
-                if !parts.is_empty() {
-                    messages.push(parsed_message("assistant", parts.join("\n")));
+                    messages.push(parsed_message("assistant", say));
                 }
             }
         }
@@ -695,22 +755,27 @@ mod tests {
         assert!(messages
             .iter()
             .any(|message| message_text(message) == "durable earlier question"));
-        let assistant_history = messages
+        let assistant_messages: Vec<_> = messages
             .iter()
-            .find(|message| matches!(message, ChatMessage::Assistant { .. }))
-            .expect("completed Thought should produce assistant history");
-        let flat_history = message_text(assistant_history);
+            .filter(|message| matches!(message, ChatMessage::Assistant { .. }))
+            .collect();
         assert!(
-            flat_history.contains("durable earlier work"),
-            "平铺后历史应含 think 文本: {flat_history}"
+            assistant_messages
+                .iter()
+                .any(|m| message_text(m) == "durable earlier work"),
+            "历史应含 think 普通文本"
         );
         assert!(
-            flat_history.contains("durable earlier answer"),
-            "平铺后历史应含 say 文本: {flat_history}"
+            assistant_messages
+                .iter()
+                .any(|m| message_text(m) == "durable earlier answer"),
+            "历史应含 say 普通文本"
         );
         assert!(
-            !flat_history.contains("{\"think\""),
-            "平铺后历史不应是 JSON 外壳: {flat_history}"
+            !assistant_messages
+                .iter()
+                .any(|m| message_text(m).contains("think:{")),
+            "历史不应包含 think:{{ 标记"
         );
         assert!(!messages
             .iter()
@@ -727,6 +792,42 @@ mod tests {
             completed.output.unwrap().terminal_state,
             ThinkingTerminalState::Completed
         );
+    }
+
+    #[tokio::test]
+    async fn dual_scheme_keeps_think_only_history_without_markers() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let thought_store = Arc::new(ThoughtStore::open(&data_dir).unwrap());
+
+        let mut completed = ThoughtContext::new_at(
+            ThoughtId::parse("ca761236-ed42-11ce-bacd-00aa0057b223").unwrap(),
+            UtcTimestamp::parse("2026-07-15T12:36:00.000000000Z").unwrap(),
+            ThinkingInput::User {
+                text: "loop turn".to_string(),
+            },
+        );
+        thought_store.persist_input(&completed).unwrap();
+        completed.set_output(ThinkingOutput::completed(
+            Some("only think text".to_string()),
+            None,
+            None,
+        ));
+        thought_store.persist_output(&completed).unwrap();
+
+        let mut assembler = ContextAssembler::new(ContextConfig::default(), &data_dir, None);
+        assembler.set_thought_store(Arc::clone(&thought_store));
+
+        let (_system_prompt, messages) = assembler.build_messages("next loop", "loop").await;
+
+        assert!(messages
+            .iter()
+            .any(|m| message_text(m) == "only think text"));
+        assert!(!messages.iter().any(|m| message_text(m).contains("think:{")));
+        assert!(matches!(
+            messages.last().unwrap(),
+            ChatMessage::User { text } if text == "next loop"
+        ));
     }
 
     #[tokio::test]

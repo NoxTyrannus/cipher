@@ -142,7 +142,6 @@ mod tests {
             status: TurnStatus::Executing,
             user_message: String::new(),
             input_kind: "user".into(),
-            say_published: false,
         }
     }
 

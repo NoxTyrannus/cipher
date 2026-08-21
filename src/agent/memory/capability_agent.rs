@@ -35,6 +35,9 @@ pub struct CapabilityLoopOutcome {
 pub struct CapabilityLoopRequest {
     pub actor_id: String,
     pub system_prompt: String,
+    /// 原始用户输入（role=user 注入，attention agent 使用；其他 actor 可空）。
+    pub user_input: Option<String>,
+    /// 平台指令（role=system，与主 system 自动合并）。
     pub user_prompt: String,
 }
 
@@ -60,15 +63,19 @@ pub async fn run_capability_loop(
         .and_then(|v| u32::try_from(v).ok())
         .unwrap_or(DEFAULT_MAX_TURNS);
 
-    let mut messages = vec![
-        ChatMessage::System {
-            text: req.system_prompt,
-            kind: SystemKind::Primary,
-        },
-        ChatMessage::User {
-            text: req.user_prompt,
-        },
-    ];
+    let mut messages = vec![ChatMessage::System {
+        text: req.system_prompt,
+        kind: SystemKind::Primary,
+    }];
+    if let Some(user_input) = req.user_input {
+        if !user_input.trim().is_empty() {
+            messages.push(ChatMessage::User { text: user_input });
+        }
+    }
+    messages.push(ChatMessage::System {
+        text: req.user_prompt,
+        kind: SystemKind::Primary,
+    });
 
     let mut calls = Vec::new();
     let mut logs = Vec::new();

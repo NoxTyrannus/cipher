@@ -1,6 +1,6 @@
 use super::config::Config;
 #[cfg(test)]
-use super::config::{ContextSection, ModeStyles};
+use super::config::{CollaborationSection, ContextSection, ModeStyles};
 use crate::common::AgentError;
 use std::path::Path;
 
@@ -36,6 +36,7 @@ mod tests {
             api_key: "sk-test".into(),
             data_dir: PathBuf::from("/tmp/data"),
             default_mode: "keep".into(),
+            collaboration: CollaborationSection::default(),
             mode_styles: ModeStyles::default(),
             default_model: None,
             context: ContextSection::default(),

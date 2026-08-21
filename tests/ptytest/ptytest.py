@@ -152,10 +152,14 @@ class Session:
         self.env = dict(os.environ)
         self.env["XDG_CONFIG_HOME"] = os.path.join(root, "config")
         self.env["XDG_DATA_HOME"] = os.path.join(root, "logs")
+        # v0.3.1 统一目录使用 ~/.cipher，测试隔离通过 HOME 重定向
+        self.env["HOME"] = os.path.join(root, "home")
+        os.makedirs(self.env["HOME"], exist_ok=True)
         self.env["RUST_LOG"] = "debug"
         if env_extra:
             self.env.update(env_extra)
-        self.log_path = os.path.join(root, "logs", "cipher", "cipher.log")
+        # v0.3.1 统一目录：日志写到 ~/.cipher/cipher.log
+        self.log_path = os.path.join(self.env["HOME"], ".cipher", "cipher.log")
         self.screen_path = os.path.join(root, "screen.raw")
         self.raw = b""
         self._raw_lock = threading.Lock()
@@ -253,6 +257,8 @@ class Session:
     def wait_startup(self, timeout=90.0):
         ok, log = self.wait_log(r"mode_init: ModeManager ready", timeout)
         if not ok:
+            print(f"WAIT_STARTUP_DEBUG path={self.log_path} exists={os.path.exists(self.log_path)}")
+            print("WAIT_STARTUP_DEBUG tail:", log[-800:].replace("\n", " | "))
             return False, log
         # 等第一帧渲染
         self.drain(1.5)
@@ -914,6 +920,7 @@ def v11_permanent_error_degrade(root):
 # ---------------------------------------------------------------------------
 
 def report_fail(name, reason, mock, sess, log):
+    print(f"REPORT_FAIL name={name} reason={reason} log_tail={log[-500:]!r}", flush=True)
     try:
         sess.quit()
     except Exception:

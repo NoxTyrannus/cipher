@@ -6,14 +6,29 @@ use async_trait::async_trait;
 pub struct LoopMode {
     iteration_count: u32,
     max_iterations: u32,
+    idle_rounds: u32,
+    max_idle_rounds: u32,
 }
 
 impl LoopMode {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            idle_rounds: 0,
+            max_idle_rounds: 3,
+            ..Self::default()
+        }
     }
     pub fn iteration_count(&self) -> u32 {
         self.iteration_count
+    }
+    pub fn note_noop(&mut self) {
+        self.idle_rounds += 1;
+    }
+    pub fn reset_idle(&mut self) {
+        self.idle_rounds = 0;
+    }
+    pub fn should_stop_idle(&self) -> bool {
+        self.idle_rounds >= self.max_idle_rounds
     }
 }
 
@@ -95,6 +110,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(m.iteration_count(), 2);
+    }
+
+    #[test]
+    fn loop_idle_convergence_stops_after_three_noops() {
+        let mut m = LoopMode::new();
+        assert!(!m.should_stop_idle());
+        m.note_noop();
+        m.note_noop();
+        assert!(!m.should_stop_idle());
+        m.note_noop();
+        assert!(m.should_stop_idle());
+        m.reset_idle();
+        assert!(!m.should_stop_idle());
     }
 
     #[tokio::test]

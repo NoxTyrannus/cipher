@@ -1,5 +1,5 @@
 use crate::data::duckdb::loader::ModelRow;
-use crate::startup::config::{CollaborationStyle, TriggerNode};
+use crate::startup::config::TriggerNode;
 use crossterm::event::KeyCode;
 use ratatui::layout::Rect;
 use ratatui::Frame;
@@ -23,22 +23,17 @@ const MENU_ITEMS: &[(&str, bool)] = &[
     ("Model + Provider", true),
     ("工作区管理", false),
     ("Agent 改名", true),
-    ("默认设置", false),
     ("协同模式风格 (Mode Style)", true),
-    ("上下文编辑", false),
 ];
 
-/// 协同模式风格子菜单项（与 /config CLI 的 manage_mode_styles 保持一致）。
-const MODE_STYLE_SUBMENU_LEN: usize = 5;
+/// 协作设置子菜单项（与 /config CLI 的 manage_mode_styles 保持一致）。
+const MODE_STYLE_SUBMENU_LEN: usize = 4;
 
 fn mode_style_options_len(target: usize) -> usize {
     match target {
-        0 => 2, // UNNI 协同方式
-        1 => 3, // UNNI 协同节点
-        2 => 1, // KEEP Token 预算（占位，暂不可交互）
-        3 => 1, // KEEP 时间预算（占位）
-        4 => 2, // LOOP 融合思考
-        _ => 1,
+        0 => 3, // 协同节点
+        1 => 2, // Mix 思考
+        _ => 0,
     }
 }
 
@@ -46,17 +41,11 @@ fn mode_style_options_len(target: usize) -> usize {
 fn mode_style_option(target: usize, cursor: usize) -> String {
     match target {
         0 => match cursor {
-            0 => CollaborationStyle::Autonomous.as_str().to_string(),
-            _ => CollaborationStyle::Follow.as_str().to_string(),
-        },
-        1 => match cursor {
             0 => TriggerNode::Execution.as_str().to_string(),
             1 => TriggerNode::Insight.as_str().to_string(),
             _ => TriggerNode::Memory.as_str().to_string(),
         },
-        2 => (100_000u64 + cursor as u64 * 50_000).to_string(),
-        3 => (300u64 + cursor as u64 * 300).to_string(),
-        4 => {
+        1 => {
             if cursor == 0 {
                 "off".to_string()
             } else {
@@ -90,17 +79,9 @@ pub struct AddModelForm {
 }
 
 #[derive(Debug, Clone)]
-pub struct QuickAddForm {
-    pub provider: String,
-    pub fields: Vec<FormField>,
-    pub field_cursor: usize,
-    pub submitted: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct ChangeKeyForm {
-    pub fields: Vec<FormField>,
-    pub field_cursor: usize,
+pub struct DeleteModelConfirm {
+    pub model_id: String,
+    pub model_name: String,
     pub submitted: bool,
 }
 
@@ -118,6 +99,13 @@ pub struct RenameAgentForm {
 }
 
 #[derive(Debug, Clone)]
+pub struct KeepBudgetInput {
+    pub target: usize,
+    pub input: String,
+    pub submitted: bool,
+}
+
+#[derive(Debug, Clone)]
 pub enum ConfigView {
     Menu,
 
@@ -129,29 +117,25 @@ pub enum ConfigView {
         cursor: usize,
     },
 
-    QuickAddSelectProvider {
-        providers: Vec<String>,
-        cursor: usize,
-    },
-
-    QuickAdd(QuickAddForm),
-
-    ChangeKey(ChangeKeyForm),
-
     SetDefault(SetDefaultSelect),
+
+    DeleteModelConfirm(DeleteModelConfirm),
 
     /// 协同模式风格：子菜单（UNNI 协同方式 / UNNI 协同节点 / KEEP 预算 / LOOP 融合思考）。
     ModeStyleSubMenu {
         cursor: usize,
     },
 
-    /// 选择器：统一承载"选中选项 → 提交"。
+    /// 选择器：统一承载"选中选项 → 提交"（仅协同方式/节点/LOOP Mix）。
     ModeStyleSelect {
-        /// 子菜单中的目标项索引（0=UNNI 协同方式, 1=UNNI 协同节点, 2=KEEP Token, 3=KEEP 时间, 4=LOOP 融合思考）。
+        /// 子菜单中的目标项索引（0=UNNI 协同方式, 1=UNNI 协同节点, 4=LOOP 融合思考）。
         target: usize,
         cursor: usize,
         submitted: bool,
     },
+
+    /// KEEP 预算数字输入表单（子菜单 target=2 token / target=3 时间）。
+    KeepBudgetInput(KeepBudgetInput),
 
     RenameAgent(RenameAgentForm),
 }
@@ -175,8 +159,6 @@ pub struct ConfigPanel {
 pub enum DbRequest {
     LoadModels,
 
-    LoadProviders,
-
     LoadDefaultCandidates,
 
     SubmitAddModel {
@@ -188,15 +170,8 @@ pub enum DbRequest {
         model_id: String,
     },
 
-    SubmitQuickAdd {
-        provider: String,
-        name: String,
+    DeleteModel {
         model_id: String,
-    },
-
-    SubmitChangeKey {
-        provider: String,
-        api_key: String,
     },
 
     SubmitSetDefault {
@@ -237,9 +212,6 @@ impl ConfigPanel {
     pub fn pending_db_request(&self) -> DbRequest {
         match &self.view {
             ConfigView::ModelList if self.models.is_empty() => DbRequest::LoadModels,
-            ConfigView::QuickAddSelectProvider { providers, .. } if providers.is_empty() => {
-                DbRequest::LoadProviders
-            }
             ConfigView::SetDefault(sel) if sel.candidates.is_empty() => {
                 DbRequest::LoadDefaultCandidates
             }
@@ -257,14 +229,8 @@ impl ConfigPanel {
                 name: form.fields[4].value.clone(),
                 model_id: form.fields[5].value.clone(),
             },
-            ConfigView::QuickAdd(form) if form.submitted => DbRequest::SubmitQuickAdd {
-                provider: form.provider.clone(),
-                name: form.fields[0].value.clone(),
-                model_id: form.fields[1].value.clone(),
-            },
-            ConfigView::ChangeKey(form) if form.submitted => DbRequest::SubmitChangeKey {
-                provider: form.fields[0].value.clone(),
-                api_key: form.fields[1].value.clone(),
+            ConfigView::DeleteModelConfirm(form) if form.submitted => DbRequest::DeleteModel {
+                model_id: form.model_id.clone(),
             },
             ConfigView::SetDefault(sel) if sel.submitted => {
                 let model_id = sel
@@ -285,6 +251,10 @@ impl ConfigPanel {
                     value,
                 }
             }
+            ConfigView::KeepBudgetInput(form) if form.submitted => DbRequest::SaveModeStyle {
+                target: form.target,
+                value: form.input.trim().to_string(),
+            },
             ConfigView::RenameAgent(form) if form.submitted => DbRequest::SubmitRenameAgent {
                 display_name: form.name.clone(),
             },
@@ -295,10 +265,10 @@ impl ConfigPanel {
     pub fn clear_db_request(&mut self) {
         match &mut self.view {
             ConfigView::AddModel(f) => f.submitted = false,
-            ConfigView::QuickAdd(f) => f.submitted = false,
-            ConfigView::ChangeKey(f) => f.submitted = false,
             ConfigView::SetDefault(s) => s.submitted = false,
+            ConfigView::DeleteModelConfirm(f) => f.submitted = false,
             ConfigView::ModeStyleSelect { submitted, .. } => *submitted = false,
+            ConfigView::KeepBudgetInput(form) => form.submitted = false,
             ConfigView::RenameAgent(f) => f.submitted = false,
             _ => {}
         }
@@ -327,44 +297,17 @@ impl ConfigPanel {
                 }
                 r
             }
-            ConfigView::QuickAddSelectProvider {
-                mut providers,
-                mut cursor,
-            } => {
-                let r = self.handle_provider_select_key(key, &mut providers, &mut cursor);
-                if matches!(self.view, ConfigView::Menu) {
-                    self.view = ConfigView::QuickAddSelectProvider { providers, cursor };
-                }
-                r
-            }
-            ConfigView::QuickAdd(mut form) => {
-                let r = self.handle_form_key(
-                    key,
-                    &mut form.fields,
-                    &mut form.field_cursor,
-                    &mut form.submitted,
-                );
-                if matches!(self.view, ConfigView::Menu) {
-                    self.view = ConfigView::QuickAdd(form);
-                }
-                r
-            }
-            ConfigView::ChangeKey(mut form) => {
-                let r = self.handle_form_key(
-                    key,
-                    &mut form.fields,
-                    &mut form.field_cursor,
-                    &mut form.submitted,
-                );
-                if matches!(self.view, ConfigView::Menu) {
-                    self.view = ConfigView::ChangeKey(form);
-                }
-                r
-            }
             ConfigView::SetDefault(mut sel) => {
                 let r = self.handle_set_default_key(key, &mut sel);
                 if matches!(self.view, ConfigView::Menu) {
                     self.view = ConfigView::SetDefault(sel);
+                }
+                r
+            }
+            ConfigView::DeleteModelConfirm(mut form) => {
+                let r = self.handle_delete_model_confirm_key(key, &mut form);
+                if matches!(self.view, ConfigView::Menu) {
+                    self.view = ConfigView::DeleteModelConfirm(form);
                 }
                 r
             }
@@ -381,7 +324,7 @@ impl ConfigPanel {
                 mut cursor,
                 mut submitted,
             } => {
-                let r = self.handle_mode_style_select_key(key, &mut cursor, &mut submitted);
+                let r = self.handle_mode_style_select_key(key, target, &mut cursor, &mut submitted);
 
                 if matches!(self.view, ConfigView::Menu) && self.expanded.is_some() {
                     self.view = ConfigView::ModeStyleSelect {
@@ -389,6 +332,14 @@ impl ConfigPanel {
                         cursor,
                         submitted,
                     };
+                }
+                r
+            }
+            ConfigView::KeepBudgetInput(mut form) => {
+                let r = self.handle_keep_budget_input_key(key, &mut form);
+
+                if matches!(self.view, ConfigView::Menu) {
+                    self.view = ConfigView::KeepBudgetInput(form);
                 }
                 r
             }
@@ -421,7 +372,7 @@ impl ConfigPanel {
                 let enabled = MENU_ITEMS[idx].1;
                 if enabled {
                     self.expanded = Some(idx);
-                    if idx == 4 {
+                    if idx == 3 {
                         self.view = ConfigView::ModeStyleSubMenu { cursor: 0 };
                     } else if idx == 2 {
                         self.view = ConfigView::RenameAgent(RenameAgentForm::default());
@@ -462,33 +413,26 @@ impl ConfigPanel {
                 self.view = ConfigView::AddModelSelectTemplate { cursor: 0 };
                 ActionResult::Navigate
             }
-            KeyCode::Char('q') => {
-                self.view = ConfigView::QuickAddSelectProvider {
-                    providers: Vec::new(),
-                    cursor: 0,
+            KeyCode::Char('x') => {
+                if self.models.len() <= 1 {
+                    self.message = Some((
+                        "至少保留一个模型，当前仅剩 1 个模型，不能删除".to_string(),
+                        true,
+                    ));
+                    self.view = ConfigView::ModelList;
+                    return ActionResult::Navigate;
+                }
+                let model = self.models.get(self.list_cursor);
+                let (model_id, model_name) = match model {
+                    Some(model) => (model.id.clone(), model.name.clone()),
+                    None => {
+                        self.message = Some(("没有可删除的模型".to_string(), true));
+                        return ActionResult::Navigate;
+                    }
                 };
-                ActionResult::Navigate
-            }
-            KeyCode::Char('k') => {
-                let default_provider = self
-                    .models
-                    .get(self.list_cursor)
-                    .map(|m| m.provider.clone())
-                    .unwrap_or_default();
-                self.view = ConfigView::ChangeKey(ChangeKeyForm {
-                    fields: vec![
-                        FormField {
-                            label: "provider",
-                            value: default_provider,
-                            is_secret: false,
-                        },
-                        FormField {
-                            label: "新 API key",
-                            value: String::new(),
-                            is_secret: true,
-                        },
-                    ],
-                    field_cursor: 0,
+                self.view = ConfigView::DeleteModelConfirm(DeleteModelConfirm {
+                    model_id,
+                    model_name,
                     submitted: false,
                 });
                 ActionResult::Navigate
@@ -617,57 +561,18 @@ impl ConfigPanel {
         }
     }
 
-    fn handle_provider_select_key(
+    fn handle_delete_model_confirm_key(
         &mut self,
         key: KeyCode,
-        providers: &mut [String],
-        cursor: &mut usize,
+        form: &mut DeleteModelConfirm,
     ) -> ActionResult {
         match key {
-            KeyCode::Up => {
-                if *cursor > 0 {
-                    *cursor -= 1;
-                }
+            KeyCode::Enter => {
+                form.submitted = true;
                 ActionResult::Navigate
             }
-            KeyCode::Down => {
-                if *cursor < providers.len().saturating_sub(1) {
-                    *cursor += 1;
-                }
-                ActionResult::Navigate
-            }
-            KeyCode::Left => {
+            KeyCode::Left | KeyCode::Esc => {
                 self.view = ConfigView::ModelList;
-                ActionResult::Navigate
-            }
-            KeyCode::Esc => ActionResult::Exit,
-            KeyCode::Right | KeyCode::Enter => {
-                if providers.is_empty() {
-                    self.message = Some((
-                        "无已配置 key 的 provider, 先 '新增 model' 配一个".into(),
-                        true,
-                    ));
-                    self.view = ConfigView::ModelList;
-                } else {
-                    let provider = providers[*cursor].clone();
-                    self.view = ConfigView::QuickAdd(QuickAddForm {
-                        provider,
-                        fields: vec![
-                            FormField {
-                                label: "模型显示名",
-                                value: String::new(),
-                                is_secret: false,
-                            },
-                            FormField {
-                                label: "model_id",
-                                value: String::new(),
-                                is_secret: false,
-                            },
-                        ],
-                        field_cursor: 0,
-                        submitted: false,
-                    });
-                }
                 ActionResult::Navigate
             }
             _ => ActionResult::Navigate,
@@ -723,11 +628,19 @@ impl ConfigPanel {
             KeyCode::Esc => ActionResult::Exit,
             KeyCode::Right | KeyCode::Enter => {
                 let target = *cursor;
-                self.view = ConfigView::ModeStyleSelect {
-                    target,
-                    cursor: 0,
-                    submitted: false,
-                };
+                if matches!(target, 2 | 3) {
+                    self.view = ConfigView::KeepBudgetInput(KeepBudgetInput {
+                        target,
+                        input: String::new(),
+                        submitted: false,
+                    });
+                } else {
+                    self.view = ConfigView::ModeStyleSelect {
+                        target,
+                        cursor: 0,
+                        submitted: false,
+                    };
+                }
                 ActionResult::Navigate
             }
             _ => ActionResult::Navigate,
@@ -737,6 +650,7 @@ impl ConfigPanel {
     fn handle_mode_style_select_key(
         &mut self,
         key: KeyCode,
+        target: usize,
         cursor: &mut usize,
         submitted: &mut bool,
     ) -> ActionResult {
@@ -748,7 +662,7 @@ impl ConfigPanel {
                 ActionResult::Navigate
             }
             KeyCode::Down => {
-                if *cursor < mode_style_options_len(self.view_target()) - 1 {
+                if *cursor < mode_style_options_len(target).saturating_sub(1) {
                     *cursor += 1;
                 }
                 ActionResult::Navigate
@@ -766,10 +680,41 @@ impl ConfigPanel {
         }
     }
 
-    fn view_target(&self) -> usize {
-        match &self.view {
-            ConfigView::ModeStyleSelect { target, .. } => *target,
-            _ => 0,
+    fn handle_keep_budget_input_key(
+        &mut self,
+        key: KeyCode,
+        form: &mut KeepBudgetInput,
+    ) -> ActionResult {
+        match key {
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                form.input.push(c);
+                ActionResult::Navigate
+            }
+            KeyCode::Backspace => {
+                form.input.pop();
+                ActionResult::Navigate
+            }
+            KeyCode::Left => {
+                self.view = ConfigView::ModeStyleSubMenu {
+                    cursor: form.target,
+                };
+                ActionResult::Navigate
+            }
+            KeyCode::Esc => {
+                self.view = ConfigView::ModeStyleSubMenu {
+                    cursor: form.target,
+                };
+                ActionResult::Navigate
+            }
+            KeyCode::Enter => {
+                if form.input.trim().is_empty() {
+                    self.message = Some(("请输入数字（0 = 无限）".into(), true));
+                } else {
+                    form.submitted = true;
+                }
+                ActionResult::Navigate
+            }
+            _ => ActionResult::Navigate,
         }
     }
 
@@ -806,17 +751,18 @@ impl ConfigPanel {
         match &self.view {
             ConfigView::Menu => "← 退出设置    ↑↓ 选择    → 进入    Esc 退出",
             ConfigView::ModelList => {
-                "← 返回上级    ↑↓ 选择    a 新增  q 快速  k 改Key  d 切默认    Esc 退出"
+                "← 返回上级    ↑↓ 选择    a 新增  x 删除  d 切默认    Esc 退出"
             }
             ConfigView::AddModelSelectTemplate { .. }
-            | ConfigView::QuickAddSelectProvider { .. }
             | ConfigView::SetDefault(_)
             | ConfigView::ModeStyleSubMenu { .. }
             | ConfigView::ModeStyleSelect { .. } => {
                 "← 返回上级    ↑↓ 选择    → 确认    Esc 退出设置"
             }
-            ConfigView::AddModel(_) | ConfigView::QuickAdd(_) | ConfigView::ChangeKey(_) => {
-                "← 取消        Tab 下一字段  Enter 确认    Esc 退出设置"
+            ConfigView::AddModel(_) => "← 取消        Tab 下一字段  Enter 确认    Esc 退出设置",
+            ConfigView::DeleteModelConfirm(_) => "Enter 确认删除  ←/Esc 取消",
+            ConfigView::KeepBudgetInput(_) => {
+                "← 返回上级    数字输入  Backspace 删除  Enter 确认  Esc 取消"
             }
             ConfigView::RenameAgent(_) => "← 取消    Enter 确认    Esc 退出设置",
         }
@@ -862,16 +808,10 @@ pub fn render(panel: &ConfigPanel, frame: &mut Frame, area: Rect) {
         ConfigView::AddModel(form) => {
             render_form(panel, frame, content_area, &form.fields, form.field_cursor);
         }
-        ConfigView::QuickAddSelectProvider { providers, cursor } => {
-            render_provider_list(panel, frame, content_area, providers, *cursor);
-        }
-        ConfigView::QuickAdd(form) => {
-            render_form(panel, frame, content_area, &form.fields, form.field_cursor);
-        }
-        ConfigView::ChangeKey(form) => {
-            render_form(panel, frame, content_area, &form.fields, form.field_cursor);
-        }
         ConfigView::SetDefault(sel) => render_set_default(panel, frame, content_area, sel),
+        ConfigView::DeleteModelConfirm(form) => {
+            render_delete_model_confirm(panel, frame, content_area, form);
+        }
         ConfigView::ModeStyleSubMenu { cursor } => {
             render_mode_style_submenu(panel, frame, content_area, *cursor);
         }
@@ -882,6 +822,9 @@ pub fn render(panel: &ConfigPanel, frame: &mut Frame, area: Rect) {
         } => {
             let _ = submitted;
             render_mode_style_select(panel, frame, content_area, *target, *cursor);
+        }
+        ConfigView::KeepBudgetInput(form) => {
+            render_keep_budget_input(panel, frame, content_area, form);
         }
         ConfigView::RenameAgent(form) => {
             render_rename_agent(panel, frame, content_area, form);
@@ -1001,8 +944,7 @@ fn render_model_list(panel: &ConfigPanel, frame: &mut Frame, area: Rect) {
 
     lines.push(Line::from(vec![
         Span::styled("  [a] 新增  ", Style::default().fg(Color::Green)),
-        Span::styled("[q] 快速新增  ", Style::default().fg(Color::Green)),
-        Span::styled("[k] 改Key  ", Style::default().fg(Color::Green)),
+        Span::styled("[x] 删除  ", Style::default().fg(Color::Red)),
         Span::styled("[d] 切默认", Style::default().fg(Color::Green)),
     ]));
 
@@ -1106,48 +1048,35 @@ fn render_form(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_provider_list(
+fn render_delete_model_confirm(
     _panel: &ConfigPanel,
     frame: &mut Frame,
     area: Rect,
-    providers: &[String],
-    cursor: usize,
+    form: &DeleteModelConfirm,
 ) {
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::Paragraph;
 
-    let mut lines: Vec<Line> = vec![
+    let lines = vec![
         Line::from(""),
         Line::from(vec![Span::styled(
-            "选 provider (带出 api_url/api_key/api_type):",
-            Style::default().fg(Color::Gray),
+            "确认删除模型:",
+            Style::default().fg(Color::Red),
         )]),
         Line::from(""),
-    ];
-
-    if providers.is_empty() {
-        lines.push(Line::from(vec![Span::styled(
-            "  (无已配置 key 的 provider)",
+        Line::from(vec![Span::styled(
+            format!("  {} ({})", form.model_name, form.model_id),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  Enter 确认删除    ←/Esc 取消",
             Style::default().fg(Color::DarkGray),
-        )]));
-    } else {
-        for (i, p) in providers.iter().enumerate() {
-            let is_sel = cursor == i;
-            let style = if is_sel {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            let marker = if is_sel { "▶" } else { " " };
-            lines.push(Line::from(vec![Span::styled(
-                format!(" {} {}", marker, p),
-                style,
-            )]));
-        }
-    }
+        )]),
+    ];
     frame.render_widget(Paragraph::new(lines), area);
 }
 
@@ -1189,17 +1118,16 @@ fn render_mode_style_submenu(_panel: &ConfigPanel, frame: &mut Frame, area: Rect
     use ratatui::widgets::Paragraph;
 
     let items: [(&str, &str); MODE_STYLE_SUBMENU_LEN] = [
-        ("UNNI 协同方式", "自主 / 跟随"),
-        ("UNNI 协同节点", "执行 / 洞察 / 记忆"),
-        ("KEEP Token 预算", "默认 100K"),
-        ("KEEP 时间预算", "默认 5min"),
-        ("LOOP 融合思考", "开 / 关 (Mix Thinking)"),
+        ("协同节点", "执行 / 洞察 / 记忆 (UNNI/KEEP/LOOP 共用)"),
+        ("Mix 思考", "开 / 关 (节点为执行中台时自动关)"),
+        ("KEEP Token 预算", "0=无限, 最小 100K"),
+        ("KEEP 时间预算", "0=无限, 最小 5min"),
     ];
 
     let mut lines: Vec<Line> = vec![
         Line::from(""),
         Line::from(vec![Span::styled(
-            "协同模式风格 (UNNI 可配置, KEEP/LOOP 协同方式/节点固定不可设置):",
+            "协作设置 (UNNI/KEEP/LOOP 共用):",
             Style::default().fg(Color::Gray),
         )]),
         Line::from(""),
@@ -1237,25 +1165,16 @@ fn render_mode_style_select(
 
     let (title, options): (&str, Vec<&str>) = match target {
         0 => (
-            "UNNI 协同方式",
-            vec![
-                CollaborationStyle::Autonomous.label(),
-                CollaborationStyle::Follow.label(),
-            ],
-        ),
-        1 => (
-            "UNNI 协同节点",
+            "协同节点",
             vec![
                 TriggerNode::Execution.label(),
                 TriggerNode::Insight.label(),
                 TriggerNode::Memory.label(),
             ],
         ),
-        2 => ("KEEP Token 预算", vec!["默认 100K (100,000 token)"]),
-        3 => ("KEEP 时间预算", vec!["默认 5min (300 秒)"]),
-        4 => (
-            "LOOP 融合思考 (Mix Thinking)",
-            vec!["关 (顺序触发, 默认)", "开 (流水线并行 + 拼接合并)"],
+        1 => (
+            "Mix 思考",
+            vec!["关 (顺序触发)", "开 (流水线并行 + 拼接合并)"],
         ),
         _ => ("", vec![]),
     };
@@ -1283,6 +1202,57 @@ fn render_mode_style_select(
             Span::styled(*desc, style),
         ]));
     }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_keep_budget_input(
+    _panel: &ConfigPanel,
+    frame: &mut Frame,
+    area: Rect,
+    form: &KeepBudgetInput,
+) {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+
+    let (title, unit, minimum, minimum_label) = if form.target == 2 {
+        ("KEEP Token 预算", "K", "100", "100K (100,000 token)")
+    } else {
+        ("KEEP 时间预算", "min", "5", "5min (300 秒)")
+    };
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            format!("{title}:"),
+            Style::default().fg(Color::Gray),
+        )]),
+        Line::from(vec![Span::styled(
+            format!("单位 {unit}；最小值 {minimum_label}；输入 0 = 无限"),
+            Style::default().fg(Color::DarkGray),
+        )]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  ▶ ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{minimum} 起 / 0=无限: "),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(form.input.clone(), Style::default().fg(Color::White)),
+            Span::styled("_", Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  Enter 确认    ← 返回上级    Esc 取消",
+            Style::default().fg(Color::DarkGray),
+        )]),
+    ];
     frame.render_widget(Paragraph::new(lines), area);
 }
 
@@ -1343,47 +1313,53 @@ mod tests {
     }
 
     #[test]
-    fn menu_shows_5_items() {
+    fn menu_shows_4_items_without_removed_entries() {
         let panel = ConfigPanel::new();
         let text = render_to_text(&panel);
 
         assert!(text.contains("Model + Provider"), "menu item 1");
-
         assert!(text.contains('工'), "menu item 2");
         assert!(text.contains("Agent"), "menu item 3 (Agent prefix)");
-        assert!(text.contains('默'), "menu item 4");
-        assert!(text.contains('上'), "menu item 5");
+        assert!(text.contains("Mode Style"), "menu item 4");
+        assert!(!text.contains("默认设置"), "default settings removed");
+        assert!(!text.contains("上下文编辑"), "context editing removed");
 
         let pending_count = text.matches('(').count();
         assert_eq!(
-            pending_count, 4,
-            "3 disabled items show (待后续) + 1 item title has parens, got: {text}"
+            pending_count, 2,
+            "1 disabled item shows (待后续) + 1 item title has parens, got: {text}"
         );
     }
 
     #[test]
     fn mode_style_submenu_renders_without_panic() {
         let mut panel = ConfigPanel::new();
-        panel.expanded = Some(4);
+        panel.expanded = Some(3);
         panel.view = ConfigView::ModeStyleSubMenu { cursor: 1 };
         let text = render_to_text(&panel).replace(' ', "");
-        assert!(text.contains("协同模式风格"), "submenu title: {text}");
-        assert!(text.contains("UNNI协同方式"), "item 1: {text}");
+        assert!(text.contains("协作设置"), "submenu title: {text}");
+        assert!(text.contains("协同节点"), "item 1: {text}");
+        assert!(text.contains("Mix思考"), "item 2: {text}");
         assert!(text.contains("KEEPToken"), "item 3: {text}");
-        assert!(text.contains("LOOP融合思考"), "item 5: {text}");
+        assert!(text.contains("KEEP时间"), "item 4: {text}");
+        assert!(!text.contains("UNNI协同方式"), "style item removed: {text}");
+        assert!(
+            !text.contains("LOOP融合思考"),
+            "loop-only mix item removed: {text}"
+        );
     }
 
     #[test]
     fn mode_style_select_renders_without_panic() {
         let mut panel = ConfigPanel::new();
-        panel.expanded = Some(4);
+        panel.expanded = Some(3);
         panel.view = ConfigView::ModeStyleSelect {
-            target: 1,
+            target: 0,
             cursor: 1,
             submitted: false,
         };
         let text = render_to_text(&panel).replace(' ', "");
-        assert!(text.contains("UNNI协同节点"), "select title: {text}");
+        assert!(text.contains("协同节点"), "select title: {text}");
         assert!(text.contains("执行中台"), "option 0: {text}");
     }
 
@@ -1451,19 +1427,19 @@ mod tests {
     fn menu_right_on_mode_style_enters_submenu() {
         let mut p = ConfigPanel::new();
 
-        for _ in 0..4 {
+        for _ in 0..3 {
             p.handle_key(KeyCode::Down);
         }
-        assert_eq!(p.menu_cursor, 4);
+        assert_eq!(p.menu_cursor, 3);
         p.handle_key(KeyCode::Right);
         assert!(matches!(p.view, ConfigView::ModeStyleSubMenu { .. }));
-        assert_eq!(p.expanded, Some(4));
+        assert_eq!(p.expanded, Some(3));
     }
 
     #[test]
     fn mode_style_submenu_navigates_and_enters_select() {
         let mut p = ConfigPanel::new();
-        for _ in 0..4 {
+        for _ in 0..3 {
             p.handle_key(KeyCode::Down);
         }
         p.handle_key(KeyCode::Right);
@@ -1477,9 +1453,9 @@ mod tests {
     }
 
     #[test]
-    fn mode_style_select_unni_style_submits_autonomous_follow() {
+    fn mode_style_select_node_submits_insight_and_clears() {
         let mut p = ConfigPanel::new();
-        p.expanded = Some(4);
+        p.expanded = Some(3);
         p.view = ConfigView::ModeStyleSelect {
             target: 0,
             cursor: 1,
@@ -1490,7 +1466,7 @@ mod tests {
             p.pending_db_request(),
             DbRequest::SaveModeStyle {
                 target: 0,
-                value: "follow".to_string()
+                value: "insight".to_string()
             }
         );
         p.clear_db_request();
@@ -1498,11 +1474,11 @@ mod tests {
     }
 
     #[test]
-    fn mode_style_select_unni_node_submits() {
+    fn mode_style_select_node_submits_memory() {
         let mut p = ConfigPanel::new();
-        p.expanded = Some(4);
+        p.expanded = Some(3);
         p.view = ConfigView::ModeStyleSelect {
-            target: 1,
+            target: 0,
             cursor: 2,
             submitted: false,
         };
@@ -1510,7 +1486,39 @@ mod tests {
         assert_eq!(
             p.pending_db_request(),
             DbRequest::SaveModeStyle {
-                target: 1,
+                target: 0,
+                value: "memory".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn mode_style_select_node_down_twice_reaches_memory() {
+        let mut p = ConfigPanel::new();
+        p.expanded = Some(3);
+        p.view = ConfigView::ModeStyleSelect {
+            target: 0,
+            cursor: 0,
+            submitted: false,
+        };
+        p.handle_key(KeyCode::Down);
+        p.handle_key(KeyCode::Down);
+        if let ConfigView::ModeStyleSelect { cursor, .. } = &p.view {
+            assert_eq!(*cursor, 2, "two Down presses must reach Memory option");
+        } else {
+            panic!("still ModeStyleSelect");
+        }
+        p.handle_key(KeyCode::Down);
+        if let ConfigView::ModeStyleSelect { cursor, .. } = &p.view {
+            assert_eq!(*cursor, 2, "Down must not move past the last option");
+        } else {
+            panic!();
+        }
+        p.handle_key(KeyCode::Enter);
+        assert_eq!(
+            p.pending_db_request(),
+            DbRequest::SaveModeStyle {
+                target: 0,
                 value: "memory".to_string()
             }
         );
@@ -1519,9 +1527,9 @@ mod tests {
     #[test]
     fn mode_style_select_loop_mix_submits() {
         let mut p = ConfigPanel::new();
-        p.expanded = Some(4);
+        p.expanded = Some(3);
         p.view = ConfigView::ModeStyleSelect {
-            target: 4,
+            target: 1,
             cursor: 1,
             submitted: false,
         };
@@ -1529,10 +1537,99 @@ mod tests {
         assert_eq!(
             p.pending_db_request(),
             DbRequest::SaveModeStyle {
-                target: 4,
+                target: 1,
                 value: "on".to_string()
             }
         );
+    }
+
+    #[test]
+    fn keep_budget_enter_from_submenu_opens_numeric_input() {
+        let mut p = ConfigPanel::new();
+        p.expanded = Some(3);
+        p.view = ConfigView::ModeStyleSubMenu { cursor: 2 };
+        p.handle_key(KeyCode::Enter);
+        assert!(matches!(
+            p.view,
+            ConfigView::KeepBudgetInput(KeepBudgetInput { target: 2, .. })
+        ));
+
+        p.view = ConfigView::ModeStyleSubMenu { cursor: 3 };
+        p.handle_key(KeyCode::Enter);
+        assert!(matches!(
+            p.view,
+            ConfigView::KeepBudgetInput(KeepBudgetInput { target: 3, .. })
+        ));
+    }
+
+    #[test]
+    fn keep_budget_input_submits_zero_and_values() {
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::KeepBudgetInput(KeepBudgetInput {
+            target: 2,
+            input: "0".into(),
+            submitted: false,
+        });
+        p.handle_key(KeyCode::Enter);
+        assert_eq!(
+            p.pending_db_request(),
+            DbRequest::SaveModeStyle {
+                target: 2,
+                value: "0".to_string()
+            }
+        );
+        p.clear_db_request();
+        assert_eq!(p.pending_db_request(), DbRequest::None);
+
+        p.view = ConfigView::KeepBudgetInput(KeepBudgetInput {
+            target: 3,
+            input: "10".into(),
+            submitted: false,
+        });
+        p.handle_key(KeyCode::Enter);
+        assert_eq!(
+            p.pending_db_request(),
+            DbRequest::SaveModeStyle {
+                target: 3,
+                value: "10".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn keep_budget_input_only_accepts_digits_and_backspace() {
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::KeepBudgetInput(KeepBudgetInput {
+            target: 2,
+            input: String::new(),
+            submitted: false,
+        });
+        p.handle_key(KeyCode::Char('1'));
+        p.handle_key(KeyCode::Char('x'));
+        p.handle_key(KeyCode::Char('0'));
+        if let ConfigView::KeepBudgetInput(form) = &p.view {
+            assert_eq!(form.input, "10");
+        } else {
+            panic!();
+        }
+        p.handle_key(KeyCode::Backspace);
+        if let ConfigView::KeepBudgetInput(form) = &p.view {
+            assert_eq!(form.input, "1");
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn keep_budget_input_esc_cancels_to_submenu() {
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::KeepBudgetInput(KeepBudgetInput {
+            target: 3,
+            input: "0".into(),
+            submitted: false,
+        });
+        p.handle_key(KeyCode::Esc);
+        assert!(matches!(p.view, ConfigView::ModeStyleSubMenu { cursor: 3 }));
     }
 
     #[test]
@@ -1574,9 +1671,10 @@ mod tests {
         panel.view = ConfigView::ModelList;
         let text = render_to_text(&panel);
         assert!(text.contains("[a]"), "add hotkey hint");
-        assert!(text.contains("[q]"), "quick add hotkey hint");
-        assert!(text.contains("[k]"), "change key hotkey hint");
+        assert!(text.contains("[x]"), "delete hotkey hint");
         assert!(text.contains("[d]"), "set default hotkey hint");
+        assert!(!text.contains("[q]"), "quick add hotkey removed");
+        assert!(!text.contains("[k]"), "change key hotkey removed");
     }
 
     #[test]
@@ -1617,12 +1715,51 @@ mod tests {
     }
 
     #[test]
-    fn model_list_k_enters_change_key() {
+    fn model_list_x_with_single_model_is_rejected() {
         let mut p = ConfigPanel::new();
         p.view = ConfigView::ModelList;
-        p.models = vec![fake_model("test")];
-        p.handle_key(KeyCode::Char('k'));
-        assert!(matches!(p.view, ConfigView::ChangeKey(_)));
+        p.models = vec![fake_model("only")];
+        p.handle_key(KeyCode::Char('x'));
+        assert!(matches!(p.view, ConfigView::ModelList));
+        assert!(p.message.is_some());
+    }
+
+    #[test]
+    fn model_list_x_enters_delete_confirm_and_submits() {
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::ModelList;
+        p.models = vec![fake_model("a"), fake_model("b")];
+        p.list_cursor = 1;
+        p.handle_key(KeyCode::Char('x'));
+        assert!(matches!(
+            &p.view,
+            ConfigView::DeleteModelConfirm(DeleteModelConfirm {
+                model_id,
+                ..
+            }) if model_id == "b"
+        ));
+        assert_eq!(p.pending_db_request(), DbRequest::None);
+        p.handle_key(KeyCode::Enter);
+        assert_eq!(
+            p.pending_db_request(),
+            DbRequest::DeleteModel {
+                model_id: "b".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn model_list_delete_confirm_esc_cancels() {
+        let mut p = ConfigPanel::new();
+        p.models = vec![fake_model("a"), fake_model("b")];
+        p.view = ConfigView::DeleteModelConfirm(DeleteModelConfirm {
+            model_id: "a".into(),
+            model_name: "a".into(),
+            submitted: false,
+        });
+        p.handle_key(KeyCode::Esc);
+        assert!(matches!(p.view, ConfigView::ModelList));
+        assert_eq!(p.pending_db_request(), DbRequest::None);
     }
 
     #[test]
@@ -1636,8 +1773,8 @@ mod tests {
     #[test]
     fn form_typing_fills_field() {
         let mut p = ConfigPanel::new();
-        p.view = ConfigView::ChangeKey(ChangeKeyForm {
-            fields: vec![
+        p.view = test_add_model_form(
+            vec![
                 FormField {
                     label: "provider",
                     value: String::new(),
@@ -1649,23 +1786,23 @@ mod tests {
                     is_secret: true,
                 },
             ],
-            field_cursor: 0,
-            submitted: false,
-        });
+            0,
+            false,
+        );
         p.handle_key(KeyCode::Char('a'));
         p.handle_key(KeyCode::Char('b'));
-        if let ConfigView::ChangeKey(f) = &p.view {
+        if let ConfigView::AddModel(f) = &p.view {
             assert_eq!(f.fields[0].value, "ab");
         } else {
-            panic!("still ChangeKey");
+            panic!("still AddModel");
         }
     }
 
     #[test]
     fn form_tab_moves_to_next_field() {
         let mut p = ConfigPanel::new();
-        p.view = ConfigView::ChangeKey(ChangeKeyForm {
-            fields: vec![
+        p.view = test_add_model_form(
+            vec![
                 FormField {
                     label: "a",
                     value: String::new(),
@@ -1677,11 +1814,11 @@ mod tests {
                     is_secret: true,
                 },
             ],
-            field_cursor: 0,
-            submitted: false,
-        });
+            0,
+            false,
+        );
         p.handle_key(KeyCode::Tab);
-        if let ConfigView::ChangeKey(f) = &p.view {
+        if let ConfigView::AddModel(f) = &p.view {
             assert_eq!(f.field_cursor, 1);
         } else {
             panic!();
@@ -1691,17 +1828,17 @@ mod tests {
     #[test]
     fn form_backspace_deletes() {
         let mut p = ConfigPanel::new();
-        p.view = ConfigView::ChangeKey(ChangeKeyForm {
-            fields: vec![FormField {
+        p.view = test_add_model_form(
+            vec![FormField {
                 label: "x",
                 value: "ab".into(),
                 is_secret: false,
             }],
-            field_cursor: 0,
-            submitted: false,
-        });
+            0,
+            false,
+        );
         p.handle_key(KeyCode::Backspace);
-        if let ConfigView::ChangeKey(f) = &p.view {
+        if let ConfigView::AddModel(f) = &p.view {
             assert_eq!(f.fields[0].value, "a");
         } else {
             panic!();
@@ -1711,15 +1848,15 @@ mod tests {
     #[test]
     fn form_left_cancels_to_model_list() {
         let mut p = ConfigPanel::new();
-        p.view = ConfigView::ChangeKey(ChangeKeyForm {
-            fields: vec![FormField {
+        p.view = test_add_model_form(
+            vec![FormField {
                 label: "x",
                 value: String::new(),
                 is_secret: false,
             }],
-            field_cursor: 0,
-            submitted: false,
-        });
+            0,
+            false,
+        );
         p.handle_key(KeyCode::Left);
         assert!(matches!(p.view, ConfigView::ModelList));
     }
@@ -1742,29 +1879,6 @@ mod tests {
         p.view = ConfigView::AddModelSelectTemplate { cursor: 0 };
         p.handle_key(KeyCode::Enter);
         assert!(matches!(p.view, ConfigView::AddModel(_)));
-    }
-
-    #[test]
-    fn provider_select_enter_enters_quickadd() {
-        let mut p = ConfigPanel::new();
-        p.view = ConfigView::QuickAddSelectProvider {
-            providers: vec!["agent_plan".into()],
-            cursor: 0,
-        };
-        p.handle_key(KeyCode::Enter);
-        assert!(matches!(p.view, ConfigView::QuickAdd(_)));
-    }
-
-    #[test]
-    fn provider_select_empty_shows_error() {
-        let mut p = ConfigPanel::new();
-        p.view = ConfigView::QuickAddSelectProvider {
-            providers: vec![],
-            cursor: 0,
-        };
-        p.handle_key(KeyCode::Enter);
-        assert!(matches!(p.view, ConfigView::ModelList));
-        assert!(p.message.is_some());
     }
 
     #[test]
@@ -1802,8 +1916,8 @@ mod tests {
     #[test]
     fn form_enter_on_last_field_sets_submitted() {
         let mut p = ConfigPanel::new();
-        p.view = ConfigView::ChangeKey(ChangeKeyForm {
-            fields: vec![
+        p.view = test_add_model_form(
+            vec![
                 FormField {
                     label: "p",
                     value: "x".into(),
@@ -1815,11 +1929,11 @@ mod tests {
                     is_secret: true,
                 },
             ],
-            field_cursor: 1,
-            submitted: false,
-        });
+            1,
+            false,
+        );
         p.handle_key(KeyCode::Enter);
-        if let ConfigView::ChangeKey(f) = &p.view {
+        if let ConfigView::AddModel(f) = &p.view {
             assert!(f.submitted);
             assert_eq!(f.field_cursor, 1);
         } else {
@@ -1830,8 +1944,8 @@ mod tests {
     #[test]
     fn pending_db_request_none_when_not_submitted() {
         let mut p = ConfigPanel::new();
-        p.view = ConfigView::ChangeKey(ChangeKeyForm {
-            fields: vec![
+        p.view = test_add_model_form(
+            vec![
                 FormField {
                     label: "p",
                     value: "x".into(),
@@ -1843,40 +1957,39 @@ mod tests {
                     is_secret: true,
                 },
             ],
-            field_cursor: 0,
-            submitted: false,
-        });
+            0,
+            false,
+        );
         let req = p.pending_db_request();
         assert!(matches!(req, DbRequest::None));
     }
 
     #[test]
-    fn pending_db_request_submit_change_key_when_submitted() {
+    fn pending_db_request_delete_model_when_submitted() {
         let mut p = ConfigPanel::new();
-        p.view = ConfigView::ChangeKey(ChangeKeyForm {
-            fields: vec![
-                FormField {
-                    label: "provider",
-                    value: "test".into(),
-                    is_secret: false,
-                },
-                FormField {
-                    label: "key",
-                    value: "newkey".into(),
-                    is_secret: true,
-                },
-            ],
-            field_cursor: 1,
+        p.view = ConfigView::DeleteModelConfirm(DeleteModelConfirm {
+            model_id: "m1".into(),
+            model_name: "model one".into(),
             submitted: true,
         });
         let req = p.pending_db_request();
         match req {
-            DbRequest::SubmitChangeKey { provider, api_key } => {
-                assert_eq!(provider, "test");
-                assert_eq!(api_key, "newkey");
-            }
+            DbRequest::DeleteModel { model_id } => assert_eq!(model_id, "m1"),
             other => panic!("unexpected {:?}", other),
         }
+    }
+
+    fn test_add_model_form(
+        fields: Vec<FormField>,
+        field_cursor: usize,
+        submitted: bool,
+    ) -> ConfigView {
+        ConfigView::AddModel(AddModelForm {
+            template_idx: None,
+            fields,
+            field_cursor,
+            submitted,
+        })
     }
 
     fn fake_model(id: &str) -> ModelRow {
