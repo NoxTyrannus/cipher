@@ -456,7 +456,6 @@ const DANGEROUS_CMDS: &[&str] = &[
     "rm -rf /",
     "rm -rf /*",
     "mkfs",
-    "dd",
     ":(){ :|:& };:",
     "chmod -R 777 /",
     "> /dev/sda",
@@ -464,6 +463,12 @@ const DANGEROUS_CMDS: &[&str] = &[
 
 fn check_dangerous(cmd: &str) -> bool {
     let trimmed = cmd.trim();
+    // dd 只按命令词匹配（首词 == dd 或 dd=...），避免 contains 子串误伤 ip addr 等正常命令。
+    if let Some(first) = trimmed.split_whitespace().next() {
+        if first == "dd" || first.starts_with("dd=") {
+            return true;
+        }
+    }
     DANGEROUS_CMDS
         .iter()
         .any(|bad| trimmed.starts_with(bad) || trimmed.contains(bad))
@@ -841,6 +846,40 @@ mod tests {
         let r = host_shell_exec(&ctx, &serde_json::json!({"command": "echo ok"})).unwrap();
         assert_eq!(r["exit_code"], 0);
         assert_eq!(r["stdout"].as_str().unwrap().trim(), "ok");
+    }
+
+    #[test]
+    fn check_dangerous_rejects_dd_as_first_word() {
+        assert!(check_dangerous(
+            "dd if=/dev/zero of=/dev/null bs=1M count=1"
+        ));
+        assert!(check_dangerous("dd of=/tmp/out"));
+        assert!(check_dangerous(
+            "echo x | sudo dd if=/dev/zero of=/dev/null"
+        ));
+    }
+
+    #[test]
+    fn check_dangerous_allows_ip_addr() {
+        assert!(!check_dangerous("ip addr"));
+        assert!(!check_dangerous("ip -4 addr show"));
+        assert!(!check_dangerous("adduser alice"));
+    }
+
+    #[test]
+    fn check_dangerous_keeps_sudo_chain_rejection() {
+        assert!(check_dangerous("echo x | sudo rm -rf /tmp/x"));
+        assert!(check_dangerous("sudo mkfs.ext4 /dev/sdb1"));
+    }
+
+    #[test]
+    fn check_dangerous_keeps_legacy_dangerous_patterns() {
+        assert!(check_dangerous("rm -rf /"));
+        assert!(check_dangerous("rm -rf /*"));
+        assert!(check_dangerous(":(){ :|:& };:"));
+        assert!(check_dangerous("chmod -R 777 /"));
+        assert!(check_dangerous("echo x > /dev/sda"));
+        assert!(check_dangerous("mkfs.ext4 /dev/sda1"));
     }
 
     #[test]

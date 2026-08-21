@@ -330,6 +330,20 @@ impl fmt::Display for RunError {
     }
 }
 
+/// run 失败收口载体：错误原因 + 失败时已累积的逐轮调用记录与日志（供 L3 取证落盘）。
+#[derive(Debug)]
+struct RunFailure {
+    error: RunError,
+    calls: Vec<CapabilityCallRecord>,
+    logs: Vec<String>,
+}
+
+impl fmt::Display for RunFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
 async fn run_subagent(params: SubagentRunParams) {
     let subagent_id = params.definition.subagent_id.clone();
     let _ = init_subagent_memory(&params.storage_root, &subagent_id);
@@ -342,7 +356,17 @@ async fn run_subagent(params: SubagentRunParams) {
     match result {
         Ok(Ok(outcome)) => finalize_completed(&params, &outcome).await,
         Ok(Err(failure)) => finalize_failed(&params, &failure).await,
-        Err(_) => finalize_failed(&params, &RunError::TotalTimeout).await,
+        Err(_) => {
+            finalize_failed(
+                &params,
+                &RunFailure {
+                    error: RunError::TotalTimeout,
+                    calls: Vec::new(),
+                    logs: Vec::new(),
+                },
+            )
+            .await;
+        }
     }
 
     heartbeat.abort();
@@ -361,42 +385,51 @@ fn spawn_heartbeat(pool: &Arc<AgentPool>, subagent_id: &str) -> tokio::task::Joi
     })
 }
 
-/// 有界重试：失败最多 max_retries 次重试（默认 0），耗尽返回最后一次失败。
+/// 有界重试：失败最多 max_retries 次重试（默认 0），耗尽返回最后一次失败（含当时已累积的证据）。
 async fn execute_with_retries(
     params: &SubagentRunParams,
-) -> std::result::Result<CompletedOutcome, RunError> {
+) -> std::result::Result<CompletedOutcome, RunFailure> {
     let max_retries = params.definition.budget.max_retries;
-    let mut last_error = RunError::ProviderError("no attempt started".to_string());
+    let mut last_failure = RunFailure {
+        error: RunError::ProviderError("no attempt started".to_string()),
+        calls: Vec::new(),
+        logs: Vec::new(),
+    };
     for attempt in 0..=max_retries {
         match run_once(params).await {
             Ok(outcome) => return Ok(outcome),
-            Err(error) => {
+            Err(failure) => {
                 tracing::warn!(
                     subagent_id = %params.definition.subagent_id,
                     invocation = %params.invocation_id,
                     attempt,
-                    "subagent run attempt failed: {error}"
+                    "subagent run attempt failed: {}",
+                    failure.error
                 );
-                last_error = error;
+                last_failure = failure;
                 if attempt < max_retries {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
             }
         }
     }
-    Err(last_error)
+    Err(last_failure)
 }
 
 /// 有界能力循环的一次执行（每次重试全新开始：重读记忆、重拼 prompt）。
-async fn run_once(params: &SubagentRunParams) -> std::result::Result<CompletedOutcome, RunError> {
+async fn run_once(params: &SubagentRunParams) -> std::result::Result<CompletedOutcome, RunFailure> {
     let memory =
         read_memory(&params.storage_root, &params.definition.subagent_id).unwrap_or_default();
     let system_prompt = compose_system_prompt(params, &memory);
 
     if params.task_input.trim().is_empty() {
-        return Err(RunError::ProviderError(
-            "subagent run messages would be empty: task_input is empty".to_string(),
-        ));
+        return Err(RunFailure {
+            error: RunError::ProviderError(
+                "subagent run messages would be empty: task_input is empty".to_string(),
+            ),
+            calls: Vec::new(),
+            logs: Vec::new(),
+        });
     }
 
     let mut messages = vec![
@@ -415,14 +448,37 @@ async fn run_once(params: &SubagentRunParams) -> std::result::Result<CompletedOu
     let mut logs: Vec<String> = Vec::new();
 
     for turn in 0..max_turns {
-        let request =
-            LlmRequest::from_model_row(&params.model_row, messages.clone(), params.api_key.clone())
-                .map_err(|e| RunError::ProviderError(format!("build llm request: {e}")))?;
+        let request = match LlmRequest::from_model_row(
+            &params.model_row,
+            messages.clone(),
+            params.api_key.clone(),
+        ) {
+            Ok(request) => request,
+            Err(e) => {
+                return Err(RunFailure {
+                    error: RunError::ProviderError(format!("build llm request: {e}")),
+                    calls,
+                    logs,
+                });
+            }
+        };
 
         let response =
             match tokio::time::timeout(attempt_timeout, params.provider.call(&request)).await {
-                Err(_) => return Err(RunError::AttemptTimeout { turn }),
-                Ok(Err(e)) => return Err(RunError::ProviderError(e.to_string())),
+                Err(_) => {
+                    return Err(RunFailure {
+                        error: RunError::AttemptTimeout { turn },
+                        calls,
+                        logs,
+                    });
+                }
+                Ok(Err(e)) => {
+                    return Err(RunFailure {
+                        error: RunError::ProviderError(e.to_string()),
+                        calls,
+                        logs,
+                    });
+                }
                 Ok(Ok(resp)) => resp,
             };
 
@@ -445,7 +501,13 @@ async fn run_once(params: &SubagentRunParams) -> std::result::Result<CompletedOu
                             )
                         })
                         .collect();
+                    let summary_short: String = summary.chars().take(200).collect();
                     logs.push(format!("DONE rejected (no successful call yet): {summary}"));
+                    tracing::warn!(
+                        subagent_id = %params.definition.subagent_id,
+                        invocation = %params.invocation_id,
+                        "subagent DONE rejected (no successful call yet): {summary_short}"
+                    );
                     messages.push(ChatMessage::User {
                         text: format!(
                             "上一轮调用全部失败（{}）。分析错误、调整参数后重新调用，不要直接结束；除非能力永久不可用，输出明确失败说明。",
@@ -490,7 +552,11 @@ async fn run_once(params: &SubagentRunParams) -> std::result::Result<CompletedOu
     }
 
     logs.push(format!("EXCEEDED max_turns={max_turns}"));
-    Err(RunError::MaxTurnsExceeded)
+    Err(RunFailure {
+        error: RunError::MaxTurnsExceeded,
+        calls,
+        logs,
+    })
 }
 
 /// 执行单个能力调用并把结果回填对话（错误回填纠错提示，不视为 run 失败）。
@@ -756,15 +822,29 @@ async fn finalize_completed(params: &SubagentRunParams, outcome: &CompletedOutco
     );
 }
 
-/// 失败收口：失败事实进 memory + last_output，生命周期 failed（AgentPool 以 idle 身份保留）。
-async fn finalize_failed(params: &SubagentRunParams, error: &RunError) {
+/// 失败收口：失败事实进 memory（含逐轮 calls/logs 证据）+ last_output，生命周期 failed（AgentPool 以 idle 身份保留）。
+async fn finalize_failed(params: &SubagentRunParams, failure: &RunFailure) {
     let subagent_id = &params.definition.subagent_id;
-    let message = error.to_string();
+    let message = failure.error.to_string();
     let entry = MemoryEntry {
         t: UtcTimestamp::now().to_string(),
         input: params.task_input.clone(),
-        actions: Vec::new(),
-        evidence: vec![format!("FAIL subagent.run: {message}")],
+        actions: failure
+            .calls
+            .iter()
+            .map(|call| {
+                format!(
+                    "capability_id={} status={}",
+                    call.capability_id,
+                    if call.ok { "OK" } else { "FAIL" }
+                )
+            })
+            .collect(),
+        evidence: if failure.logs.is_empty() {
+            vec![format!("FAIL subagent.run: {message}")]
+        } else {
+            failure.logs.clone()
+        },
         output: format!("failed: {message}"),
     };
     let window = memory_window(params);
@@ -924,6 +1004,28 @@ mod tests {
         }
     }
 
+    /// 能力存在但执行必失败（走 execute_for_agent 失败 → logs "FAIL {capability_id}: ..." 路径）。
+    struct FailingCap {
+        id: &'static str,
+    }
+
+    impl BaseCapability for FailingCap {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn name(&self) -> &'static str {
+            "Failing"
+        }
+        fn execute(
+            &self,
+            _input: &crate::logic::capability::base::Schema,
+        ) -> crate::common::Result<crate::logic::capability::base::Schema> {
+            Err(crate::common::AgentError::Script(
+                "probe failure".to_string(),
+            ))
+        }
+    }
+
     // ---- fixtures ----
 
     fn test_registry() -> Registry {
@@ -944,6 +1046,7 @@ mod tests {
         for (id, name, executor) in [
             ("probe.a", "Probe A", "test.probe.a"),
             ("probe.b", "Probe B", "test.probe.b"),
+            ("probe.c", "Probe C", "test.probe.c"),
         ] {
             reg.base_capabilities.insert(
                 id.to_string(),
@@ -975,6 +1078,7 @@ mod tests {
             id: "test.probe.b",
             order,
         }));
+        executor.register(Arc::new(FailingCap { id: "test.probe.c" }));
         executor
     }
 
@@ -1611,7 +1715,7 @@ mod tests {
 
         // 每轮「失败调用 -> done」；max_turns=2 -> turn1 的 done 被拒绝后轮数耗尽 -> 失败收口。
         let responses = vec![
-            r#"{"capability_calls": [{"capability_id": "unknown.cap"}]}"#.to_string(),
+            r#"{"capability_calls": [{"capability_id": "probe.c"}]}"#.to_string(),
             r#"{"done": true, "summary": "give up"}"#.to_string(),
         ];
         let provider = Arc::new(ScriptedProvider::new(responses, None));
@@ -1635,5 +1739,31 @@ mod tests {
         let last = read_last_output(&storage, "sg_test").unwrap().unwrap();
         assert_eq!(last.status, "failed");
         assert!(last.summary.contains("max_turns"), "got: {}", last.summary);
+
+        // 失败收口证据落盘（Q5）：evidence 含逐轮 logs（FAIL 调用 + DONE rejected + 轮数耗尽），
+        // actions 含逐轮调用摘要 —— 失败轮证据可在 L3 取证。
+        let memory = read_memory(&storage, "sg_test").unwrap();
+        let entry = memory.entries.last().unwrap();
+        let evidence = entry.evidence.join("\n");
+        assert!(
+            evidence.contains("FAIL probe.c"),
+            "evidence must keep per-turn FAIL log, got: {evidence}"
+        );
+        assert!(
+            evidence.contains("DONE rejected"),
+            "evidence must keep DONE rejected log, got: {evidence}"
+        );
+        assert!(
+            evidence.contains("EXCEEDED max_turns=2"),
+            "evidence must keep max_turns exhaustion log, got: {evidence}"
+        );
+        assert!(
+            entry
+                .actions
+                .iter()
+                .any(|a| a.contains("capability_id=probe.c status=FAIL")),
+            "actions must keep per-turn call summary, got: {:?}",
+            entry.actions
+        );
     }
 }
