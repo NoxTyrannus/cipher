@@ -387,49 +387,51 @@ pub fn seed_memory_agents(conn: &duckdb::Connection) -> Result<()> {
 
 /// 四个 subagent 模板行（§5.1 / §14）。
 ///
-/// `mode = 'subagent_template'`，可读不可改；capability_allowlist 非空（安全集合）；
+/// `mode = 'subagent_template'`，可读不可改；capability_allowlist 为**宽安全集**
+/// （四个模板同宽集，实例创建时由实例 allowlist 只做子集裁剪，宽集上限允许任意
+/// 任务按需取用——保守性由实例设计裁剪承担，不再由模板窄集承担）；
 /// config.subagent 含 lifecycle/startup/trigger/memory_window_pct/briefing/预算字段。
-/// 模板能力集按需演进；冲突时更新 capability_allowlist，保证旧数据目录启动后自动获得新授权。
+/// 升级策略：`INSERT ... ON CONFLICT (id) DO UPDATE SET capability_allowlist`——
+/// 旧数据目录模板行（窄集）在 seed 时自动宽化为当前宽集（幂等，仅对已知四模板 id，
+/// 不改用户自建模板行）。
 pub fn seed_subagent_templates(conn: &duckdb::Connection) -> Result<()> {
     // (id, display_name, lifecycle_kind, startup, allowlist)
-    let templates: &[(&str, &str, &str, &str, &[&str])] = &[
+    // 宽安全集：模板 = 类型封装（生命周期/触发/默认基线）+ 宽集；实例只做子集裁剪。
+    let wide_allowlist: &[&str] = &[
+        "file.read",
+        "file.list",
+        "file.write",
+        "path.exists",
+        "text.grep",
+        "shell.exec",
+    ];
+    let templates: &[(&str, &str, &str, &str)] = &[
         (
             "subagent.template.normal",
             "Normal Subagent Template",
             "temporary",
             "normal",
-            &[
-                "file.read",
-                "file.list",
-                "path.exists",
-                "text.grep",
-                "file.write",
-                "shell.exec",
-            ],
         ),
         (
             "subagent.template.resident",
             "Resident Subagent Template",
             "resident",
             "normal",
-            &["file.read", "file.list", "path.exists", "text.grep"],
         ),
         (
             "subagent.template.scheduled",
             "Scheduled Subagent Template",
             "temporary",
             "scheduled",
-            &["file.read", "file.list", "path.exists", "text.grep"],
         ),
         (
             "subagent.template.condition",
             "Condition Subagent Template",
             "resident",
             "condition",
-            &["file.read", "file.list", "path.exists", "text.grep"],
         ),
     ];
-    for (id, name, lifecycle, startup, allowlist) in templates {
+    for (id, name, lifecycle, startup) in templates {
         let trigger = match *startup {
             "scheduled" => serde_json::json!({
                 "type": "schedule",
@@ -457,7 +459,7 @@ pub fn seed_subagent_templates(conn: &duckdb::Connection) -> Result<()> {
         let prompt = format!(
             "你是 subagent「{name}」，一个有最小记忆的异步工作单元。\n             ## 角色与任务边界\n             - 只处理执行中台分配的任务，不越界，不访问未授权能力，不创建/删除其他 subagent。\n             - 完成分配任务后立即以简报合同收口，不额外继续工作。\n             ## 能力调用规范\n             - 能力调用规范见系统提供的统一片段（capability_call.md 由运行时按需拼接），不要自行重写调用协议。\n             - 你只能调用 available_capabilities 中已授权的能力。\n             ## 运行方式\n             - 每轮从固定能力组选择 0/1/多个能力，多个调用按声明顺序依次执行；能力调用结果不回到本轮 LLM。\n             - 每轮只做一次模型调用。\n             ## 简报输出合同\n             - 任务完成时输出：{{\"done\": true, \"summary\": \"简明结果\"}}"
         );
-        let allowlist_json = serde_json::to_string(&allowlist.to_vec()).map_err(|error| {
+        let allowlist_json = serde_json::to_string(&wide_allowlist.to_vec()).map_err(|error| {
             AgentError::Parse(format!("serialize template allowlist for {id}: {error}"))
         })?;
         conn.execute(
@@ -695,7 +697,7 @@ mod tests {
             .unwrap();
         assert_eq!(platform_count_after, 2);
 
-        // 模板 allowlist 非空安全集合。
+        // 模板 allowlist 为宽安全集（四模板同宽集，实例只做子集裁剪）。
         let allowlist_text: Option<String> = conn
             .query_row(
                 "SELECT CAST(capability_allowlist AS VARCHAR) FROM agent                  WHERE id = 'subagent.template.normal'",
@@ -704,10 +706,22 @@ mod tests {
             )
             .unwrap();
         let allowlist: serde_json::Value = serde_json::from_str(&allowlist_text.unwrap()).unwrap();
-        assert!(
-            !allowlist.as_array().unwrap().is_empty(),
-            "template allowlist must be non-empty"
-        );
+        let ids: Vec<&str> = allowlist
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        for expected in [
+            "file.read",
+            "file.list",
+            "file.write",
+            "path.exists",
+            "text.grep",
+            "shell.exec",
+        ] {
+            assert!(ids.contains(&expected), "normal 模板宽集缺少 {expected}");
+        }
     }
 
     #[test]
@@ -731,6 +745,80 @@ mod tests {
             )
             .unwrap();
         assert_eq!(keep_text.unwrap(), "[\"file.read\"]");
+    }
+
+    #[test]
+    fn seed_templates_wide_allowlist_upgrades_legacy_narrow_rows() {
+        // 升级路径：旧数据目录模板行（窄只读集）在 seed 后被宽化为当前宽集。
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        crate::data::duckdb::schema::create_all_tables(&conn).unwrap();
+        let dir = tempdir().unwrap();
+        ensure_default_capabilities(dir.path()).unwrap();
+        import_factory_defaults(&conn, dir.path()).unwrap();
+
+        // 模拟旧数据：把 resident/scheduled/condition 三模板行改为只读窄集。
+        for id in [
+            "subagent.template.resident",
+            "subagent.template.scheduled",
+            "subagent.template.condition",
+        ] {
+            conn.execute(
+                "UPDATE agent SET capability_allowlist = CAST(? AS JSON) WHERE id = ?",
+                duckdb::params![r#"["file.read","file.list","path.exists","text.grep"]"#, id],
+            )
+            .unwrap();
+        }
+
+        // 重新 seed：DO UPDATE 把窄集行宽化回当前宽集。
+        import_factory_defaults(&conn, dir.path()).unwrap();
+
+        let wide: serde_json::Value = serde_json::from_str(
+            r#"["file.read","file.list","file.write","path.exists","text.grep","shell.exec"]"#,
+        )
+        .unwrap();
+        for id in [
+            "subagent.template.normal",
+            "subagent.template.resident",
+            "subagent.template.scheduled",
+            "subagent.template.condition",
+        ] {
+            let text: Option<String> = conn
+                .query_row(
+                    "SELECT CAST(capability_allowlist AS VARCHAR) FROM agent WHERE id = ?",
+                    duckdb::params![id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&text.unwrap()).unwrap();
+            assert_eq!(parsed, wide, "模板 {id} 应被宽化为宽集");
+        }
+    }
+
+    #[test]
+    fn seed_templates_do_not_touch_custom_template_rows() {
+        // 仅已知四模板 id 宽化：用户自建模板行（同 mode，不同 id）不受影响。
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        crate::data::duckdb::schema::create_all_tables(&conn).unwrap();
+        let dir = tempdir().unwrap();
+        ensure_default_capabilities(dir.path()).unwrap();
+        import_factory_defaults(&conn, dir.path()).unwrap();
+
+        conn.execute(
+            "INSERT INTO agent (id, name, mode, capability_allowlist, is_default) \
+             VALUES ('subagent.template.custom', 'My Template', 'subagent_template', '[\"file.read\"]', false);",
+            [],
+        )
+        .unwrap();
+        import_factory_defaults(&conn, dir.path()).unwrap();
+
+        let text: Option<String> = conn
+            .query_row(
+                "SELECT CAST(capability_allowlist AS VARCHAR) FROM agent WHERE id = 'subagent.template.custom'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(text.unwrap(), "[\"file.read\"]", "用户自建模板行不得被宽化");
     }
 
     #[test]

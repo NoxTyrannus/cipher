@@ -375,8 +375,9 @@ fn subagent_create(
             SubagentError::failed(format!("subagent.create prewrite failed: {error}"))
         })?;
 
-    // 4) 生成 sg_<uuid> 实例行（prompt 从模板复制）。
+    // 4) 生成 sg_<uuid> 实例行（prompt 缺省继承模板基线，可被任务专属 prompt 覆盖）。
     let subagent_id = format!("sg_{}", uuid_simple());
+    let instance_prompt = parse_optional_prompt(args)?.unwrap_or_else(|| template.prompt.clone());
     let task_input = args
         .get("task_input")
         .and_then(|value| value.as_str())
@@ -399,7 +400,7 @@ fn subagent_create(
         id: subagent_id.clone(),
         name,
         mode: "subagent".to_string(),
-        prompt: template.prompt.clone(),
+        prompt: instance_prompt,
         capability_allowlist: allowlist.clone(),
         config: serde_json::json!({ "subagent": instance_config }),
     };
@@ -483,15 +484,7 @@ fn subagent_update(
         }
         None => current.model_id.clone(),
     };
-    let new_prompt = match args.get("prompt").and_then(|value| value.as_str()) {
-        Some(prompt) if !prompt.trim().is_empty() => prompt.to_string(),
-        Some(_) => {
-            return Err(SubagentError::rejected(
-                "subagent.update: prompt must not be empty",
-            ))
-        }
-        None => instance.prompt.clone(),
-    };
+    let new_prompt = parse_optional_prompt(args)?.unwrap_or_else(|| instance.prompt.clone());
     let new_startup = if args.get("startup").is_some() {
         parse_optional_startup(args.get("startup"))?.unwrap_or(current.startup)
     } else {
@@ -1155,6 +1148,24 @@ fn chosen_allowlist(
             "subagent.create: capability_allowlist must be an array",
         )),
         None => Ok(template_allowlist.to_vec()),
+    }
+}
+
+/// 可选 prompt 校验（subagent.create / subagent.update 共享）：
+/// 缺省 → `Ok(None)`（继承模板基线/保持现状）；非字符串 → 拒绝；字符串但
+/// trim 后为空/纯空白 → 拒绝（明示）。
+fn parse_optional_prompt(
+    args: &serde_json::Value,
+) -> std::result::Result<Option<String>, SubagentError> {
+    match args.get("prompt") {
+        None => Ok(None),
+        Some(serde_json::Value::String(prompt)) if !prompt.trim().is_empty() => {
+            Ok(Some(prompt.clone()))
+        }
+        Some(serde_json::Value::String(_)) => Err(SubagentError::rejected(
+            "prompt must not be empty or whitespace",
+        )),
+        Some(_) => Err(SubagentError::rejected("prompt must be a string")),
     }
 }
 
@@ -2021,6 +2032,115 @@ mod tests {
             config.trigger,
             Some(serde_json::json!({"type": "schedule", "cron": "* * * * *"}))
         );
+    }
+
+    #[test]
+    fn create_prompt_overrides_template_baseline() {
+        let db = test_conn_arc();
+        let storage_root = tempfile::tempdir().unwrap();
+        let output = call(
+            &db,
+            storage_root.path(),
+            "subagent.create",
+            serde_json::json!({
+                "template_id": TEMPLATE_NORMAL,
+                "model_id": MODEL_MINI,
+                "prompt": "任务专属方法论：先 grep 再 read，按声明顺序执行。",
+            }),
+        )
+        .unwrap();
+        let id = subagent_id(&output);
+        let row = with_conn(&db, |conn| resolve_agent_row(conn, &id).unwrap().unwrap());
+        assert_eq!(
+            row.prompt,
+            "任务专属方法论：先 grep 再 read，按声明顺序执行。"
+        );
+    }
+
+    #[test]
+    fn create_prompt_defaults_to_template_baseline() {
+        let db = test_conn_arc();
+        let storage_root = tempfile::tempdir().unwrap();
+        let output = create_default(&db, storage_root.path());
+        let id = subagent_id(&output);
+        let row = with_conn(&db, |conn| resolve_agent_row(conn, &id).unwrap().unwrap());
+        // 缺省 prompt = 模板 prompt（继承，向后兼容）。
+        let template_prompt: Option<String> = with_conn(&db, |conn| {
+            conn.query_row(
+                "SELECT prompt FROM agent WHERE id = ?",
+                duckdb::params![TEMPLATE_NORMAL],
+                |row| row.get(0),
+            )
+            .unwrap()
+        });
+        assert_eq!(row.prompt, template_prompt.unwrap());
+    }
+
+    #[test]
+    fn create_rejects_empty_or_whitespace_prompt() {
+        let db = test_conn_arc();
+        let storage_root = tempfile::tempdir().unwrap();
+        for bad_prompt in ["", "   ", "\n\t "] {
+            let result = call(
+                &db,
+                storage_root.path(),
+                "subagent.create",
+                serde_json::json!({
+                    "template_id": TEMPLATE_NORMAL,
+                    "model_id": MODEL_MINI,
+                    "prompt": bad_prompt,
+                }),
+            );
+            assert!(result.is_err(), "空/空白 prompt 应被拒绝: {bad_prompt:?}");
+        }
+    }
+
+    #[test]
+    fn create_rejects_non_string_prompt() {
+        let db = test_conn_arc();
+        let storage_root = tempfile::tempdir().unwrap();
+        let result = call(
+            &db,
+            storage_root.path(),
+            "subagent.create",
+            serde_json::json!({
+                "template_id": TEMPLATE_NORMAL,
+                "model_id": MODEL_MINI,
+                "prompt": 42,
+            }),
+        );
+        assert!(result.is_err(), "非字符串 prompt 应被拒绝");
+    }
+
+    #[test]
+    fn create_allowlist_equal_to_template_wide_set_ok() {
+        let db = test_conn_arc();
+        let storage_root = tempfile::tempdir().unwrap();
+        // 等于模板宽集边界：OK（模板宽集上限允许任意任务按需取用）。
+        let result = call(
+            &db,
+            storage_root.path(),
+            "subagent.create",
+            serde_json::json!({
+                "template_id": TEMPLATE_NORMAL,
+                "model_id": MODEL_MINI,
+                "capability_allowlist": ["file.read", "file.list", "path.exists", "text.grep"],
+            }),
+        );
+        assert!(result.is_ok(), "等于模板宽集应为 OK");
+    }
+
+    #[test]
+    fn parse_optional_prompt_shared_behavior() {
+        // 抽取的公共校验函数：缺省 / 正常 / 空白 / 非字符串。
+        assert_eq!(parse_optional_prompt(&serde_json::json!({})).unwrap(), None);
+        assert_eq!(
+            parse_optional_prompt(&serde_json::json!({"prompt": "p"})).unwrap(),
+            Some("p".to_string())
+        );
+        assert!(parse_optional_prompt(&serde_json::json!({"prompt": "  "})).is_err());
+        assert!(parse_optional_prompt(&serde_json::json!({"prompt": 7})).is_err());
+        assert!(parse_optional_prompt(&serde_json::json!({"prompt": null})).is_err());
     }
 
     #[test]
