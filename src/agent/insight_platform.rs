@@ -24,17 +24,45 @@ struct InsightRawOutput {
     usage_observations: Vec<UsageObservation>,
 }
 
+/// 宽松解析洞察中台输出：候选链（全文 → ```json 块 → strip+首对象 → 全文）+
+/// 每候选先 serde 再 `repair_json` 重试 + Value 级字段提取（不整体判死）。
+///
+/// - `insight` 非字符串（数字/对象等）→ `to_string()` 保留（不判死）；
+/// - `usage_observations` 数组内坏项独立跳过（字段级容错），其余项照常；
+/// - 全部候选失败 → `insight=None, usage_observations=[]`（由调用方 fallback 处理）。
 fn parse_insight_output(content: &str) -> Result<InsightRawOutput> {
-    if let Ok(raw) = serde_json::from_str::<InsightRawOutput>(content) {
-        if raw.insight.is_some() {
-            return Ok(raw);
+    let mut candidates = Vec::new();
+    let trimmed = content.trim().to_string();
+    if !trimmed.is_empty() {
+        candidates.push(trimmed.clone());
+    }
+    if let Some(block) = extract_json_block(content) {
+        if !candidates.contains(&block) {
+            candidates.push(block);
         }
     }
+    let stripped = crate::common::json_util::strip_reasoning_preamble(content);
+    if let Some(obj) = crate::common::json_util::extract_first_json_object(&stripped) {
+        if !candidates.contains(&obj) {
+            candidates.push(obj);
+        }
+    }
+    if !candidates.contains(&trimmed) {
+        candidates.push(trimmed);
+    }
 
-    if let Some(json_block) = extract_json_block(content) {
-        if let Ok(raw) = serde_json::from_str::<InsightRawOutput>(&json_block) {
+    for candidate in candidates {
+        if let Some(raw) = parse_insight_raw(&candidate) {
             if raw.insight.is_some() {
                 return Ok(raw);
+            }
+        }
+        let repaired = crate::common::json_util::repair_json(&candidate);
+        if repaired != candidate {
+            if let Some(raw) = parse_insight_raw(&repaired) {
+                if raw.insight.is_some() {
+                    return Ok(raw);
+                }
             }
         }
     }
@@ -46,6 +74,29 @@ fn parse_insight_output(content: &str) -> Result<InsightRawOutput> {
     Ok(InsightRawOutput {
         insight: None,
         usage_observations: vec![],
+    })
+}
+
+/// Value 级宽容提取：整体反序列化为 Value 后逐字段处理（不依赖 serde 结构整体判死）。
+fn parse_insight_raw(text: &str) -> Option<InsightRawOutput> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let obj = value.as_object()?;
+    let insight = obj.get("insight").map(|v| match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    });
+    let mut usage_observations = Vec::new();
+    if let Some(observations) = obj.get("usage_observations").and_then(|v| v.as_array()) {
+        for item in observations {
+            match serde_json::from_value::<UsageObservation>(item.clone()) {
+                Ok(observation) => usage_observations.push(observation),
+                Err(e) => tracing::warn!("insight_platform: 坏 usage_observation 项跳过: {e}"),
+            }
+        }
+    }
+    Some(InsightRawOutput {
+        insight,
+        usage_observations,
     })
 }
 
@@ -205,7 +256,7 @@ impl InsightPlatform {
                 tracing::error!(
                     "insight_platform: request build failed for turn_id={turn_id}: {e}"
                 );
-                publish_insight(&self.pool, turn_id, fallback_insight(execution)).await;
+                publish_insight(&self.pool, turn_id, fallback_insight(""), &subagent_results).await;
                 return;
             }
         };
@@ -218,7 +269,7 @@ impl InsightPlatform {
             self.usage_observation_tx.clone(),
             turn_id.to_string(),
             used_capabilities,
-            execution.cloned(),
+            subagent_results.clone(),
             Arc::clone(&state),
             Arc::clone(&notify),
         ));
@@ -272,7 +323,7 @@ async fn run_insight_stream_parser(
     usage_observation_tx: mpsc::Sender<Vec<UsageObservation>>,
     turn_id: String,
     used_capabilities: Vec<String>,
-    execution: Option<ExecutionOutput>,
+    fact_segments: Vec<String>,
     state: Arc<Mutex<InsightStreamState>>,
     notify: Arc<Notify>,
 ) {
@@ -313,13 +364,19 @@ async fn run_insight_stream_parser(
                 tracing::warn!(
                     "insight_platform: no insight text received for turn_id={turn_id}, using fallback"
                 );
-                insight_text = Some(fallback_insight(execution.as_ref()).insight);
+                insight_text = Some(fallback_insight(&snapshot.0).insight);
             }
         }
 
         if !snapshot.1 {
             if let Some(text) = insight_text {
-                publish_insight(&pool, &turn_id, InsightResult { insight: text }).await;
+                publish_insight(
+                    &pool,
+                    &turn_id,
+                    InsightResult { insight: text },
+                    &fact_segments,
+                )
+                .await;
                 if let Ok(mut guard) = state.lock() {
                     guard.insight_sent = true;
                 }
@@ -373,7 +430,33 @@ fn filter_usage_observations(
     before - observations.len()
 }
 
-async fn publish_insight(pool: &AgentPool, turn_id: &str, insight: InsightResult) {
+/// 事实节单段最大字符数（系统提取摘要截断上限）。
+const MAX_INSIGHT_FACT_CHARS: usize = 1200;
+
+/// 输出修饰（事实节 ⊕ 判断节）：事实节 = 确定性系统提取（subagent 结果段，
+/// 不依赖模型）；判断节 = 洞察模型解读原文。无 subagent 结果时省略事实节。
+fn decorate_insight_text(insight: &str, fact_segments: &[String]) -> String {
+    let mut parts = Vec::new();
+    if !fact_segments.is_empty() {
+        let facts = crate::common::json_util::truncate_head_tail(
+            &fact_segments.join("\n\n"),
+            MAX_INSIGHT_FACT_CHARS,
+        );
+        parts.push(format!("## 事实（系统提取）\n{facts}"));
+    }
+    parts.push(format!("## 洞察判断\n{insight}"));
+    parts.join("\n\n")
+}
+
+async fn publish_insight(
+    pool: &AgentPool,
+    turn_id: &str,
+    insight: InsightResult,
+    fact_segments: &[String],
+) {
+    let insight = InsightResult {
+        insight: decorate_insight_text(&insight.insight, fact_segments),
+    };
     let output = InsightOutput {
         insight,
         usage_observations: vec![],
@@ -664,41 +747,14 @@ fn format_lifecycle_record(record: &CapabilityLifecycleRecord) -> String {
     lines.join("\n")
 }
 
-fn fallback_insight(execution: Option<&ExecutionOutput>) -> InsightResult {
-    let text = match execution {
-        None => {
-            "本轮无执行，属于纯对话轮；没有能力调用证据需要复核，也不产生能力使用观察。".to_string()
-        }
-        Some(execution) => {
-            let failed: Vec<&CapabilityLifecycleRecord> = execution
-                .lifecycle_actions
-                .iter()
-                .filter(|record| {
-                    matches!(
-                        record.lifecycle_state,
-                        CapabilityLifecycleState::Failed | CapabilityLifecycleState::Rejected
-                    )
-                })
-                .collect();
-            if failed.is_empty() {
-                "本轮生命周期动作已受理或完成；方向是否真正正确仍需以实际产物和下一轮 subagent 结果为最终证据。".to_string()
-            } else {
-                let ids = failed
-                    .iter()
-                    .map(|record| record.capability_id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                if failed.len() == execution.lifecycle_actions.len() {
-                    format!(
-                        "本轮全部生命周期动作失败/被拒绝（{ids}），应先修正原因再继续，不把计划或总结当作完成。"
-                    )
-                } else {
-                    format!(
-                        "本轮部分生命周期动作失败/被拒绝（{ids}）。已受理/完成的事实可保留，失败项需在下一轮修正。"
-                    )
-                }
-            }
-        }
+/// 原文保留替代模板 fallback：不再生成模板话术——
+/// `insight = 原始输出截断文本`（max 800 字符），下游可见模型原话；
+/// 仅当原始输出完全为空/纯空白时返回标记文本「（洞察中台无输出）」。
+fn fallback_insight(raw_output: &str) -> InsightResult {
+    let text = if raw_output.trim().is_empty() {
+        "（洞察中台无输出）".to_string()
+    } else {
+        crate::common::json_util::truncate_utf8_boundary(raw_output, 800).to_string()
     };
     InsightResult { insight: text }
 }
@@ -1127,30 +1183,111 @@ mod tests {
     }
 
     #[test]
-    fn fallback_insight_reports_rejected() {
-        let result = fallback_insight(Some(&execution_with(vec![record(
-            "subagent.run",
-            CapabilityLifecycleState::Rejected,
-            vec![],
-            Some("sleeping".into()),
-        )])));
-        assert!(result.insight.contains("失败/被拒绝"));
+    fn fallback_insight_keeps_raw_output() {
+        // 原文保留替代模板：insight = 原始输出截断文本。
+        let result = fallback_insight("方向可能偏了，但这是模型原话");
+        assert_eq!(result.insight, "方向可能偏了，但这是模型原话");
     }
 
     #[test]
-    fn fallback_insight_accepted_is_not_success_claim() {
-        let result = fallback_insight(Some(&execution_with(vec![record(
-            "subagent.run",
-            CapabilityLifecycleState::Accepted,
-            vec![],
-            None,
-        )])));
-        assert!(result.insight.contains("受理或完成"));
+    fn fallback_insight_truncates_to_800_chars() {
+        let long = "x".repeat(2000);
+        let result = fallback_insight(&long);
+        assert!(result.insight.len() <= 800, "{}", result.insight.len());
+        assert!(result.insight.starts_with("x"));
     }
 
     #[test]
-    fn fallback_insight_none_execution_say_only() {
-        let result = fallback_insight(None);
-        assert!(result.insight.contains("纯对话轮"));
+    fn fallback_insight_empty_output_marker() {
+        assert_eq!(fallback_insight("").insight, "（洞察中台无输出）");
+        assert_eq!(fallback_insight("   \n\t ").insight, "（洞察中台无输出）");
+    }
+
+    #[test]
+    fn parse_insight_output_partial_damage_extracts_leading_json() {
+        // 部分损坏（散文 + 带头 JSON）：strip+首对象 提取。
+        let raw = parse_insight_output(
+            "先分析：\n{\"insight\":\"方向正确\",\"usage_observations\":[]}\n后记（未闭合",
+        )
+        .unwrap();
+        assert_eq!(raw.insight.as_deref(), Some("方向正确"));
+    }
+
+    #[test]
+    fn parse_insight_output_repair_path_recovers_bare_newline() {
+        let raw = parse_insight_output(
+            "{\"insight\":\"方向正确\",\"usage_observations\":[{\"capability_id\":\"file.read\",\"observation\":\"a\nb\",\"suggestion\":\"c\"}]}",
+        )
+        .unwrap();
+        assert_eq!(raw.insight.as_deref(), Some("方向正确"));
+        assert_eq!(raw.usage_observations.len(), 1);
+        assert_eq!(raw.usage_observations[0].observation, "a\nb");
+    }
+
+    #[test]
+    fn parse_insight_output_tolerates_non_string_insight() {
+        // 类型容错：insight=数字 → to_string 保留（不判死）。
+        let raw = parse_insight_output(r#"{"insight":42}"#).unwrap();
+        assert_eq!(raw.insight.as_deref(), Some("42"));
+        let raw = parse_insight_output(r#"{"insight":{"direction":"ok"}}"#).unwrap();
+        assert_eq!(raw.insight.as_deref(), Some(r#"{"direction":"ok"}"#));
+    }
+
+    #[test]
+    fn parse_insight_output_skips_bad_usage_observation_items() {
+        // usage_observations 数组内坏项跳过（字段级容错），其余项照常。
+        let raw = parse_insight_output(
+            r#"{"insight":"x","usage_observations":[
+                {"capability_id":"file.read","observation":"ok","suggestion":"s"},
+                "not-an-object",
+                {"capability_id":123}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(raw.insight.as_deref(), Some("x"));
+        assert_eq!(raw.usage_observations.len(), 1);
+        assert_eq!(raw.usage_observations[0].capability_id, "file.read");
+    }
+
+    #[test]
+    fn parse_insight_output_candidate_chain_order() {
+        // 候选链顺序：全文优先，其次 ```json 块。
+        let raw = parse_insight_output(
+            r#"{"insight":"from_plain"}\n```json\n{"insight":"from_block"}\n```"#,
+        )
+        .unwrap();
+        assert_eq!(raw.insight.as_deref(), Some("from_plain"));
+        // 无法整段解析时回退 ```json 块。
+        let raw =
+            parse_insight_output("```json\n{\"insight\":\"from_block\"}\n```\n尾部垃圾").unwrap();
+        assert_eq!(raw.insight.as_deref(), Some("from_block"));
+    }
+
+    #[test]
+    fn decorate_insight_text_without_facts_omits_fact_section() {
+        let decorated = decorate_insight_text("判断：继续", &[]);
+        assert_eq!(decorated, "## 洞察判断\n判断：继续");
+        assert!(!decorated.contains("事实"));
+    }
+
+    #[test]
+    fn decorate_insight_text_with_facts_prepends_fact_section() {
+        let decorated = decorate_insight_text(
+            "判断：继续",
+            &["subagent_id: sg_1\nlifecycle: Idle\noutput: 完成".to_string()],
+        );
+        assert!(decorated.starts_with("## 事实（系统提取）\nsubagent_id: sg_1"));
+        assert!(decorated.contains("\n\n## 洞察判断\n判断：继续"));
+    }
+
+    #[test]
+    fn decorate_insight_text_truncates_facts_at_1200() {
+        let long_segment = "y".repeat(1500);
+        let decorated = decorate_insight_text("判断", &[long_segment]);
+        assert!(
+            decorated.contains("[truncated"),
+            "事实节应被截断: {decorated}"
+        );
+        assert!(decorated.ends_with("## 洞察判断\n判断"));
     }
 }
