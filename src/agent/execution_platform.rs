@@ -34,6 +34,9 @@ struct ExecutionPlatformRawOutput {
     task_design: Option<String>,
     task_status: Option<String>,
     capability_calls: Vec<RawCapabilityCall>,
+    /// 坏调用证据：capability_id 非字符串/空的项原文（截断 200 字符），
+    /// 逐项提取时跳过并记入；组装 ExecutionOutput 时并入 task_status 供洞察可读。
+    bad_calls: Vec<String>,
 }
 
 const EXECUTION_INSTRUCTION: &str = "现在做一轮 subagent 生命周期管理。输出 JSON。";
@@ -554,9 +557,11 @@ impl ExecutionPlatform {
         } else {
             subagent_states = self.pool.subagent_states().await;
         }
+        // 坏调用证据并入 task_status：洞察中台可读，不吞坏项。
+        let task_status = append_bad_call_evidence(raw.task_status.as_deref(), &raw.bad_calls);
         ExecutionOutput {
             task_design: raw.task_design.unwrap_or_default(),
-            task_status: raw.task_status.unwrap_or_default(),
+            task_status,
             lifecycle_actions: actions,
             subagent_states,
         }
@@ -755,6 +760,22 @@ impl ExecutionPlatform {
     }
 }
 
+/// 坏调用证据并入 task_status 文本（洞察可读）；无坏项时原样返回。
+fn append_bad_call_evidence(task_status: Option<&str>, bad_calls: &[String]) -> String {
+    let mut status = task_status.unwrap_or_default().to_string();
+    if !bad_calls.is_empty() {
+        if !status.is_empty() {
+            status.push('\n');
+        }
+        status.push_str(&format!(
+            "[坏调用证据] 本轮 {} 个能力调用项损坏被跳过: {}",
+            bad_calls.len(),
+            bad_calls.join("; ")
+        ));
+    }
+    status
+}
+
 fn model_context_window(registry: &Option<Registry>, model_id: &str) -> usize {
     registry
         .as_ref()
@@ -834,6 +855,14 @@ fn failure_output(message: String) -> ExecutionOutput {
     }
 }
 
+/// 宽容解析执行中台输出：候选链（```json 块 / strip+首对象 / 全文）+
+/// Value 级逐项提取（动作/语意分离），全程不整体判死。
+///
+/// - `capability_calls`：逐项独立处理，坏项（capability_id 非字符串/空）记入
+///   `bad_calls` 证据并 warn 日志，其余项照常进入候选；
+/// - `task_design` / `task_status`：缺失 → None；类型非字符串 → `to_string()` 截断保留；
+/// - 完全提取不到 → 诚实零动作：`task_design=None`，`task_status=Some("raw:" + 原文截断
+///   200)`，`capability_calls=[]`——下游可见模型原话，不伪装「解析失败」占位。
 fn parse_execution_output(content: &str) -> ExecutionPlatformRawOutput {
     let mut candidates = Vec::new();
     if let Some(block) = crate::common::json_util::extract_json_block(content) {
@@ -849,24 +878,84 @@ fn parse_execution_output(content: &str) -> ExecutionPlatformRawOutput {
     }
 
     for candidate in candidates {
-        if let Ok(raw) = serde_json::from_str::<ExecutionPlatformRawOutput>(&candidate) {
+        if let Some(raw) = parse_execution_raw(&candidate) {
             return raw;
         }
         let repaired = crate::common::json_util::repair_json(&candidate);
         if repaired != candidate {
-            if let Ok(raw) = serde_json::from_str::<ExecutionPlatformRawOutput>(&repaired) {
+            if let Some(raw) = parse_execution_raw(&repaired) {
                 return raw;
             }
         }
     }
 
     ExecutionPlatformRawOutput {
-        task_design: Some("执行中台输出解析失败，本轮无能力调用。".to_string()),
+        task_design: None,
         task_status: Some(format!(
-            "invalid execution platform output: {}",
-            crate::common::json_util::truncate_utf8_boundary(content, 160)
+            "raw:{}",
+            crate::common::json_util::truncate_utf8_boundary(content, 200)
         )),
         capability_calls: vec![],
+        bad_calls: vec![],
+    }
+}
+
+/// Value 级宽容提取：整体反序列化为 Value 后逐字段处理（不依赖 serde 结构整体判死）。
+fn parse_execution_raw(text: &str) -> Option<ExecutionPlatformRawOutput> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let obj = value.as_object()?;
+    let mut raw = ExecutionPlatformRawOutput {
+        task_design: optional_text_field(obj.get("task_design")),
+        task_status: optional_text_field(obj.get("task_status")),
+        ..Default::default()
+    };
+    if let Some(calls) = obj.get("capability_calls").and_then(|v| v.as_array()) {
+        for item in calls {
+            match parse_raw_capability_call(item) {
+                Some(call) => raw.capability_calls.push(call),
+                None => {
+                    let item_text = serde_json::to_string(item).unwrap_or_default();
+                    let excerpt = crate::common::json_util::truncate_utf8_boundary(&item_text, 200);
+                    tracing::warn!("execution_platform: 坏 capability_call 项跳过: {excerpt}");
+                    raw.bad_calls.push(excerpt.to_string());
+                }
+            }
+        }
+    }
+    Some(raw)
+}
+
+/// 单个能力调用宽容解析：`capability_id` 非字符串/空 → None（记坏证据）；
+/// `capability_name` 非字符串 → `to_string()` 保留；`arguments` 原样。
+fn parse_raw_capability_call(item: &serde_json::Value) -> Option<RawCapabilityCall> {
+    let obj = item.as_object()?;
+    let capability_id = match obj.get("capability_id") {
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => s.clone(),
+        _ => return None,
+    };
+    let capability_name = obj.get("capability_name").map(|v| match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    });
+    let arguments = obj
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    Some(RawCapabilityCall {
+        capability_id,
+        capability_name,
+        arguments,
+    })
+}
+
+/// 语意字段容错：缺失 → None；非字符串 → `to_string()` 截断 200 字符保留（不判死）。
+fn optional_text_field(v: Option<&serde_json::Value>) -> Option<String> {
+    match v {
+        None => None,
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(other) => Some(
+            crate::common::json_util::truncate_utf8_boundary(&other.to_string(), 200).to_string(),
+        ),
     }
 }
 
@@ -954,9 +1043,112 @@ mod tests {
 
     #[test]
     fn parse_output_invalid_fails_closed_with_empty_calls() {
+        // 诚实零动作：原话进 task_status（带 raw: 前缀），不伪装正常 0 动作。
         let raw = parse_execution_output("not json");
         assert!(raw.capability_calls.is_empty());
-        assert!(raw.task_status.as_deref().unwrap().contains("invalid"));
+        assert!(raw.bad_calls.is_empty());
+        let status = raw.task_status.as_deref().unwrap();
+        assert!(status.starts_with("raw:"), "{status}");
+        assert!(status.contains("not json"));
+        assert!(raw.task_design.is_none());
+    }
+
+    #[test]
+    fn parse_output_extracts_from_prose_mixed_json() {
+        // 散文 + 裸 JSON 混合：strip+首对象 提取。
+        let raw = parse_execution_output(
+            "分析完成。\n{\"task_design\":\"继续\",\"task_status\":\"等待\",\"capability_calls\":[{\"capability_id\":\"file.read\",\"arguments\":{\"path\":\"a.txt\"}}]}",
+        );
+        assert_eq!(raw.task_design.as_deref(), Some("继续"));
+        assert_eq!(raw.capability_calls.len(), 1);
+        assert_eq!(raw.capability_calls[0].capability_id, "file.read");
+        assert_eq!(raw.capability_calls[0].arguments["path"], "a.txt");
+        assert!(raw.bad_calls.is_empty());
+    }
+
+    #[test]
+    fn parse_output_skips_bad_calls_keeps_good_ones() {
+        let raw = parse_execution_output(
+            r#"{"task_design":"d","capability_calls":[
+                {"capability_id":123,"arguments":{}},
+                {"capability_id":"file.read","arguments":{"path":"a"}},
+                {"capability_id":"","arguments":{}},
+                {"capability_id":"text.grep","arguments":{"pattern":"x"}}
+            ]}"#,
+        );
+        assert_eq!(raw.capability_calls.len(), 2, "2 好 2 坏 → 仅 2 好进入候选");
+        assert_eq!(raw.capability_calls[0].capability_id, "file.read");
+        assert_eq!(raw.capability_calls[1].capability_id, "text.grep");
+        assert_eq!(raw.bad_calls.len(), 2, "坏证据 2 条");
+        assert!(
+            raw.bad_calls[0].contains("capability_id"),
+            "证据含坏项原文: {}",
+            raw.bad_calls[0]
+        );
+        assert_eq!(
+            raw.task_design.as_deref(),
+            Some("d"),
+            "语意字段不受坏项影响"
+        );
+    }
+
+    #[test]
+    fn parse_output_tolerates_non_string_semantic_fields() {
+        // task_design 数字 → to_string 保留；task_status 缺失 → None；capability_name 数字宽容。
+        let raw = parse_execution_output(
+            r#"{"task_design":42,"capability_calls":[{"capability_id":"file.read","capability_name":7}]}"#,
+        );
+        assert_eq!(raw.task_design.as_deref(), Some("42"));
+        assert!(raw.task_status.is_none());
+        assert_eq!(raw.capability_calls.len(), 1);
+        assert_eq!(raw.capability_calls[0].capability_id, "file.read");
+        assert_eq!(
+            raw.capability_calls[0].capability_name.as_deref(),
+            Some("7")
+        );
+        assert!(raw.bad_calls.is_empty());
+    }
+
+    #[test]
+    fn parse_output_repair_path_recovers_bare_newline() {
+        // repair_json 路径：字符串内裸换行。
+        let raw = parse_execution_output(
+            "{\"task_design\":\"d\",\"task_status\":\"s\",\"capability_calls\":[{\"capability_id\":\"file.read\",\"arguments\":{\"path\":\"a\nb\"}}]}",
+        );
+        assert_eq!(raw.capability_calls.len(), 1);
+        assert_eq!(raw.capability_calls[0].capability_id, "file.read");
+        assert_eq!(raw.capability_calls[0].arguments["path"], "a\nb");
+    }
+
+    #[test]
+    fn parse_output_candidate_chain_prefers_fenced_block() {
+        // 候选链顺序：```json 块优先于首对象/全文。
+        let text = "```json\n{\"task_design\":\"from_block\",\"capability_calls\":[{\"capability_id\":\"file.read\"}]}\n```\n{\"task_design\":\"from_plain\",\"capability_calls\":[]}";
+        let raw = parse_execution_output(text);
+        assert_eq!(raw.task_design.as_deref(), Some("from_block"));
+        assert_eq!(raw.capability_calls.len(), 1);
+    }
+
+    #[test]
+    fn parse_output_candidate_chain_falls_back_to_plain_json() {
+        let text = "先思考\n{\"task_design\":\"from_plain\",\"capability_calls\":[{\"capability_id\":\"text.grep\"}]}";
+        let raw = parse_execution_output(text);
+        assert_eq!(raw.task_design.as_deref(), Some("from_plain"));
+        assert_eq!(raw.capability_calls[0].capability_id, "text.grep");
+    }
+
+    #[test]
+    fn append_bad_call_evidence_merges_into_task_status() {
+        assert_eq!(append_bad_call_evidence(None, &[]), "");
+        assert_eq!(
+            append_bad_call_evidence(Some("继续"), &[]),
+            "继续",
+            "无坏项原样返回"
+        );
+        let merged =
+            append_bad_call_evidence(Some("继续"), &["{\"capability_id\":123}".to_string()]);
+        assert!(merged.starts_with("继续\n[坏调用证据] 本轮 1 个能力调用项损坏被跳过: "));
+        assert!(merged.contains("{\"capability_id\":123}"));
     }
 
     #[test]
@@ -1034,6 +1226,7 @@ mod tests {
                         "capability_allowlist": ["file.read"],
                     }),
                 }],
+                bad_calls: vec![],
             })
             .await;
         assert_eq!(created.lifecycle_actions.len(), 1);
@@ -1055,6 +1248,7 @@ mod tests {
                         "task_input": "probe",
                     }),
                 }],
+                bad_calls: vec![],
             })
             .await;
         assert_eq!(run.lifecycle_actions.len(), 1);
