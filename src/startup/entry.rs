@@ -431,7 +431,6 @@ pub async fn run_normal(
         let exp_api_key = memory_api_key.clone();
         let exp_prompts = memory_prompts_dir.clone();
 
-        let exp_trivium = std::sync::Arc::clone(&trivium_db);
         let exp_registry = memory_registry.clone();
         let exp_executor = std::sync::Arc::clone(&memory_executor);
         tokio::spawn(async move {
@@ -439,7 +438,6 @@ pub async fn run_normal(
                 exp_provider,
                 exp_model,
                 Some(exp_api_key),
-                Some(exp_trivium),
                 exp_prompts,
                 experience_rx,
                 exp_registry,
@@ -456,7 +454,6 @@ pub async fn run_normal(
         let pref_api_key = memory_api_key.clone();
         let pref_prompts = memory_prompts_dir.clone();
 
-        let pref_trivium = std::sync::Arc::clone(&trivium_db);
         let pref_registry = memory_registry.clone();
         let pref_executor = std::sync::Arc::clone(&memory_executor);
         tokio::spawn(async move {
@@ -464,7 +461,6 @@ pub async fn run_normal(
                 pref_provider,
                 pref_model,
                 Some(pref_api_key),
-                Some(pref_trivium),
                 pref_prompts,
                 preference_rx,
                 pref_registry,

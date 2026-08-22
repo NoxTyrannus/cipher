@@ -97,7 +97,15 @@ pub fn clear_prompt_cache() {
 }
 
 pub fn read_platform_prompt(prompts_dir: &Path, name: &str) -> String {
-    read_prompt(prompts_dir, name)
+    let content = read_prompt(prompts_dir, name);
+    // T3：文件缺失/为空时回退 DEFAULT_PROMPTS 内嵌默认（记忆 agent 无 prompts_dir 时的
+    // 角色/判断标准兜底；md 与内嵌常量同源 include_str，语义一致）。
+    if content.trim().is_empty() {
+        if let Some((_, default)) = DEFAULT_PROMPTS.iter().find(|(n, _)| *n == name) {
+            return default.to_string();
+        }
+    }
+    content
 }
 
 #[cfg(test)]

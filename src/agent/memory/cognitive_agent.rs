@@ -3,18 +3,19 @@ use std::sync::Arc;
 
 use secrecy::SecretString;
 
-use serde_json::Value;
-
+use crate::agent::memory::capability_agent::{run_capability_loop, CapabilityLoopRequest};
+use crate::agent::memory::memory_capability_entries;
 use crate::data::duckdb::Registry;
 use crate::data::triviumdb::TriviumDb;
 use crate::data::ModelRow;
 use crate::logic::capability::executor::CapabilityExecutor;
-use crate::logic::capability::service::{CapabilityCall, CapabilityService};
-use crate::logic::model::message::{ChatMessage, SystemKind};
-use crate::logic::model::prompts::read_platform_prompt;
-use crate::logic::model::provider::{LlmProvider, LlmRequest};
+use crate::logic::model::prompts::{
+    compose_agent_capability_prompt, read_platform_prompt, MEMORY_COGNITIVE_DEFAULT,
+};
+use crate::logic::model::provider::LlmProvider;
 
-#[allow(dead_code)]
+const ACTOR_ID: &str = "cognitive-agent";
+
 pub struct CognitiveAgent {
     provider: Arc<dyn LlmProvider>,
     model_row: ModelRow,
@@ -81,71 +82,77 @@ impl CognitiveAgent {
         tracing::info!("cognitive agent: inbox closed, exiting");
     }
 
+    /// T3：工具调用式交错思维链（与 attention-agent 同构）。
+    /// 输入 = 近期思考摘要 + 当前认知图；agent 在能力循环内先查看（memory.list /
+    /// memory.retrieve）、可查证（memory.evidence.lookup），再提交变更
+    /// （memory.cognitive.update），全部完成后输出 done。写回在能力循环内完成。
     async fn process_cognitive_update(&self) -> crate::common::Result<()> {
-        let base = match &self.prompts_dir {
+        let base_prompt = match &self.prompts_dir {
             Some(dir) => read_platform_prompt(dir, "memory_cognitive.md"),
-            None => String::from("Update cognitive graph based on recent thought summaries."),
+            None => MEMORY_COGNITIVE_DEFAULT.to_string(),
         };
 
-        let api_key = match &self.api_key {
-            Some(k) => k.clone(),
-            None => return Ok(()),
+        let (Some(registry), Some(executor)) = (&self.registry, &self.executor) else {
+            tracing::warn!("{ACTOR_ID}: capability runtime not configured; update skipped");
+            return Ok(());
         };
-
-        let prompt = format!(
-            "{}\n\n## Task\nUpdate the cognitive graph through the capability protocol.\n\n             Output ONLY one JSON object:\n             {{\n  \"nodes\": [{{\"action\": \"upsert|delete\", \"node_id\": \"可选\", \"insight\": \"概念/规则\", \"context\": \"背景\"}}],\n             \"edges\": [{{\"action\": \"upsert|delete\", \"from\": \"节点A\", \"to\": \"节点B\", \"relation\": \"关系\"}}]\n}}\n\n             节点不超过100字，边关系不超过30字。",
-            base,
-        );
+        let Some(api_key) = &self.api_key else {
+            return Ok(());
+        };
 
         let summaries = self.recent_thought_summaries(29);
         let current_graph = self.current_cognitive_graph().await;
-        let mut user_parts = Vec::new();
+        let mut input_parts = Vec::new();
         if !summaries.is_empty() {
-            user_parts.push(format!("## Recent Thought Summaries\n{summaries}"));
+            input_parts.push(format!("## Recent Thought Summaries\n{summaries}"));
         }
         if !current_graph.is_empty() {
-            user_parts.push(format!("## Current Cognitive Graph\n{current_graph}"));
+            input_parts.push(format!("## Current Cognitive Graph\n{current_graph}"));
         }
-        user_parts.push("Update cognitive graph now. Output ONLY the JSON.".to_string());
-        let user_content = user_parts.join("\n\n");
+        let input_segment = input_parts.join("\n\n");
 
-        let messages = vec![
-            ChatMessage::System {
-                text: prompt,
-                kind: SystemKind::Primary,
-            },
-            ChatMessage::User { text: user_content },
-        ];
-
-        let req = LlmRequest::from_model_row(&self.model_row, messages, api_key)?;
-        let resp = self.provider.call(&req).await?;
-
-        let output: serde_json::Value = serde_json::from_str(&resp.content).unwrap_or(Value::Null);
-        let (node_updates, edge_updates) = cognitive_updates_from_output(output);
-        if node_updates.is_empty() && edge_updates.is_empty() {
-            return Ok(());
-        }
-
-        let (Some(registry), Some(executor)) = (&self.registry, &self.executor) else {
-            tracing::warn!("cognitive agent: capability runtime not configured; update skipped");
-            return Ok(());
-        };
-
-        let args = serde_json::json!({
-            "nodes": node_updates,
-            "edges": edge_updates,
-        });
-        let call = CapabilityCall {
-            capability_id: "memory.cognitive.update".to_string(),
-            capability_name: "Update Cognitive Graph".to_string(),
-            arguments: args,
-        };
-        CapabilityService::new(registry, executor)?.execute_for_agent("cognitive-agent", &call)?;
-        tracing::debug!(
-            "cognitive agent: capability update committed (nodes={}, edges={})",
-            node_updates.len(),
-            edge_updates.len()
+        let system_prompt = compose_agent_capability_prompt(
+            &base_prompt,
+            &memory_capability_entries(registry, executor, ACTOR_ID),
         );
+
+        let req = CapabilityLoopRequest {
+            actor_id: ACTOR_ID.to_string(),
+            system_prompt,
+            assistant_segments: if input_segment.is_empty() {
+                vec![]
+            } else {
+                vec![input_segment]
+            },
+            user_prompt: "基于以上思考摘要与当前认知图，更新认知图：先用 memory.list / memory.retrieve 查看相关节点与边，可调用 memory.evidence.lookup 查证原始证据，最后调用 memory.cognitive.update（nodes/edges）提交变更；无变更时输出 done 说明。开始执行。".to_string(),
+        };
+
+        match run_capability_loop(
+            &self.provider,
+            &self.model_row,
+            api_key,
+            registry,
+            executor,
+            req,
+        )
+        .await
+        {
+            Ok(trace) => {
+                for line in &trace.logs {
+                    tracing::info!("{ACTOR_ID}: {line}");
+                }
+                if !trace.completed {
+                    tracing::warn!(
+                        "{ACTOR_ID}: did not finish within max_turns ({} calls)",
+                        trace.calls.len()
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("{ACTOR_ID} loop failed: {e}");
+                return Ok(());
+            }
+        }
 
         self.publish_cognitive_version();
 
@@ -280,49 +287,5 @@ fn truncate_text(s: &str, max_chars: usize) -> String {
         format!("{truncated}…")
     } else {
         truncated
-    }
-}
-
-fn cognitive_updates_from_output(output: Value) -> (Vec<Value>, Vec<Value>) {
-    match output {
-        Value::Array(fragments) => {
-            // 兼容旧版 entity/relation/target 三元组：按边导入。
-            let mut edges = Vec::new();
-            for fragment in fragments {
-                let Some(from) = fragment.get("entity").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                let Some(relation) = fragment.get("relation").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                let Some(to) = fragment.get("target").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                if from.trim().is_empty() || relation.trim().is_empty() || to.trim().is_empty() {
-                    continue;
-                }
-                edges.push(serde_json::json!({
-                    "action": "upsert",
-                    "from": from,
-                    "relation": relation,
-                    "to": to,
-                }));
-            }
-            (Vec::new(), edges)
-        }
-        Value::Object(obj) => {
-            let nodes = obj
-                .get("nodes")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let edges = obj
-                .get("edges")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            (nodes, edges)
-        }
-        _ => (Vec::new(), Vec::new()),
     }
 }

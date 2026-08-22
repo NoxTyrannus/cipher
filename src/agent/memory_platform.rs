@@ -2,9 +2,7 @@ use crate::data::duckdb::Registry;
 use crate::data::triviumdb::TriviumDb;
 use crate::data::ModelRow;
 use crate::logic::capability::executor::CapabilityExecutor;
-use crate::logic::model::prompts::{
-    compose_agent_capability_prompt, read_platform_prompt, CapabilityPromptEntry,
-};
+use crate::logic::model::prompts::{compose_agent_capability_prompt, read_platform_prompt};
 use crate::logic::model::provider::LlmProvider;
 use secrecy::SecretString;
 use std::path::{Path, PathBuf};
@@ -17,6 +15,7 @@ use super::communication::{
     ExecutionOutput, ExperienceFragment, InsightOutput, MemoryOutput,
 };
 use super::memory::capability_agent::{run_capability_loop, CapabilityLoopRequest};
+use super::memory::memory_capability_entries;
 
 #[cfg(test)]
 fn extract_json_block(text: &str) -> Option<String> {
@@ -333,27 +332,6 @@ impl MemoryPlatform {
             }
         }
     }
-}
-
-fn memory_capability_entries(
-    registry: &Registry,
-    executor: &Arc<CapabilityExecutor>,
-    actor_id: &str,
-) -> Vec<CapabilityPromptEntry> {
-    let Ok(service) = crate::logic::capability::service::CapabilityService::new(registry, executor)
-    else {
-        return Vec::new();
-    };
-    let Ok(defs) = service.definitions_for_agent(actor_id) else {
-        return Vec::new();
-    };
-    defs.into_iter()
-        .map(|d| CapabilityPromptEntry {
-            capability_id: d.capability_id,
-            capability_name: d.capability_name,
-            description: d.description,
-        })
-        .collect()
 }
 
 fn attention_output_from_trace(
