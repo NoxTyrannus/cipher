@@ -647,50 +647,6 @@ fn fallback_memory(execution: Option<&ExecutionOutput>) -> MemoryOutput {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[cfg(test)]
-struct SettleAction {
-    new_attention: Vec<AttentionFragment>,
-    retired_focus: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[cfg(test)]
-struct MemoryAgentOutput {
-    settle: SettleAction,
-}
-
-#[cfg(test)]
-fn parse_memory_agent_output(content: &str) -> MemoryAgentOutput {
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
-        return MemoryAgentOutput {
-            settle: SettleAction {
-                new_attention: vec![],
-                retired_focus: vec![],
-            },
-        };
-    }
-
-    if let Ok(output) = serde_json::from_str::<MemoryAgentOutput>(trimmed) {
-        return output;
-    }
-
-    if let Some(json_str) = extract_json_block(trimmed) {
-        if let Ok(output) = serde_json::from_str::<MemoryAgentOutput>(&json_str) {
-            return output;
-        }
-    }
-
-    tracing::warn!("memory_platform: parse_memory_agent_output failed, raw={trimmed}");
-    MemoryAgentOutput {
-        settle: SettleAction {
-            new_attention: vec![],
-            retired_focus: vec![],
-        },
-    }
-}
-
 /// 记忆中台 System(平台提示词)：基础提示词 + 已有注意力快照（RAG 检索结果）。
 /// 2.0.3：单段拼接（## Goal/## Think/## Insight/## Execution 段落合并）已废弃。
 fn build_attention_prompt(base_prompt: &str, existing_attention: &str) -> String {
@@ -1069,37 +1025,5 @@ mod tests {
         let result = extract_json_block(text);
         assert!(result.is_some());
         assert_eq!(result.unwrap(), "[1, 2, 3]");
-    }
-
-    #[test]
-    fn parse_memory_agent_output_valid() {
-        let json = r#"{"settle":{"new_attention":[{"focus":"test topic","content":"description"}],"retired_focus":[]}}"#;
-        let output = parse_memory_agent_output(json);
-        assert_eq!(output.settle.new_attention.len(), 1);
-        assert_eq!(output.settle.new_attention[0].focus, "test topic");
-        assert!(output.settle.retired_focus.is_empty());
-    }
-
-    #[test]
-    fn parse_memory_agent_output_empty() {
-        let output = parse_memory_agent_output("");
-        assert!(output.settle.new_attention.is_empty());
-        assert!(output.settle.retired_focus.is_empty());
-    }
-
-    #[test]
-    fn parse_memory_agent_output_in_code_block() {
-        let text = "```json\n{\"settle\":{\"new_attention\":[{\"focus\":\"f1\",\"content\":\"c1\"}],\"retired_focus\":[\"old\"]}}\n```";
-        let output = parse_memory_agent_output(text);
-        assert_eq!(output.settle.new_attention.len(), 1);
-        assert_eq!(output.settle.retired_focus.len(), 1);
-        assert_eq!(output.settle.retired_focus[0], "old");
-    }
-
-    #[test]
-    fn parse_memory_agent_output_garbage_returns_default() {
-        let output = parse_memory_agent_output("not json at all");
-        assert!(output.settle.new_attention.is_empty());
-        assert!(output.settle.retired_focus.is_empty());
     }
 }
