@@ -72,7 +72,7 @@ fn memory_index(kind: &MemoryKind) -> usize {
 /// 共享规整 pass（规则严格按序）：
 /// 1. Primary System 按序 `\n\n` 拼接为主 system 基底
 /// 2. Memory 按 cognitive→attention→experience→preference 固定顺序分组
-/// 3. Meta System 转 User，保持序列相对位置
+/// 3. Meta System 保序保留为 System（不转变、不合并，序列相对位置不变）
 /// 4. User/Assistant 原样保留；剔除全空白文本消息
 /// 5. cache_after_system 恒 true
 pub fn normalize(messages: Vec<ChatMessage>) -> Normalized {
@@ -93,7 +93,10 @@ pub fn normalize(messages: Vec<ChatMessage>) -> Normalized {
                 SystemKind::Meta => {
                     let text = text.trim().to_string();
                     if !text.is_empty() {
-                        history.push(ChatMessage::User { text });
+                        history.push(ChatMessage::System {
+                            text,
+                            kind: SystemKind::Meta,
+                        });
                     }
                 }
             },
@@ -211,7 +214,7 @@ mod tests {
         assert!(matches!(&n.messages[0], ChatMessage::User { text } if text == "hi"));
         assert!(matches!(
             &n.messages[1],
-            ChatMessage::User { text } if text == "[memory echo]\n沉淀 4 条"
+            ChatMessage::System { text, kind: SystemKind::Meta } if text == "[memory echo]\n沉淀 4 条"
         ));
         assert!(n.cache_after_system);
     }
@@ -242,23 +245,42 @@ mod tests {
     }
 
     #[test]
-    fn meta_becomes_user_keeping_position() {
+    fn meta_stays_system_keeping_position() {
         let n = normalize(vec![
             user("a"),
             meta("[capability result: file.read]\ncontent"),
             user("b"),
         ]);
-        let roles: Vec<&str> = n
-            .messages
-            .iter()
-            .map(|m| match m {
-                ChatMessage::User { .. } => "user",
-                _ => "other",
-            })
-            .collect();
-        assert_eq!(roles, vec!["user", "user", "user"]);
-        assert!(n.messages[1].text().contains("file.read"));
+        assert_eq!(n.messages.len(), 3);
+        assert!(matches!(&n.messages[0], ChatMessage::User { text } if text == "a"));
+        assert!(matches!(
+            &n.messages[1],
+            ChatMessage::System { text, kind: SystemKind::Meta } if text == "[capability result: file.read]\ncontent"
+        ));
+        assert!(matches!(&n.messages[2], ChatMessage::User { text } if text == "b"));
         assert_eq!(n.system, "");
+    }
+
+    #[test]
+    fn meta_not_merged_into_memory_or_primary() {
+        // Meta 保持独立 system 段：不并入 Primary system、不并入 Memory 分组。
+        let n = normalize(vec![
+            primary("sys"),
+            memory("记忆A", MemoryKind::Cognitive),
+            meta("[mode trigger: keep]\nreason"),
+            user("hi"),
+        ]);
+        assert_eq!(n.system, "sys\n\n## 认知记忆\n记忆A");
+        assert!(!n.system.contains("mode trigger"));
+        assert_eq!(n.messages.len(), 2);
+        assert!(matches!(
+            &n.messages[0],
+            ChatMessage::System {
+                kind: SystemKind::Meta,
+                ..
+            }
+        ));
+        assert!(matches!(&n.messages[1], ChatMessage::User { text } if text == "hi"));
     }
 
     #[test]

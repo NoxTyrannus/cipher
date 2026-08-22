@@ -70,7 +70,11 @@ fn build_openai_request(req: &LlmRequest, stream: bool) -> OpenAiRequest<'_> {
                 role: "assistant".to_string(),
                 content: text.clone(),
             }),
-            ChatMessage::System { .. } => unreachable!("normalize 已抽取全部 System"),
+            // Meta 等 System 段保序输出 role=system（不合并进主 system，保序语义）。
+            ChatMessage::System { text, .. } => messages.push(OpenAiMessage {
+                role: "system".to_string(),
+                content: text.clone(),
+            }),
         }
     }
     OpenAiRequest {
@@ -331,6 +335,28 @@ mod tests {
         assert!(sys_text.contains("## 注意力"));
         assert!(sys_text.contains("[ATTENTION] focus: x"));
         assert_eq!(msgs[1]["role"], "user");
+    }
+
+    #[test]
+    fn meta_system_serialized_in_order_as_system_role() {
+        let req = LlmRequest {
+            model: "m".into(),
+            system: Some("你是助手".into()),
+            messages: vec![
+                user_msg("a"),
+                ChatMessage::System {
+                    text: "[Think Engine output]\nthink".into(),
+                    kind: SystemKind::Meta,
+                },
+                user_msg("b"),
+            ],
+            ..Default::default()
+        };
+        let body = serde_json::to_value(build_openai_request(&req, false)).unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, vec!["system", "user", "system", "user"], "{body}");
+        assert_eq!(msgs[2]["content"], "[Think Engine output]\nthink");
     }
 
     #[test]

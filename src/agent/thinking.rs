@@ -360,6 +360,26 @@ trait ThinkingSchemeHandler: Send + Sync {
 
 struct DualThinkingHandler;
 
+/// Say 消息组装：把 [Think Engine output] 作为独立 Meta 段插入。
+/// 若消息末尾是 User 段，在其**之前**插入；否则追加到末尾——
+/// 保证真实用户消息 = 唯一 user 段（不 replace、不冒充 user）。
+fn insert_think_meta_before_user(messages: &mut Vec<ChatMessage>, think_text: &str) {
+    let segment = ChatMessage::System {
+        text: format!("[Think Engine output]\n{think_text}"),
+        kind: SystemKind::Meta,
+    };
+    if matches!(messages.last(), Some(ChatMessage::User { .. })) {
+        let user_text = match messages.pop() {
+            Some(ChatMessage::User { text }) => text,
+            _ => unreachable!("guard 已确认末尾为 User"),
+        };
+        messages.push(segment);
+        messages.push(ChatMessage::User { text: user_text });
+    } else {
+        messages.push(segment);
+    }
+}
+
 #[async_trait::async_trait]
 impl ThinkingSchemeHandler for DualThinkingHandler {
     #[allow(clippy::too_many_arguments)]
@@ -459,25 +479,8 @@ impl ThinkingSchemeHandler for DualThinkingHandler {
             let (say_system, mut say_messages) = assembler
                 .build_dual_messages("say", input, &mode_hint)
                 .await;
-            if let Some(last) = say_messages.last_mut() {
-                if let ChatMessage::User { .. } = last {
-                    let user_text = match std::mem::replace(
-                        last,
-                        ChatMessage::System {
-                            text: String::new(),
-                            kind: SystemKind::Meta,
-                        },
-                    ) {
-                        ChatMessage::User { text } => text,
-                        _ => unreachable!(),
-                    };
-                    *last = ChatMessage::System {
-                        text: format!("[Think Engine output]\n{think_text}"),
-                        kind: SystemKind::Meta,
-                    };
-                    say_messages.push(ChatMessage::User { text: user_text });
-                }
-            }
+            // 在真实用户消息之前插入独立 Meta 段（真实用户消息 = 唯一 user 段）。
+            insert_think_meta_before_user(&mut say_messages, &think_text);
             let say_system = if self_awareness.is_empty() {
                 say_system
             } else {
@@ -666,6 +669,68 @@ impl Default for ThinkingFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn user(text: &str) -> ChatMessage {
+        ChatMessage::User {
+            text: text.to_string(),
+        }
+    }
+
+    fn assistant(text: &str) -> ChatMessage {
+        ChatMessage::Assistant {
+            text: text.to_string(),
+        }
+    }
+
+    fn meta(text: &str) -> ChatMessage {
+        ChatMessage::System {
+            text: text.to_string(),
+            kind: SystemKind::Meta,
+        }
+    }
+
+    #[test]
+    fn insert_think_meta_before_user_keeps_single_user_segment() {
+        // 末尾为 User：think 段在其之前插入，真实用户消息仍为唯一 user 段。
+        let mut msgs = vec![assistant("a1"), user("真实输入")];
+        insert_think_meta_before_user(&mut msgs, "think 文本");
+        assert_eq!(msgs.len(), 3);
+        assert!(
+            matches!(&msgs[1], ChatMessage::System { text, kind: SystemKind::Meta } if text == "[Think Engine output]\nthink 文本")
+        );
+        assert!(matches!(&msgs[2], ChatMessage::User { text } if text == "真实输入"));
+        let user_count = msgs
+            .iter()
+            .filter(|m| matches!(m, ChatMessage::User { .. }))
+            .count();
+        assert_eq!(user_count, 1, "真实用户消息必须是唯一 user 段");
+    }
+
+    #[test]
+    fn insert_think_meta_appends_when_no_trailing_user() {
+        let mut msgs = vec![user("q1"), assistant("a1")];
+        insert_think_meta_before_user(&mut msgs, "t2");
+        assert_eq!(msgs.len(), 3);
+        assert!(matches!(
+            &msgs[2],
+            ChatMessage::System { text, kind: SystemKind::Meta } if text == "[Think Engine output]\nt2"
+        ));
+    }
+
+    #[test]
+    fn insert_think_meta_keeps_prior_order() {
+        let mut msgs = vec![meta("[capability result: file.read]\ncontent"), user("u")];
+        insert_think_meta_before_user(&mut msgs, "think");
+        assert_eq!(msgs.len(), 3);
+        // 既有 Meta 段位置不变（索引 0），think 段紧随其后，用户消息仍在末尾。
+        assert!(
+            matches!(&msgs[0], ChatMessage::System { text, .. } if text.starts_with("[capability result"))
+        );
+        assert!(
+            matches!(&msgs[1], ChatMessage::System { text, .. } if text == "[Think Engine output]\nthink")
+        );
+        assert!(matches!(&msgs[2], ChatMessage::User { .. }));
+    }
 
     #[test]
     fn five_states_have_distinct_strs() {

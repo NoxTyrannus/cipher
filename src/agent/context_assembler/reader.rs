@@ -25,7 +25,10 @@ pub(super) fn parsed_thinking_input(input: ThinkingInput) -> ParsedMessage {
             } else {
                 ""
             };
-            parsed_message("system", format!("[洞察回环轮{result_flag}]\n{summary}"))
+            parsed_message(
+                "system",
+                format!("[洞察回环轮 | 洞察中台报告{result_flag}]\n{summary}"),
+            )
         }
         ThinkingInput::ModeTrigger { mode, reason } => {
             parsed_message("system", format!("[mode trigger: {mode}]\n{reason}"))
@@ -352,4 +355,67 @@ pub(super) fn parse_yaml_string(line: &str, prefix: &str) -> Option<String> {
     line.strip_prefix(prefix)
         .map(|s| s.trim())
         .map(|s| s.trim_matches('"').to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::thought::ThinkingInput;
+
+    #[test]
+    fn platform_insight_prefix_names_insight_platform() {
+        let parsed = parsed_thinking_input(ThinkingInput::PlatformInsight {
+            summary: "insight 摘要".to_string(),
+            has_subagent_result: false,
+        });
+        assert_eq!(parsed.role, "system");
+        assert!(parsed
+            .content
+            .starts_with("[洞察回环轮 | 洞察中台报告]\ninsight 摘要"));
+    }
+
+    #[test]
+    fn platform_insight_prefix_marks_subagent_result() {
+        let parsed = parsed_thinking_input(ThinkingInput::PlatformInsight {
+            summary: "摘要".to_string(),
+            has_subagent_result: true,
+        });
+        assert!(parsed
+            .content
+            .starts_with("[洞察回环轮 | 洞察中台报告 (含 subagent 结果段)]\n摘要"));
+    }
+
+    #[test]
+    fn mode_trigger_and_capability_result_prefixes_unchanged() {
+        let mode = parsed_thinking_input(ThinkingInput::ModeTrigger {
+            mode: "keep".to_string(),
+            reason: "r".to_string(),
+        });
+        assert!(mode.content.starts_with("[mode trigger: keep]"));
+        let cap = parsed_thinking_input(ThinkingInput::CapabilityResult {
+            capability_id: "file.read".to_string(),
+            capability_name: "读文件".to_string(),
+            summary: "s".to_string(),
+            artifact_refs: vec![],
+        });
+        assert!(cap
+            .content
+            .starts_with("[capability result: file.read / 读文件]"));
+    }
+
+    #[test]
+    fn chat_message_of_system_maps_to_meta() {
+        let parsed = ParsedMessage {
+            role: "system".to_string(),
+            token_count: 3,
+            content: "[洞察回环轮 | 洞察中台报告]\nx".to_string(),
+        };
+        assert!(matches!(
+            chat_message_of(&parsed),
+            ChatMessage::System {
+                kind: SystemKind::Meta,
+                ..
+            }
+        ));
+    }
 }
