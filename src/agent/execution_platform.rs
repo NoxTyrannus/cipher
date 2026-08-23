@@ -34,8 +34,9 @@ struct ExecutionPlatformRawOutput {
     task_design: Option<String>,
     task_status: Option<String>,
     capability_calls: Vec<RawCapabilityCall>,
-    /// 坏调用证据：capability_id 非字符串/空的项原文（截断 200 字符），
-    /// 逐项提取时跳过并记入；组装 ExecutionOutput 时并入 task_status 供洞察可读。
+    /// 坏调用证据：capability_id 非字符串/空的项原文、capability_calls 非数组的字段
+    /// 原文（截断 200 字符），逐项提取时跳过并记入；组装 ExecutionOutput 时并入
+    /// task_status 供洞察可读。
     bad_calls: Vec<String>,
 }
 
@@ -761,6 +762,11 @@ impl ExecutionPlatform {
 }
 
 /// 坏调用证据并入 task_status 文本（洞察可读）；无坏项时原样返回。
+/// 证据总量封顶：坏项正文合计不超过 `MAX_BAD_EVIDENCE_CHARS`（400）字符，
+/// 只完整保留上限内的条目，其余以 `…(+N items)` 标记省略——防止极端坏输出
+/// 膨胀 task_status 流入洞察请求上下文（insight_platform 组装该字段时不截断）。
+const MAX_BAD_EVIDENCE_CHARS: usize = 400;
+
 fn append_bad_call_evidence(task_status: Option<&str>, bad_calls: &[String]) -> String {
     let mut status = task_status.unwrap_or_default().to_string();
     if !bad_calls.is_empty() {
@@ -768,10 +774,26 @@ fn append_bad_call_evidence(task_status: Option<&str>, bad_calls: &[String]) -> 
             status.push('\n');
         }
         status.push_str(&format!(
-            "[坏调用证据] 本轮 {} 个能力调用项损坏被跳过: {}",
-            bad_calls.len(),
-            bad_calls.join("; ")
+            "[坏调用证据] 本轮 {} 个能力调用项损坏被跳过: ",
+            bad_calls.len()
         ));
+        // 逐条完整装入上限（单条提取时已截断 200，首条必然可装入）；
+        // 装不下的条目整条省略并计数。
+        let mut kept: Vec<&str> = Vec::new();
+        let mut used = 0usize;
+        for item in bad_calls {
+            let sep = if kept.is_empty() { 0 } else { 2 }; // "; "
+            if used + sep + item.len() > MAX_BAD_EVIDENCE_CHARS {
+                break;
+            }
+            used += sep + item.len();
+            kept.push(item);
+        }
+        let omitted = bad_calls.len() - kept.len();
+        status.push_str(&kept.join("; "));
+        if omitted > 0 {
+            status.push_str(&format!("…(+{omitted} items)"));
+        }
     }
     status
 }
@@ -859,7 +881,8 @@ fn failure_output(message: String) -> ExecutionOutput {
 /// Value 级逐项提取（动作/语意分离），全程不整体判死。
 ///
 /// - `capability_calls`：逐项独立处理，坏项（capability_id 非字符串/空）记入
-///   `bad_calls` 证据并 warn 日志，其余项照常进入候选；
+///   `bad_calls` 证据并 warn 日志，其余项照常进入候选；字段为非数组
+///   （对象/字符串等）时原文记入 `bad_calls` 证据并 warn，仍零动作；
 /// - `task_design` / `task_status`：缺失 → None；类型非字符串 → `to_string()` 截断保留；
 /// - 完全提取不到 → 诚实零动作：`task_design=None`，`task_status=Some("raw:" + 原文截断
 ///   200)`，`capability_calls=[]`——下游可见模型原话，不伪装「解析失败」占位。
@@ -909,17 +932,29 @@ fn parse_execution_raw(text: &str) -> Option<ExecutionPlatformRawOutput> {
         task_status: optional_text_field(obj.get("task_status")),
         ..Default::default()
     };
-    if let Some(calls) = obj.get("capability_calls").and_then(|v| v.as_array()) {
-        for item in calls {
-            match parse_raw_capability_call(item) {
-                Some(call) => raw.capability_calls.push(call),
-                None => {
-                    let item_text = serde_json::to_string(item).unwrap_or_default();
-                    let excerpt = crate::common::json_util::truncate_utf8_boundary(&item_text, 200);
-                    tracing::warn!("execution_platform: 坏 capability_call 项跳过: {excerpt}");
-                    raw.bad_calls.push(excerpt.to_string());
+    match obj.get("capability_calls") {
+        // 缺失：零动作（与诚实零动作语义一致）。
+        None => {}
+        Some(serde_json::Value::Array(calls)) => {
+            for item in calls {
+                match parse_raw_capability_call(item) {
+                    Some(call) => raw.capability_calls.push(call),
+                    None => {
+                        let item_text = serde_json::to_string(item).unwrap_or_default();
+                        let excerpt =
+                            crate::common::json_util::truncate_utf8_boundary(&item_text, 200);
+                        tracing::warn!("execution_platform: 坏 capability_call 项跳过: {excerpt}");
+                        raw.bad_calls.push(excerpt.to_string());
+                    }
                 }
             }
+        }
+        // 非数组（对象/字符串等）：复述原文记坏证据 + warn，仍零动作。
+        Some(other) => {
+            let raw_text = serde_json::to_string(other).unwrap_or_default();
+            let excerpt = crate::common::json_util::truncate_utf8_boundary(&raw_text, 200);
+            tracing::warn!("execution_platform: capability_calls 非数组，跳过: {excerpt}");
+            raw.bad_calls.push(excerpt.to_string());
         }
     }
     Some(raw)
@@ -1149,6 +1184,75 @@ mod tests {
             append_bad_call_evidence(Some("继续"), &["{\"capability_id\":123}".to_string()]);
         assert!(merged.starts_with("继续\n[坏调用证据] 本轮 1 个能力调用项损坏被跳过: "));
         assert!(merged.contains("{\"capability_id\":123}"));
+    }
+
+    #[test]
+    fn append_bad_call_evidence_caps_total_and_marks_omitted() {
+        // 50 条 × 28 字节 = 1400 字节，远超上限 → 只完整保留能装入 400 上限的整条，
+        // 尾部 …(+N items) 标记省略条数，坏项正文有界。
+        let items: Vec<String> = (0..50)
+            .map(|i| format!("item-{i:02}:{}", "y".repeat(20)))
+            .collect();
+        let merged = append_bad_call_evidence(None, &items);
+        assert!(merged.starts_with("[坏调用证据] 本轮 50 个能力调用项损坏被跳过: "));
+        let body_start = merged.find(": ").unwrap() + 2;
+        let body = &merged[body_start..];
+        assert!(body.contains("…(+"), "应含省略标记: {merged}");
+        let kept_part = body.split("…(+").next().unwrap();
+        assert!(
+            kept_part.len() <= 400,
+            "坏项正文应≤400: {}",
+            kept_part.len()
+        );
+        assert!(kept_part.contains("item-00"), "首条完整保留");
+        assert!(kept_part.contains("item-12"), "完整条目逐条装入");
+        assert!(!kept_part.contains("item-13"), "超出上限的条目省略");
+        let omitted: usize = body
+            .split("…(+")
+            .nth(1)
+            .and_then(|s| s.split(" items)").next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        assert!((1..50).contains(&omitted), "omitted={omitted}");
+        assert_eq!(omitted, 50 - kept_part.matches("item-").count());
+        // 单条 200 内小样本：原样并入，无省略标记。
+        let small = append_bad_call_evidence(
+            Some("继续"),
+            &[
+                "{\"capability_id\":123}".to_string(),
+                "{\"capability_id\":\"\"}".to_string(),
+            ],
+        );
+        assert!(!small.contains("…(+"), "小样本不省略: {small}");
+        assert!(small.contains("{\"capability_id\":123}; {\"capability_id\":\"\"}"));
+    }
+
+    #[test]
+    fn parse_output_non_array_capability_calls_records_bad_evidence() {
+        // capability_calls 为对象：复述原文记坏证据，仍零动作，语意字段不受影响。
+        let raw = parse_execution_output(
+            r#"{"task_design":"d","capability_calls":{"capability_id":"file.read","arguments":{"path":"a"}}}"#,
+        );
+        assert!(raw.capability_calls.is_empty(), "对象形态零动作");
+        assert_eq!(raw.bad_calls.len(), 1, "记 1 条坏证据");
+        assert!(
+            raw.bad_calls[0].contains("capability_id"),
+            "{}",
+            raw.bad_calls[0]
+        );
+        assert_eq!(raw.task_design.as_deref(), Some("d"));
+
+        // 字符串形态同样记证据，坏证据截断 200。
+        let raw2 =
+            parse_execution_output(r#"{"task_status":"s","capability_calls":"oops not an array"}"#);
+        assert!(raw2.capability_calls.is_empty());
+        assert_eq!(raw2.bad_calls.len(), 1);
+        assert!(
+            raw2.bad_calls[0].contains("oops not an array"),
+            "{}",
+            raw2.bad_calls[0]
+        );
+        assert_eq!(raw2.task_status.as_deref(), Some("s"));
     }
 
     #[test]
