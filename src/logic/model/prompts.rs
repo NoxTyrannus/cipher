@@ -154,10 +154,12 @@ pub fn compose_dual_prompt(prompts_dir: &Path, role: &str, mode: &str) -> String
         "loop" => "Current mode: LOOP — continuous autonomous iteration; think is required, say is forbidden.",
         _ => "",
     };
+    // 系统描述（system.md）置顶：先建立「我是谁所在的世界」的认知，再给引擎契约、身份信条与模式说明。
+    let system = read_platform_prompt(prompts_dir, "system.md");
     if mode_line.is_empty() {
-        format!("{engine}\n\n{soul}")
+        format!("{system}\n\n{engine}\n\n{soul}")
     } else {
-        format!("{engine}\n\n{soul}\n\n{mode_line}")
+        format!("{system}\n\n{engine}\n\n{soul}\n\n{mode_line}")
     }
 }
 
