@@ -35,7 +35,8 @@ pub enum MemoryKind {
     Preference,
 }
 
-/// normalize 产物：system 文本 + 纯对话历史（System 已全部抽取）。
+/// normalize 产物：system 基底（Primary 合并 + Memory 分组）+ 保序历史。
+/// 历史中 System 仅剩 Meta 段（保序保留，序列化层按序输出 role=system，不并入基底）。
 #[derive(Debug, Clone)]
 pub struct Normalized {
     pub system: String,

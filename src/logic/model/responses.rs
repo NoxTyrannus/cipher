@@ -87,7 +87,15 @@ fn build_responses_request(req: &LlmRequest, stream: bool) -> ResponsesRequest<'
                 call_id: None,
                 output: None,
             }),
-            ChatMessage::System { .. } => unreachable!("normalize 已抽取全部 System"),
+            // Meta 等 System 段保序输出 role=system 的 input item（不合并进
+            // instructions，保序语义；Primary 段由 normalize 汇入 instructions 基底）。
+            ChatMessage::System { text, .. } => input.push(ResponsesInputItem {
+                item_type: "message".to_string(),
+                role: Some("system".to_string()),
+                content: Some(text.clone()),
+                call_id: None,
+                output: None,
+            }),
         }
     }
 
@@ -473,6 +481,62 @@ mod tests {
         assert!(instructions.contains("## 认知记忆"));
         assert!(instructions.contains("[COGNITIVE] user likes rust"));
         assert_eq!(body["input"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn meta_system_serialized_in_order_as_system_role() {
+        // 双脑 think 上下文：历史 PlatformInsight Meta + 用户消息 + think 段 Meta + 用户消息。
+        // Meta 保序进 inputs（role=system），Primary 进 instructions，二者不合并。
+        let req = LlmRequest {
+            model: "m".into(),
+            system: Some("你是助手".into()),
+            messages: vec![
+                ChatMessage::System {
+                    text: "[洞察回环轮 | 洞察中台报告]\ninsight".into(),
+                    kind: SystemKind::Meta,
+                },
+                ChatMessage::User { text: "a".into() },
+                ChatMessage::System {
+                    text: "[Think Engine output]\nthink".into(),
+                    kind: SystemKind::Meta,
+                },
+                ChatMessage::User { text: "b".into() },
+            ],
+            ..Default::default()
+        };
+        let body = serde_json::to_value(build_responses_request(&req, false)).unwrap();
+        assert_eq!(body["instructions"], "你是助手");
+        let input = body["input"].as_array().unwrap();
+        let roles: Vec<&str> = input.iter().map(|i| i["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, vec!["system", "user", "system", "user"], "{body}");
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["content"], "[洞察回环轮 | 洞察中台报告]\ninsight");
+        assert_eq!(input[2]["content"], "[Think Engine output]\nthink");
+    }
+
+    #[test]
+    fn say_sequence_think_meta_before_user_serialized_in_order() {
+        // 双脑 say 路径最简形态：[System(Meta think), User] —— think 段按序保留在用户前。
+        let req = make_request(vec![
+            ChatMessage::System {
+                text: "[Think Engine output]\nplan".into(),
+                kind: SystemKind::Meta,
+            },
+            ChatMessage::User {
+                text: "继续".to_string(),
+            },
+        ]);
+        let body = serde_json::to_value(build_responses_request(&req, false)).unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "system");
+        assert_eq!(input[0]["content"], "[Think Engine output]\nplan");
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["content"], "继续");
+        assert!(
+            body.get("instructions").is_none(),
+            "无 Primary 时不生成 instructions"
+        );
     }
 
     #[test]
