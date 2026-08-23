@@ -6,6 +6,7 @@ use budget::{ContextBudget, ParsedMessage};
 use reader::*;
 
 use crate::agent::agent_pool::AgentPool;
+use crate::agent::thought::ThinkingInput;
 use crate::agent::thought::ThinkingTerminalState;
 use crate::common::{AgentError, Result};
 use crate::data::thought_store::ThoughtStore;
@@ -194,11 +195,16 @@ impl ContextAssembler {
     }
 
     /// 双脑模式专用：按 role（think/say）组装 system prompt 和 messages。
+    /// `input_override`：内部轮（非用户输入轮，如洞察回环轮）携带的 ThinkingInput。
+    /// Some（内部轮）时当前输入段以 System{Meta} + reader 同款前缀呈现（保序插入原
+    /// User 段位置，不产生任何 User 段——真实用户消息=唯一 user 段全局成立）；
+    /// None（用户轮）时当前输入段为 User 段（现状不变）。
     pub async fn build_dual_messages(
         &self,
         role: &str,
         user_input: &str,
         mode_hint: &str,
+        input_override: Option<&ThinkingInput>,
     ) -> (String, Vec<ChatMessage>) {
         let window = self.config.context_window;
 
@@ -254,9 +260,18 @@ impl ContextAssembler {
         }
         messages.extend(experience_msgs);
         messages.extend(preference_msgs);
-        messages.push(ChatMessage::User {
-            text: user_input.to_string(),
-        });
+        match input_override {
+            // 内部轮：当前输入段 = System{Meta} + reader 同款前缀（parsed_thinking_input
+            // 与历史段格式一致），保序插入原 User 段位置，不产生任何 User 段。
+            Some(override_input) => {
+                let parsed = parsed_thinking_input(override_input.clone());
+                messages.push(chat_message_of(&parsed));
+            }
+            // 用户轮：现状不变（当前输入段 = 唯一 User 段）。
+            None => messages.push(ChatMessage::User {
+                text: user_input.to_string(),
+            }),
+        }
 
         (system_prompt, messages)
     }
@@ -828,6 +843,208 @@ mod tests {
             messages.last().unwrap(),
             ChatMessage::User { text } if text == "next loop"
         ));
+    }
+
+    #[tokio::test]
+    async fn internal_round_current_input_is_system_meta_without_user_segment() {
+        // 内部轮（has_user_input=false，如洞察回环轮）：当前输入段 = System{Meta} +
+        // reader 同款前缀，保序置于原 User 段位置，不产生任何 User 段。
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let assembler = ContextAssembler::new(ContextConfig::default(), &data_dir, None);
+
+        let override_input = ThinkingInput::PlatformInsight {
+            summary: "洞察摘要".to_string(),
+            has_subagent_result: false,
+        };
+        let (_system_prompt, messages) = assembler
+            .build_dual_messages("think", "洞察摘要", "unni", Some(&override_input))
+            .await;
+
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(m, ChatMessage::User { .. })),
+            "内部轮 build 结果不应含任何 User 段: {:?}",
+            messages
+        );
+        assert!(matches!(
+            messages.last(),
+            Some(ChatMessage::System { text, kind: SystemKind::Meta })
+                if text == "[洞察回环轮 | 洞察中台报告]\n洞察摘要"
+        ));
+    }
+
+    #[tokio::test]
+    async fn internal_round_platform_insight_prefix_marks_subagent_result() {
+        // has_subagent_result=true 时附加「 (含 subagent 结果段)」，与 reader 历史段格式一致。
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let assembler = ContextAssembler::new(ContextConfig::default(), &data_dir, None);
+
+        let override_input = ThinkingInput::PlatformInsight {
+            summary: "摘要".to_string(),
+            has_subagent_result: true,
+        };
+        let (_s, messages) = assembler
+            .build_dual_messages("think", "摘要", "unni", Some(&override_input))
+            .await;
+        assert!(matches!(
+            messages.last(),
+            Some(ChatMessage::System { text, kind: SystemKind::Meta })
+                if text == "[洞察回环轮 | 洞察中台报告 (含 subagent 结果段)]\n摘要"
+        ));
+    }
+
+    #[tokio::test]
+    async fn internal_round_mode_trigger_and_capability_result_prefixes() {
+        // ModeTrigger / CapabilityResult 前缀与 reader parsed_thinking_input 历史段同款。
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let assembler = ContextAssembler::new(ContextConfig::default(), &data_dir, None);
+
+        let mode_override = ThinkingInput::ModeTrigger {
+            mode: "keep".to_string(),
+            reason: "预算收敛".to_string(),
+        };
+        let (_s, messages) = assembler
+            .build_dual_messages("think", "预算收敛", "keep", Some(&mode_override))
+            .await;
+        assert!(matches!(
+            messages.last(),
+            Some(ChatMessage::System { text, kind: SystemKind::Meta })
+                if text == "[mode trigger: keep]\n预算收敛"
+        ));
+
+        let cap_override = ThinkingInput::CapabilityResult {
+            capability_id: "file.read".to_string(),
+            capability_name: "读文件".to_string(),
+            summary: "读取成功".to_string(),
+            artifact_refs: vec!["ref1".to_string()],
+        };
+        let (_s, messages) = assembler
+            .build_dual_messages("think", "读取成功", "unni", Some(&cap_override))
+            .await;
+        assert!(matches!(
+            messages.last(),
+            Some(ChatMessage::System { text, kind: SystemKind::Meta })
+                if text == "[capability result: file.read / 读文件]\n读取成功\nartifact refs: ref1"
+        ));
+
+        let legacy_override = ThinkingInput::LegacyInternal;
+        let (_s, messages) = assembler
+            .build_dual_messages("think", "x", "unni", Some(&legacy_override))
+            .await;
+        assert!(matches!(
+            messages.last(),
+            Some(ChatMessage::System { text, kind: SystemKind::Meta })
+                if text == "[legacy internal round]"
+        ));
+    }
+
+    #[tokio::test]
+    async fn internal_round_keeps_history_order_and_current_meta_at_end() {
+        // 历史含真实用户轮（其 User 段合法），内部轮当前输入 Meta 段保序置于末尾，
+        // 不以 User 段冒充当前输入。
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let thought_store = Arc::new(ThoughtStore::open(&data_dir).unwrap());
+
+        let mut completed = ThoughtContext::new_at(
+            ThoughtId::parse("ca761237-ed42-11ce-bacd-00aa0057b223").unwrap(),
+            UtcTimestamp::parse("2026-07-15T12:37:00.000000000Z").unwrap(),
+            ThinkingInput::User {
+                text: "真实用户历史问题".to_string(),
+            },
+        );
+        thought_store.persist_input(&completed).unwrap();
+        completed.set_output(ThinkingOutput::completed(
+            Some("历史 think".to_string()),
+            Some("历史 say".to_string()),
+            None,
+        ));
+        thought_store.persist_output(&completed).unwrap();
+
+        let mut assembler = ContextAssembler::new(ContextConfig::default(), &data_dir, None);
+        assembler.set_thought_store(Arc::clone(&thought_store));
+
+        let override_input = ThinkingInput::PlatformInsight {
+            summary: "洞察摘要".to_string(),
+            has_subagent_result: false,
+        };
+        let (_s, messages) = assembler
+            .build_dual_messages("think", "洞察摘要", "unni", Some(&override_input))
+            .await;
+
+        // 历史真实用户段仍存在（合法 user 段）。
+        assert!(messages
+            .iter()
+            .any(|m| message_text(m) == "真实用户历史问题"));
+        // 当前输入不得以 User 段出现（不冒充用户）。
+        assert!(!messages
+            .iter()
+            .any(|m| matches!(m, ChatMessage::User { text } if text == "洞察摘要")));
+        // 当前输入段 = System{Meta} + 前缀，保序置于末尾（原 User 段位置）。
+        assert!(matches!(
+            messages.last(),
+            Some(ChatMessage::System { text, kind: SystemKind::Meta })
+                if text == "[洞察回环轮 | 洞察中台报告]\n洞察摘要"
+        ));
+    }
+
+    #[tokio::test]
+    async fn internal_round_messages_normalize_keep_meta_without_user() {
+        // normalize（TA 产物）对 Meta 保序：内部轮当前输入段经 normalize 后仍为
+        // role=system 的 Meta 段，不产生任何 User 段（全局「唯一 user 段」成立）。
+        use crate::logic::model::message::normalize;
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let assembler = ContextAssembler::new(ContextConfig::default(), &data_dir, None);
+
+        let override_input = ThinkingInput::PlatformInsight {
+            summary: "当前洞察摘要".to_string(),
+            has_subagent_result: false,
+        };
+        let (_s, messages) = assembler
+            .build_dual_messages("think", "当前洞察摘要", "unni", Some(&override_input))
+            .await;
+        let normalized = normalize(messages);
+        assert!(!normalized
+            .messages
+            .iter()
+            .any(|m| matches!(m, ChatMessage::User { .. })));
+        assert!(normalized.messages.iter().any(|m| matches!(
+            m,
+            ChatMessage::System { text, kind: SystemKind::Meta }
+                if text == "[洞察回环轮 | 洞察中台报告]\n当前洞察摘要"
+        )));
+    }
+
+    #[tokio::test]
+    async fn user_round_keeps_single_user_segment() {
+        // 用户轮（has_user_input=true）：现状回归，当前输入段 = 唯一 User 段。
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let assembler = ContextAssembler::new(ContextConfig::default(), &data_dir, None);
+
+        let (_system_prompt, messages) = assembler
+            .build_dual_messages("think", "hello", "unni", None)
+            .await;
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            messages.last(),
+            Some(ChatMessage::User { text }) if text == "hello"
+        ));
+        let user_count = messages
+            .iter()
+            .filter(|m| matches!(m, ChatMessage::User { .. }))
+            .count();
+        assert_eq!(user_count, 1, "用户轮必须恰好一个 user 段");
     }
 
     #[tokio::test]

@@ -405,6 +405,10 @@ impl ThinkingSchemeHandler for DualThinkingHandler {
         let api_key = resolve_api_key(model_row)?;
         let self_awareness = assembler.build_self_awareness().await;
         let has_user_input = is_user_input;
+        // 内部轮（input_override=Some）时把当前输入段交给组装层包装为 System{Meta}+前缀
+        // （与 reader 历史段同款，不产生 User 段）；用户轮（None）保持 User 段。
+        // 与 has_user_input（=input_override.is_none()）同源，不引入新判定。
+        let input_override = instance.input_override.as_ref();
         // 2.0.8 回环轮执行权（决策冻结 2026-08-21）：
         // - UNNI：洞察回环轮（PlatformInsight）且该轮洞察输入含 subagent 结果段
         //   （has_subagent_result=true）→ 无执行权（输出交付后停，等用户下一次输入）；
@@ -434,7 +438,7 @@ impl ThinkingSchemeHandler for DualThinkingHandler {
 
         // Think 调用（可取消）
         let (think_system, think_messages) = assembler
-            .build_dual_messages("think", input, &mode_hint)
+            .build_dual_messages("think", input, &mode_hint, input_override)
             .await;
         let think_system = if self_awareness.is_empty() {
             think_system
@@ -477,7 +481,7 @@ impl ThinkingSchemeHandler for DualThinkingHandler {
         if should_say {
             // Say 调用：共享上下文 + Think 输出 + 用户消息（可取消）
             let (say_system, mut say_messages) = assembler
-                .build_dual_messages("say", input, &mode_hint)
+                .build_dual_messages("say", input, &mode_hint, input_override)
                 .await;
             // 在真实用户消息之前插入独立 Meta 段（真实用户消息 = 唯一 user 段）。
             insert_think_meta_before_user(&mut say_messages, &think_text);
@@ -895,6 +899,7 @@ mod tests {
         think: String,
         say: String,
         calls: std::sync::atomic::AtomicUsize,
+        captured: Arc<std::sync::Mutex<Vec<Vec<ChatMessage>>>>,
     }
 
     impl DualScriptedProvider {
@@ -903,6 +908,7 @@ mod tests {
                 think: think.into(),
                 say: say.into(),
                 calls: std::sync::atomic::AtomicUsize::new(0),
+                captured: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
     }
@@ -919,11 +925,13 @@ mod tests {
 
         async fn call(
             &self,
-            _request: &crate::logic::model::provider::LlmRequest,
+            request: &crate::logic::model::provider::LlmRequest,
         ) -> std::result::Result<
             crate::logic::model::provider::LlmResponse,
             crate::common::AgentError,
         > {
+            // 记录每次请求的消息序列，供请求级断言（内部轮不得含 User 段）。
+            self.captured.lock().unwrap().push(request.messages.clone());
             // 引擎提示词当前留空，无法再用角色文案区分；按调用顺序（think → say）返回。
             let content = if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                 self.think.clone()
@@ -1126,5 +1134,56 @@ mod tests {
             receivers.execution_rx.try_recv(),
             Ok(crate::agent::communication::AgentMessage::Execute { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn internal_round_requests_carry_system_meta_no_user_segment() {
+        // 请求级回归：内部轮（PlatformInsight）think/say 两次请求均不含 User 段，
+        // 当前输入段为 System{Meta} + reader 同款前缀（真实用户消息=唯一 user 段全局成立）。
+        let temporary = tempfile::tempdir().unwrap();
+        let thought_store = Arc::new(ThoughtStore::open(temporary.path()).unwrap());
+        let (pool, _receivers) = AgentPool::new();
+        let assembler = dual_test_assembler(temporary.path());
+        let instance = unni_insight_instance("insight summary", false);
+        let mut context = instance.thought_context();
+        thought_store.persist_input(&context).unwrap();
+
+        let provider = DualScriptedProvider::new("internal plan", "user visible report");
+        let captured = Arc::clone(&provider.captured);
+
+        DualThinkingHandler
+            .run_with_dm(
+                instance,
+                &dual_test_model_row(),
+                Arc::new(provider),
+                &assembler,
+                &pool,
+                &thought_store,
+                "insight summary",
+                false,
+                &mut context,
+                &tokio::sync::Notify::new(),
+            )
+            .await
+            .unwrap();
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2, "think + say 各一次请求");
+        for msgs in requests.iter() {
+            assert!(
+                !msgs.iter().any(|m| matches!(m, ChatMessage::User { .. })),
+                "内部轮请求不应含 User 段: {:?}",
+                msgs
+            );
+            assert!(
+                msgs.iter().any(|m| matches!(
+                    m,
+                    ChatMessage::System { text, kind: SystemKind::Meta }
+                        if text.starts_with("[洞察回环轮 | 洞察中台报告]")
+                )),
+                "当前输入段应为 System{{Meta}} + 洞察前缀: {:?}",
+                msgs
+            );
+        }
     }
 }
