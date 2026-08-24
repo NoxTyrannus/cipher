@@ -480,11 +480,13 @@ pub fn seed_subagent_templates(conn: &duckdb::Connection) -> Result<()> {
     Ok(())
 }
 
-/// 核心平台 agent 表内预授权（§4.1）：执行中台六个 subagent.*、洞察平台 usage_method.observe。
+/// 核心平台 agent 表内预授权（§4.1）：执行中台六个 subagent.*、洞察平台 usage_method.observe、
+/// 洞察域能力记忆 agent（usage_method.observe，常驻滑动窗口节点；config.max_turns=2 限制
+/// 失败回环重试上限）。
 ///
 /// INSERT ON CONFLICT DO NOTHING，幂等；已存在的行（含用户手工改动）不被覆盖。
 pub fn seed_platform_agents(conn: &duckdb::Connection) -> Result<()> {
-    let agents: &[(&str, &str, &[&str])] = &[
+    let agents: &[(&str, &str, &[&str], Option<&str>)] = &[
         (
             "execution-platform",
             "Execution Platform",
@@ -496,22 +498,33 @@ pub fn seed_platform_agents(conn: &duckdb::Connection) -> Result<()> {
                 "subagent.wake",
                 "subagent.delete",
             ],
+            None,
         ),
         (
             "insight-platform",
             "Insight Platform",
             &["usage_method.observe"],
+            None,
+        ),
+        (
+            "capability-memory-agent",
+            "Capability Memory Agent",
+            &["usage_method.observe"],
+            Some(r#"{"max_turns":2}"#),
         ),
     ];
-    for (id, name, caps) in agents {
+    for (id, name, caps, config) in agents {
         let caps_json = serde_json::to_string(caps).map_err(|error| {
             AgentError::Parse(format!("serialize capability_allowlist for {id}: {error}"))
         })?;
+        let config_json = config
+            .map(str::to_string)
+            .unwrap_or_else(|| "null".to_string());
         conn.execute(
-            "INSERT INTO agent (id, name, mode, capability_allowlist, display_name, is_default) \
-             VALUES (?, ?, 'platform', CAST(? AS JSON), ?, false) \
+            "INSERT INTO agent (id, name, mode, capability_allowlist, config, display_name, is_default) \
+             VALUES (?, ?, 'platform', CAST(? AS JSON), CAST(? AS JSON), ?, false) \
              ON CONFLICT (id) DO NOTHING",
-            duckdb::params![id, name, caps_json, name],
+            duckdb::params![id, name, caps_json, config_json, name],
         )
         .map_err(|error| AgentError::Bootstrap(format!("seed platform agent {id}: {error}")))?;
     }
@@ -676,7 +689,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(platform_count, 2);
+        assert_eq!(platform_count, 3);
 
         // 幂等：再跑一遍不增加行、不破坏已有行。
         import_factory_defaults(&conn, dir.path()).unwrap();
@@ -695,7 +708,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(platform_count_after, 2);
+        assert_eq!(platform_count_after, 3);
 
         // 模板 allowlist 为宽安全集（四模板同宽集，实例只做子集裁剪）。
         let allowlist_text: Option<String> = conn

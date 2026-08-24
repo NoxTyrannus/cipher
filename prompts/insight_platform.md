@@ -26,24 +26,9 @@ Use these three questions as a thinking method only:
 2. Alignment: is the current subagent plan still moving toward the goal?
 3. Growth: is there a capability usage lesson worth persisting?
 
-Compress the answer into one `insight` passage. Do not output the questions as fields.
+Compress the answer into one passage of prose. Do not output the questions as fields.
 
-## Output Format
+## Output
 
-Respond with ONLY one JSON object:
-
-```json
-{
-  "insight": "one complete judgement about whether the direction is still correct",
-  "usage_observations": [
-    {"capability_id": "actual capability id used this turn", "observation": "...", "suggestion": "..."}
-  ]
-}
-```
-
-Rules:
-- `insight` is required and comes first.
-- `usage_observations` may be empty when there is no lesson worth persisting.
-- `usage_observations[].capability_id` must appear in the latest capability call logs.
-- Do not modify stable capability definitions; observations are proposals only.
-- Do not output extra fields.
+Write your judgement as one passage of plain prose (natural language). This passage is your
+complete output — no JSON, no fixed format. Mention the real evidence you rely on.

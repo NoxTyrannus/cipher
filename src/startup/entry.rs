@@ -360,45 +360,17 @@ pub async fn run_normal(
         .await;
     });
 
-    let (usage_observation_tx, usage_observation_rx): (
-        mpsc::Sender<Vec<crate::agent::communication::UsageObservation>>,
-        mpsc::Receiver<Vec<crate::agent::communication::UsageObservation>>,
-    ) = mpsc::channel(32);
+    let (capability_memory_tx, capability_memory_rx) = mpsc::channel::<String>(64);
 
-    // 洞察只产生 usage observation 提案；这里通过 CapabilityService 调用
-    // usage_method.observe 分子能力写回 usage_method，不直连 DuckDB。
-    let usage_registry = app_state.registry.clone();
-    let usage_executor = std::sync::Arc::clone(&memory_executor);
-    tokio::spawn(async move {
-        let mut rx = usage_observation_rx;
-        while let Some(observations) = rx.recv().await {
-            for observation in observations {
-                let call = crate::logic::capability::service::CapabilityCall {
-                    capability_id: "usage_method.observe".to_string(),
-                    capability_name: "Observe Usage Method".to_string(),
-                    arguments: serde_json::json!({
-                        "capability_id": observation.capability_id,
-                        "observation": observation.observation,
-                        "suggestion": observation.suggestion,
-                    }),
-                };
-                match crate::logic::capability::service::CapabilityService::new(
-                    &usage_registry,
-                    &usage_executor,
-                )
-                .and_then(|service| service.execute_for_agent("insight-platform", &call))
-                {
-                    Ok(_) => tracing::debug!("usage_method.observe: observation persisted"),
-                    Err(e) => tracing::warn!("usage_method.observe failed: {e}"),
-                }
-            }
-        }
-        tracing::info!("usage observation consumer: rx closed, shutting down");
-    });
     let pool_insight = std::sync::Arc::clone(&pool);
     let insight_model = default_model.clone();
     let insight_prompts_dir = prompts_dir.clone();
     let insight_storage_root = Some(app_state.paths.storage_root().to_path_buf());
+    let cm_provider = std::sync::Arc::clone(&insight_provider);
+    let cm_model = default_model.clone();
+    let cm_api_key = insight_api_key.clone();
+    let cm_registry = app_state.registry.clone();
+    let cm_executor = std::sync::Arc::clone(&memory_executor);
     let insight_task = tokio::spawn(async move {
         crate::agent::insight_platform::run(
             pool_insight,
@@ -406,10 +378,24 @@ pub async fn run_normal(
             insight_provider,
             insight_model,
             insight_api_key,
-            usage_observation_tx,
+            capability_memory_tx,
             insight_prompts_dir,
             insight_storage_root,
         )
+        .await;
+    });
+
+    // 洞察域常驻节点：能力记忆 agent（滑动窗口，工具=usage_method.observe）。
+    tokio::spawn(async move {
+        crate::agent::insight_capability_memory::CapabilityMemoryAgent::new(
+            cm_provider,
+            cm_model,
+            cm_api_key,
+            cm_registry,
+            cm_executor,
+            capability_memory_rx,
+        )
+        .run()
         .await;
     });
 

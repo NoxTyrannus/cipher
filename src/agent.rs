@@ -4,6 +4,7 @@ pub mod communication;
 pub mod context_assembler;
 pub mod execution_platform;
 pub mod execution_types;
+pub mod insight_capability_memory;
 pub mod insight_platform;
 pub mod memory;
 pub mod memory_platform;
