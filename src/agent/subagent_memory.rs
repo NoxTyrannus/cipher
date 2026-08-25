@@ -307,7 +307,25 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+
+    /// 权限断言仅 Unix 平台可测（PermissionsExt::mode）；Windows 跳过。
+    #[cfg(unix)]
+    fn assert_private_file_modes(
+        dir: &std::path::Path,
+        memory: &std::path::Path,
+        last_output: &std::path::Path,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(dir.metadata().unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            memory.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            last_output.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     fn entry(prefix: &str, size: usize) -> MemoryEntry {
         MemoryEntry {
@@ -342,15 +360,8 @@ mod tests {
         let dir = root.join("subagents").join("sg_init");
         let memory = dir.join("memory.json");
         let last_output = dir.join("last_output.json");
-        assert_eq!(dir.metadata().unwrap().permissions().mode() & 0o777, 0o700);
-        assert_eq!(
-            memory.metadata().unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert_eq!(
-            last_output.metadata().unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        #[cfg(unix)]
+        assert_private_file_modes(&dir, &memory, &last_output);
 
         let parsed: SubagentMemory =
             serde_json::from_str(&std::fs::read_to_string(&memory).unwrap()).unwrap();
