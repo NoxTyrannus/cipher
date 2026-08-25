@@ -41,7 +41,7 @@ Respond with ONLY one JSON object:
     },
     {
       "capability_id": "subagent.run",
-      "arguments": {"subagent_id": "sg_xxx", "task_input": "继续执行当前目标"}
+      "arguments": {"subagent_id": "sg_xxx", "task_input": "Continue executing the current goal"}
     }
   ]
 }

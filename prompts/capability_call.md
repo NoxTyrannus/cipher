@@ -1,41 +1,41 @@
-# 能力调用规范（统一片段）
+# Capability Call Specification (unified fragment)
 
-你只能调用下方「可用能力」中已授权的能力；未列出的能力不得调用。
+You may only call capabilities authorized in the "Available Capabilities" list below; capabilities not listed must not be called.
 
-每个能力只有以下元信息：
+Each capability has only the following metadata:
 
-- `capability_id`：能力编号（权威标识）
-- `capability_name`：能力名称（可选提交）
-- `description`：能力说明
-- `input_schema`：输入结构
-- `output_schema`：输出结构
+- `capability_id`: capability identifier (authoritative id)
+- `capability_name`: capability name (optional to submit)
+- `description`: capability description
+- `input_schema`: input structure
+- `output_schema`: output structure
 
-## 调用方式
+## Calling
 
-调用最小许可：只给 `capability_id` 即可启动。
+Minimal permission for a call: only `capability_id` is required to start.
 
 ```json
 {
   "capability_call": {
-    "capability_id": "能力编号",
+    "capability_id": "capability id",
     "arguments": {}
   }
 }
 ```
 
-也允许提交完整 `capability_name`。不得重复生成 description、schema、layer 或路由；
-服务层按 `capability_id` 解析权威定义，提交 `capability_name` 时校验一致性，
-`arguments` 错误按普通能力错误返回。
+Submitting the full `capability_name` is also allowed. Do not regenerate description, schema, layer, or routing;
+the service layer resolves the authoritative definition by `capability_id`, and validates consistency
+when `capability_name` is submitted. `arguments` errors are returned as ordinary capability errors.
 
-## 每轮输出
+## Per-turn output
 
-每轮可调用 0 个、1 个或多个能力；多个调用按声明顺序执行：
+Each turn may call 0, 1, or multiple capabilities; multiple calls execute in declaration order:
 
 ```json
 {
   "capability_calls": [
-    { "capability_id": "能力编号", "arguments": {} },
-    { "capability_id": "能力编号", "arguments": {} }
+    { "capability_id": "capability id", "arguments": {} },
+    { "capability_id": "capability id", "arguments": {} }
   ]
 }
 ```
@@ -45,11 +45,11 @@ If a call fails, analyze the error, adjust the arguments and retry. Only output 
 when the task is truly complete:
 
 ```json
-{ "done": true, "summary": "本轮处理摘要" }
+{ "done": true, "summary": "summary of this turn's processing" }
 ```
 
-## 规则
+## Rules
 
-- 不得生成描述、schema、layer、路由或物理路径。
-- 猜测编号不能越权；服务层会校验授权。
-- 每轮只输出一个 JSON 对象。
+- Do not generate descriptions, schemas, layers, routing, or physical paths.
+- Guessing ids cannot bypass authorization; the service layer validates authorization.
+- Output exactly one JSON object per turn.
