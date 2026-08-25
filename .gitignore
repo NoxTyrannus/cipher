@@ -8,3 +8,7 @@
 /data/*.db
 /data/*.db.wal
 __pycache__/
+
+# 不公开：设计/测试文档与基建
+docs/
+tests/
