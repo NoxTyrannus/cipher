@@ -30,13 +30,16 @@ Cipher 是一个终端原生的 AI Agent 框架。它不是一次性响应机器
 Cipher 采用五层单向依赖架构（L1 数据层不感知上层），核心循环在 Agent 层内闭环。
 
 <p align="center">
-  <img src="architecture.svg" alt="Cipher 五层架构图" width="850">
+  <img src="assets/archify/cipher-architecture.svg" alt="Cipher 五层运行时架构图" width="900">
+  <br/>
+  <a href="assets/archify/cipher-architecture.html" target="_blank">🔗 打开交互式版本（主题切换 · 缩放 · 关系追踪 · 演示模式）</a>
 </p>
 
 **架构说明**：
 - 五层依赖单向：L1 数据层不感知上层，UI 在最顶，调用方向从上到下
 - 核心循环在 Agent 层内闭环：思考 → 执行（subagent 真实运行）→ 洞察复核 → 记忆沉淀 → 回到思考
 - 与用户对话的**唯一主体 = 思考引擎**（think/say 双引擎）；三中台输出是思考引擎的输入或内部沉淀，不直接推给用户
+- 信任边界：全部核心组件运行在**本地进程内**（受信），唯一出网交互是模型 Provider 发往 LLM 的调用
 
 ---
 
