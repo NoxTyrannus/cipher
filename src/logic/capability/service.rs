@@ -1,5 +1,6 @@
 use super::composite::CompositeNode;
 use super::executor::CapabilityExecutor;
+use super::permission::{MODE_ONE_SHOT, STATUS_ACTIVE, STATUS_EXPIRED, STATUS_USED};
 use crate::common::{AgentError, Result};
 use crate::data::duckdb::loader::{
     BaseCapabilityRow, CompositeCapabilityRow, Registry, UsageMethodRow,
@@ -47,6 +48,14 @@ enum CapabilityContract<'a> {
     Usage(&'a UsageMethodRow),
 }
 
+/// 一次能力调用的授权消耗标记（v0.4.4 运行时授权）。
+enum GrantConsumption {
+    /// 该次调用因 one-shot 授权放行：调用成功后必须回收（allowlist 移除 + 审计 used）。
+    OneShot,
+    /// 无活跃授权记录或 ttl 未过期（走正常 allowlist 路径）。
+    None,
+}
+
 impl<'a> CapabilityService<'a> {
     pub fn new(registry: &'a Registry, executor: &'a CapabilityExecutor) -> Result<Self> {
         registry.validate()?;
@@ -58,9 +67,25 @@ impl<'a> CapabilityService<'a> {
             self.registry.agents.get(agent_id).ok_or_else(|| {
                 AgentError::NotFound(format!("capability actor agent: {agent_id}"))
             })?;
+        // v0.4.4 ttl 懒回收（可用能力提示路径）：过期授权先落库回收，并从返回列表剔除。
+        let expired: Vec<String> = self.expired_active_capabilities(agent_id);
+        for capability_id in &expired {
+            if let Err(error) =
+                self.executor
+                    .reclaim_permission_grant(agent_id, capability_id, STATUS_EXPIRED)
+            {
+                tracing::warn!(
+                    agent_id,
+                    capability_id,
+                    error = %error,
+                    "permission: lazy ttl reclaim failed in definitions_for_agent"
+                );
+            }
+        }
         agent
             .capability_allowlist
             .iter()
+            .filter(|capability_id| !expired.contains(capability_id))
             .map(
                 |capability_id| match self.resolve_contract(capability_id)? {
                     CapabilityContract::Base(row) => {
@@ -135,6 +160,9 @@ impl<'a> CapabilityService<'a> {
                 call.capability_id
             )));
         }
+        // v0.4.4 授权判定：ttl 过期 → 懒回收并拒绝（即使 allowlist 快照仍含）；
+        // one-shot 未过期 → 标记本次调用，成功后回收（allowlist 移除 + 审计 used）。
+        let consumption = self.grant_consumption(agent_id, authority_id)?;
         if !agent
             .capability_allowlist
             .iter()
@@ -147,15 +175,89 @@ impl<'a> CapabilityService<'a> {
         }
 
         let output = match contract {
-            CapabilityContract::Base(row) => self.execute_base(row, &call.arguments)?,
-            CapabilityContract::Composite(row) => self.execute_composite(row, &call.arguments)?,
+            CapabilityContract::Base(row) => self.execute_base(agent_id, row, &call.arguments)?,
+            CapabilityContract::Composite(row) => {
+                self.execute_composite(agent_id, row, &call.arguments)?
+            }
             CapabilityContract::Usage(_) => unreachable!("usage methods return before execution"),
         };
+        if matches!(consumption, GrantConsumption::OneShot) {
+            // 回收是同步的（持久层）：allowlist 移除 + 审计 used；下一轮基于新 registry
+            // 的调用即失效。当前 run 快照冻结（沿用 agent.update 语义），回收失败仅记录。
+            if let Err(error) =
+                self.executor
+                    .reclaim_permission_grant(agent_id, authority_id, STATUS_USED)
+            {
+                tracing::warn!(
+                    agent_id,
+                    capability_id = authority_id,
+                    error = %error,
+                    "permission: one-shot reclaim failed after successful call"
+                );
+            }
+        }
         Ok(CapabilityResult {
             capability_id: authority_id.clone(),
             capability_name: authority_name.clone(),
             output,
         })
+    }
+
+    /// 授权消耗判定（v0.4.4）：返回该次调用是否因 one-shot 授权放行。
+    ///
+    /// 活跃授权记录命中时：
+    /// - ttl 已过期（或 one-shot 带 ttl 上限已过期）→ 懒回收（expired）+ 拒绝；
+    /// - one-shot 未过期 → 标记 `OneShot`（调用成功后回收）；
+    /// - ttl 未过期 → 正常放行（allowlist 检查决定）。
+    fn grant_consumption(&self, agent_id: &str, capability_id: &str) -> Result<GrantConsumption> {
+        for grant in &self.registry.permission_grants {
+            if grant.target_agent != agent_id
+                || grant.capability_id != capability_id
+                || grant.status != STATUS_ACTIVE
+            {
+                continue;
+            }
+            if let Some(expires_at) = &grant.expires_at {
+                if grant_is_expired(expires_at) {
+                    if let Err(error) = self.executor.reclaim_permission_grant(
+                        agent_id,
+                        capability_id,
+                        STATUS_EXPIRED,
+                    ) {
+                        tracing::warn!(
+                            agent_id,
+                            capability_id,
+                            error = %error,
+                            "permission: expired grant reclaim failed"
+                        );
+                    }
+                    return Err(AgentError::NotFound(format!(
+                        "capability '{capability_id}' authorization for agent '{agent_id}' has expired"
+                    )));
+                }
+            }
+            if grant.mode == MODE_ONE_SHOT {
+                return Ok(GrantConsumption::OneShot);
+            }
+            return Ok(GrantConsumption::None);
+        }
+        Ok(GrantConsumption::None)
+    }
+
+    /// 该 agent 已过期（expires_at <= now）的活跃授权能力 id 列表（ttl 懒回收辅助）。
+    fn expired_active_capabilities(&self, agent_id: &str) -> Vec<String> {
+        self.registry
+            .permission_grants
+            .iter()
+            .filter(|grant| grant.target_agent == agent_id && grant.status == STATUS_ACTIVE)
+            .filter_map(|grant| {
+                grant
+                    .expires_at
+                    .as_ref()
+                    .filter(|expires_at| grant_is_expired(expires_at))
+                    .map(|_| grant.capability_id.clone())
+            })
+            .collect()
     }
 
     fn resolve_contract(&self, capability_id: &str) -> Result<CapabilityContract<'_>> {
@@ -173,16 +275,28 @@ impl<'a> CapabilityService<'a> {
         )))
     }
 
-    fn execute_base(&self, row: &BaseCapabilityRow, arguments: &Value) -> Result<Value> {
+    fn execute_base(
+        &self,
+        actor_id: &str,
+        row: &BaseCapabilityRow,
+        arguments: &Value,
+    ) -> Result<Value> {
         validate_base_authority(row)?;
         validate_schema(&row.schema_in, arguments, &row.id, "input")?;
-        let output = self.executor.execute(&row.id, self.registry, arguments)?;
+        let output = self
+            .executor
+            .execute(actor_id, &row.id, self.registry, arguments)?;
         evaluate_capability_output(&row.id, &output)?;
         validate_schema(&row.schema_out, &output, &row.id, "output")?;
         Ok(output)
     }
 
-    fn execute_composite(&self, row: &CompositeCapabilityRow, input: &Value) -> Result<Value> {
+    fn execute_composite(
+        &self,
+        actor_id: &str,
+        row: &CompositeCapabilityRow,
+        input: &Value,
+    ) -> Result<Value> {
         validate_composite_authority(row)?;
         let schema_in = row.schema_in.as_ref().ok_or_else(|| {
             AgentError::Bootstrap(format!(
@@ -217,7 +331,7 @@ impl<'a> CapabilityService<'a> {
                     ))
                 })?;
             let arguments = resolve_node_arguments(node, input, &results);
-            let output = self.execute_base(base, &arguments)?;
+            let output = self.execute_base(actor_id, base, &arguments)?;
             results.insert(&node.id, output.clone());
             steps.push(serde_json::json!({
                 "node": node.id,
@@ -239,6 +353,14 @@ impl<'a> CapabilityService<'a> {
         validate_schema(schema_out, &output, &row.id, "output")?;
         Ok(output)
     }
+}
+
+/// 授权过期判定（v0.4.4）：expires_at（纳秒 RFC3339）早于或等于当前时间 → 过期。
+/// 解析失败按未过期处理（保守，不误杀快照内能力）。
+fn grant_is_expired(expires_at: &str) -> bool {
+    chrono::DateTime::parse_from_rfc3339(expires_at)
+        .map(|expires| expires.with_timezone(&chrono::Utc) <= chrono::Utc::now())
+        .unwrap_or(false)
 }
 
 /// 能力输出合同：所有能力都必须用输出定义证明成功。
@@ -547,10 +669,13 @@ fn json_pointer(root: &Value, path: &str) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::duckdb::loader::{AgentRow, BaseCapabilityRow, CompositeCapabilityRow};
+    use crate::data::duckdb::loader::{
+        AgentRow, BaseCapabilityRow, CompositeCapabilityRow, PermissionGrantRow,
+    };
+    use crate::data::duckdb::schema::create_all_tables;
     use crate::logic::capability::base::{BaseCapability, Schema};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     const BASE_ID: &str = "base.echo.v1";
     const ECHO_EXECUTOR: &str = "builtin.echo.v1";
@@ -941,5 +1066,223 @@ mod tests {
         let serialized = serde_json::to_string(&definitions).unwrap();
         assert!(!serialized.contains("executor"));
         assert!(!serialized.contains(ECHO_EXECUTOR));
+    }
+
+    // ---- v0.4.4 运行时授权钩子（one-shot 回收 / ttl 懒回收）----
+
+    type PermissionEnv = (Registry, CapabilityExecutor, Arc<Mutex<duckdb::Connection>>);
+
+    /// 构造授权钩子测试环境：registry 快照（agent+echo+授权记录）镜像到内存 DuckDB
+    /// （回收/审计落库可断言；reload 语义用 load_all_into_memory 模拟）。
+    fn permission_env(actor_caps: &[&str], grants: Vec<PermissionGrantRow>) -> PermissionEnv {
+        let mut registry = registry_with_echo(actor_caps);
+        registry.permission_grants = grants;
+        let db = Arc::new(Mutex::new(
+            duckdb::Connection::open_in_memory().expect("open in-memory duckdb"),
+        ));
+        create_all_tables(&db.lock().unwrap()).expect("create schema");
+        let allowlist_json = serde_json::to_string(actor_caps).expect("serialize actor allowlist");
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agent (id, name, mode, capability_allowlist, is_default) \
+             VALUES ('actor', 'Actor', 'unni', CAST(? AS JSON), false)",
+            duckdb::params![allowlist_json],
+        )
+        .expect("seed actor row");
+        // echo 能力行镜像（reload 后 registry 完整性；回收后 allowlist 为空 → unavailable）
+        conn.execute(
+            "INSERT INTO base_capability \
+             (id, name, type, description, schema_in, schema_out, executor, version, enabled) \
+             VALUES ('base.echo.v1', 'echo', 'function', 'test', '{}', '{}', 'builtin.echo.v1', '1.0.0', true)",
+            [],
+        )
+        .expect("seed echo row");
+        // 授权记录镜像到审计表（grant 落库后的真实状态，reclaim 的 UPDATE 需要命中）
+        for grant in &registry.permission_grants {
+            conn.execute(
+                "INSERT INTO permission_grants \
+                 (id, granted_at, granter_agent, target_agent, capability_id, mode, ttl_secs, \
+                  expires_at, used_at, revoked_at, status) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                duckdb::params![
+                    grant.id,
+                    grant.granted_at,
+                    grant.granter_agent,
+                    grant.target_agent,
+                    grant.capability_id,
+                    grant.mode,
+                    grant.ttl_secs,
+                    grant.expires_at,
+                    grant.used_at,
+                    grant.revoked_at,
+                    grant.status,
+                ],
+            )
+            .expect("seed grant row");
+        }
+        drop(conn);
+        let mut executor = executor_with_echo();
+        executor.set_duckdb(db.clone());
+        (registry, executor, db)
+    }
+
+    fn active_grant(
+        id: &str,
+        target: &str,
+        capability: &str,
+        mode: &str,
+        ttl_secs: Option<i64>,
+        expires_at: Option<&str>,
+    ) -> PermissionGrantRow {
+        PermissionGrantRow {
+            id: id.to_string(),
+            granted_at: "2026-01-01T00:00:00.000000000Z".to_string(),
+            granter_agent: "execution-platform".to_string(),
+            target_agent: target.to_string(),
+            capability_id: capability.to_string(),
+            mode: mode.to_string(),
+            ttl_secs,
+            expires_at: expires_at.map(str::to_string),
+            used_at: None,
+            revoked_at: None,
+            status: "active".to_string(),
+        }
+    }
+
+    fn echo_call() -> CapabilityCall {
+        CapabilityCall {
+            capability_id: BASE_ID.to_string(),
+            capability_name: "echo".to_string(),
+            arguments: serde_json::json!({}),
+        }
+    }
+
+    fn db_audit_status(db: &Arc<Mutex<duckdb::Connection>>, grant_id: &str) -> String {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT status FROM permission_grants WHERE id = ?",
+            duckdb::params![grant_id],
+            |row| row.get(0),
+        )
+        .expect("read audit status")
+    }
+
+    fn db_actor_allowlist(db: &Arc<Mutex<duckdb::Connection>>) -> String {
+        let conn = db.lock().unwrap();
+        conn.query_row(
+            "SELECT CAST(capability_allowlist AS VARCHAR) FROM agent WHERE id = 'actor'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read actor allowlist")
+    }
+
+    #[test]
+    fn one_shot_grant_is_reclaimed_after_successful_call() {
+        let grant = active_grant("g1", "actor", BASE_ID, "one_shot", None, None);
+        let (registry, executor, db) = permission_env(&[BASE_ID], vec![grant]);
+        let service = CapabilityService::new(&registry, &executor).unwrap();
+
+        let result = service.execute_for_agent("actor", &echo_call()).unwrap();
+        assert_eq!(result.capability_id, BASE_ID);
+        // 调用成功后：审计 used + allowlist 移除（持久层同步回收）
+        assert_eq!(db_audit_status(&db, "g1"), "used");
+        assert_eq!(db_actor_allowlist(&db), "[]");
+    }
+
+    #[test]
+    fn one_shot_reclaimed_so_reloaded_registry_rejects_next_call() {
+        let grant = active_grant("g1", "actor", BASE_ID, "one_shot", None, None);
+        let (registry, executor, db) = permission_env(&[BASE_ID], vec![grant]);
+        let service = CapabilityService::new(&registry, &executor).unwrap();
+        service.execute_for_agent("actor", &echo_call()).unwrap();
+
+        // 模拟下一次 run：spawn_for 刷新 registry（load_all_into_memory）
+        let conn = db.lock().unwrap();
+        let reloaded = crate::data::duckdb::loader::load_all_into_memory(&conn).unwrap();
+        drop(conn);
+        let service = CapabilityService::new(&reloaded, &executor).unwrap();
+        let error = service
+            .execute_for_agent("actor", &echo_call())
+            .unwrap_err();
+        assert!(matches!(error, AgentError::NotFound(_)));
+        assert!(error.to_string().contains("unavailable"));
+    }
+
+    #[test]
+    fn ttl_expired_grant_is_rejected_and_lazily_reclaimed() {
+        let grant = active_grant(
+            "g2",
+            "actor",
+            BASE_ID,
+            "ttl",
+            Some(60),
+            Some("2020-01-01T00:00:00.000000000Z"),
+        );
+        let (registry, executor, db) = permission_env(&[BASE_ID], vec![grant]);
+        let service = CapabilityService::new(&registry, &executor).unwrap();
+
+        let error = service
+            .execute_for_agent("actor", &echo_call())
+            .unwrap_err();
+        assert!(error.to_string().contains("has expired"));
+        assert_eq!(db_audit_status(&db, "g2"), "expired");
+        // 过期回收移除 allowlist（持久层）
+        assert_eq!(db_actor_allowlist(&db), "[]");
+    }
+
+    #[test]
+    fn ttl_not_yet_expired_passes_without_reclaim() {
+        let grant = active_grant(
+            "g3",
+            "actor",
+            BASE_ID,
+            "ttl",
+            Some(60),
+            Some("2099-01-01T00:00:00.000000000Z"),
+        );
+        let (registry, executor, db) = permission_env(&[BASE_ID], vec![grant]);
+        let service = CapabilityService::new(&registry, &executor).unwrap();
+
+        let result = service.execute_for_agent("actor", &echo_call()).unwrap();
+        assert_eq!(result.capability_id, BASE_ID);
+        assert_eq!(db_audit_status(&db, "g3"), "active");
+        // allowlist 未变
+        assert_eq!(db_actor_allowlist(&db), r#"["base.echo.v1"]"#);
+    }
+
+    #[test]
+    fn definitions_for_agent_skips_expired_grant_and_reclaims() {
+        let grant = active_grant(
+            "g4",
+            "actor",
+            BASE_ID,
+            "ttl",
+            Some(60),
+            Some("2020-01-01T00:00:00.000000000Z"),
+        );
+        let (registry, executor, db) = permission_env(&[BASE_ID], vec![grant]);
+        let service = CapabilityService::new(&registry, &executor).unwrap();
+
+        let definitions = service.definitions_for_agent("actor").unwrap();
+        assert!(definitions.is_empty(), "过期授权能力应从可用列表剔除");
+        assert_eq!(db_audit_status(&db, "g4"), "expired");
+        assert_eq!(db_actor_allowlist(&db), "[]");
+    }
+
+    #[test]
+    fn grant_consumption_ignores_inactive_and_foreign_records() {
+        // used/revoked 记录与无关 target 记录不参与判定 → 正常 allowlist 路径
+        let mut used = active_grant("g5", "actor", BASE_ID, "one_shot", None, None);
+        used.status = "used".to_string();
+        let mut foreign = active_grant("g6", "other-agent", BASE_ID, "one_shot", None, None);
+        foreign.status = "revoked".to_string();
+        let (registry, executor, db) = permission_env(&[BASE_ID], vec![used, foreign]);
+        let service = CapabilityService::new(&registry, &executor).unwrap();
+
+        let result = service.execute_for_agent("actor", &echo_call()).unwrap();
+        assert_eq!(result.capability_id, BASE_ID);
+        // 无 one-shot 消耗 → 不回收
+        assert_eq!(db_actor_allowlist(&db), r#"["base.echo.v1"]"#);
     }
 }

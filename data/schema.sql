@@ -70,3 +70,20 @@ CREATE TABLE IF NOT EXISTS usage_method (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- 运行时授权审计表 (v0.4.4): permission.grant/revoke 全量落库。
+CREATE TABLE IF NOT EXISTS permission_grants (
+    id TEXT PRIMARY KEY,
+    granted_at TEXT NOT NULL,
+    granter_agent TEXT NOT NULL,
+    target_agent TEXT NOT NULL,
+    capability_id TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    ttl_secs INTEGER,
+    expires_at TEXT,
+    used_at TEXT,
+    revoked_at TEXT,
+    status TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);

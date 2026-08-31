@@ -68,7 +68,13 @@ impl CapabilityExecutor {
         self.host_context = HostContext::for_workspace(workspace_root.to_path_buf());
     }
 
-    fn execute_builtin(&self, _id: &str, builtin_name: &str, input: &Schema) -> Result<Schema> {
+    fn execute_builtin(
+        &self,
+        actor_id: &str,
+        _id: &str,
+        builtin_name: &str,
+        input: &Schema,
+    ) -> Result<Schema> {
         let host = &self.host_context;
         let result: std::result::Result<Schema, String> = match builtin_name {
             "path.exists" => crate::logic::builtin::host_functions::host_path_exists(host, input),
@@ -106,6 +112,9 @@ impl CapabilityExecutor {
             name if name.starts_with("memory.") => return self.execute_memory(name, input),
             name if name.starts_with("subagent.") || name == "usage_method.observe" => {
                 return self.execute_subagent_molecule(name, input)
+            }
+            "permission.grant" | "permission.revoke" => {
+                return self.execute_permission(actor_id, builtin_name, input)
             }
             _ => {
                 return Err(AgentError::NotFound(format!(
@@ -169,10 +178,21 @@ impl CapabilityExecutor {
         self.registry.insert(cap.id().to_string(), cap);
     }
 
-    pub fn execute(&self, id: &str, registry: &Registry, input: &Schema) -> Result<Schema> {
+    /// 执行一个 base capability 的 executor 入口。
+    ///
+    /// `actor_id` 是调用方 agent（授权审计的 granter/执行者身份）；`id` 为
+    /// registry 契约 id；`registry` 为只读注册表快照；`input` 为已通过
+    /// schema_in 校验的参数。
+    pub fn execute(
+        &self,
+        actor_id: &str,
+        id: &str,
+        registry: &Registry,
+        input: &Schema,
+    ) -> Result<Schema> {
         if let Some(row) = registry.base_capabilities.get(id) {
             if let Some(builtin_name) = row.executor.strip_prefix("builtin:") {
-                return self.execute_builtin(id, builtin_name, input);
+                return self.execute_builtin(actor_id, id, builtin_name, input);
             }
 
             #[cfg(test)]
@@ -191,6 +211,52 @@ impl CapabilityExecutor {
             return cap.execute(input);
         }
         Err(AgentError::NotFound(format!("base capability: {}", id)))
+    }
+
+    /// 分发 `permission.grant` / `permission.revoke` 到 permission 模块。
+    ///
+    /// `actor_id` 即 granter/revoker（审计 granter_agent 字段）；成功路径触发
+    /// agent 表 reload（授权叠加/回收后，subagent 下一次 run 刷新 registry 即生效）。
+    fn execute_permission(
+        &self,
+        actor_id: &str,
+        builtin_name: &str,
+        input: &Schema,
+    ) -> Result<Schema> {
+        let db = self.duckdb.as_ref().ok_or_else(|| {
+            AgentError::NotFound(format!("{builtin_name}: duckdb not configured"))
+        })?;
+        let conn = db.lock().map_err(|e| {
+            AgentError::Script(format!("builtin {builtin_name}: lock poisoned: {e}"))
+        })?;
+        let result = super::permission::execute(&conn, actor_id, builtin_name, input);
+        if result.is_ok() {
+            self.trigger_reload("agent");
+        }
+        result.map_err(|e| AgentError::Script(format!("builtin {builtin_name}: {e}")))
+    }
+
+    /// 回收钩子（`CapabilityService` 判定 one-shot 已用 / ttl 已过期后调用）：
+    /// 从目标 allowlist 移除能力 + 审计行置终态（used/expired）+ 触发 reload。
+    ///
+    /// 失败仅记录（tracing::warn），不反向污染已经成功的调用——授权回收是
+    /// 持久层维护职责，判定层已按快照放行/拒绝。
+    pub fn reclaim_permission_grant(
+        &self,
+        target_agent: &str,
+        capability_id: &str,
+        status: &str,
+    ) -> Result<()> {
+        let db = self.duckdb.as_ref().ok_or_else(|| {
+            AgentError::NotFound("permission reclaim: duckdb not configured".into())
+        })?;
+        let conn = db
+            .lock()
+            .map_err(|e| AgentError::Script(format!("permission reclaim: lock poisoned: {e}")))?;
+        super::permission::reclaim(&conn, target_agent, capability_id, status)
+            .map_err(|e| AgentError::Script(format!("permission reclaim: {e}")))?;
+        self.trigger_reload("agent");
+        Ok(())
     }
 
     /// 分发六个 `subagent.*` 分子与 `usage_method.observe` 到 `subagent_capability` 模块。
@@ -442,14 +508,16 @@ mod tests {
         let mut ex = CapabilityExecutor::new();
         ex.register(Arc::new(EchoCap));
         let input = serde_json::json!({"x": 1});
-        let out = ex.execute("echo", &Registry::new(), &input).unwrap();
+        let out = ex
+            .execute("actor", "echo", &Registry::new(), &input)
+            .unwrap();
         assert_eq!(out, input);
     }
 
     #[test]
     fn executor_unknown_id_returns_not_found() {
         let ex = CapabilityExecutor::new();
-        let r = ex.execute("nope", &Registry::new(), &serde_json::json!({}));
+        let r = ex.execute("actor", "nope", &Registry::new(), &serde_json::json!({}));
         assert!(matches!(r, Err(AgentError::NotFound(_))));
     }
 
@@ -476,6 +544,7 @@ mod tests {
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
         ex.set_workspace_root(repo_root);
         let out = ex.execute(
+            "actor",
             "file.read",
             &reg,
             &serde_json::json!({"path": "Cargo.toml"}),
@@ -483,6 +552,7 @@ mod tests {
         assert!(out.is_ok(), "正确 path 应可读: {:?}", out.err());
 
         let bad = ex.execute(
+            "actor",
             "file.read",
             &reg,
             &serde_json::json!({"path": "读一下 Cargo.toml"}),

@@ -104,6 +104,7 @@ fn verify_tables(conn: &duckdb::Connection) -> CheckResult {
         "base_capability",
         "composite_capability",
         "usage_method",
+        "permission_grants",
     ];
     let mut stmt = match conn.prepare(
         "SELECT table_name FROM information_schema.tables \

@@ -19,7 +19,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn creates_exactly_five_tables() {
+    fn creates_exactly_six_tables() {
         let connection = duckdb::Connection::open_in_memory().expect("open DuckDB");
         create_all_tables(&connection).expect("create schema");
 
@@ -42,6 +42,7 @@ mod tests {
                 "base_capability",
                 "composite_capability",
                 "model",
+                "permission_grants",
                 "usage_method",
             ]
         );

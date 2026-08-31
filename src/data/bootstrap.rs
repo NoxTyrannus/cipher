@@ -40,6 +40,16 @@ pub fn bootstrap(data_dir: &Path) -> Result<AppState, AgentError> {
         ));
     }
 
+    // v0.4.4 旧数据目录升级：v2 五表库无 permission_grants 审计表，先幂等补建，
+    // 否则下方表集精确校验（TARGET_TABLES 六表）会失败导致启动报错。
+    if let Err(error) = super::migration::ensure_permission_grants_table(&conn) {
+        drop(conn);
+        return Err(merge_permission_error(
+            error,
+            secure_duckdb_files(&duckdb_path),
+        ));
+    }
+
     if let Err(error) = validate_current_duckdb_connection(&conn) {
         drop(conn);
         return Err(merge_permission_error(
@@ -115,6 +125,7 @@ mod tests {
             "base_capability",
             "composite_capability",
             "usage_method",
+            "permission_grants",
         ] {
             let mut stmt = app
                 .duckdb

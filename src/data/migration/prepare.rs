@@ -573,7 +573,7 @@ mod tests {
                 .unwrap()
                 .table_counts
                 .len(),
-            5
+            6
         );
         assert!(ThoughtStore::open(first.thoughts_data_root())
             .unwrap()

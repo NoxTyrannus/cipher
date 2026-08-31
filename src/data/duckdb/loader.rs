@@ -96,6 +96,28 @@ pub struct UsageMethodRow {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// `permission_grants` 审计行（v0.4.4 运行时授权，服务层授权校验/懒回收的只读快照）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct PermissionGrantRow {
+    pub id: String,
+    pub granted_at: String,
+    pub granter_agent: String,
+    pub target_agent: String,
+    pub capability_id: String,
+    /// `one_shot` | `ttl`。
+    pub mode: String,
+    #[serde(default)]
+    pub ttl_secs: Option<i64>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub used_at: Option<String>,
+    #[serde(default)]
+    pub revoked_at: Option<String>,
+    /// `active` | `used` | `expired` | `revoked`。
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Registry {
     pub models: HashMap<String, ModelRow>,
@@ -103,6 +125,7 @@ pub struct Registry {
     pub base_capabilities: HashMap<String, BaseCapabilityRow>,
     pub composite_capabilities: HashMap<String, CompositeCapabilityRow>,
     pub usage_methods: HashMap<String, UsageMethodRow>,
+    pub permission_grants: Vec<PermissionGrantRow>,
 }
 
 impl Registry {
@@ -314,6 +337,7 @@ pub fn load_capability_into_memory(
     load_base_capabilities(conn, registry)?;
     load_composite_capabilities(conn, registry)?;
     load_usage_methods(conn, registry)?;
+    load_permission_grants(conn, registry)?;
     Ok(())
 }
 
@@ -609,6 +633,66 @@ fn load_usage_methods(
                 metadata,
             },
         );
+    }
+    Ok(())
+}
+
+fn load_permission_grants(
+    conn: &duckdb::Connection,
+    registry: &mut Registry,
+) -> Result<(), AgentError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT id, granted_at, granter_agent, target_agent, capability_id, mode, \
+             ttl_secs, expires_at, used_at, revoked_at, status FROM permission_grants",
+        )
+        .map_err(|error| AgentError::Bootstrap(format!("prepare permission_grants: {error}")))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, String>(10)?,
+            ))
+        })
+        .map_err(|error| AgentError::Bootstrap(format!("query permission_grants: {error}")))?;
+
+    for row in rows {
+        let (
+            id,
+            granted_at,
+            granter_agent,
+            target_agent,
+            capability_id,
+            mode,
+            ttl_secs,
+            expires_at,
+            used_at,
+            revoked_at,
+            status,
+        ) =
+            row.map_err(|error| AgentError::Bootstrap(format!("row permission_grants: {error}")))?;
+        registry.permission_grants.push(PermissionGrantRow {
+            id,
+            granted_at,
+            granter_agent,
+            target_agent,
+            capability_id,
+            mode,
+            ttl_secs,
+            expires_at,
+            used_at,
+            revoked_at,
+            status,
+        });
     }
     Ok(())
 }
