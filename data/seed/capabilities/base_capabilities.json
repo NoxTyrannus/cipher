@@ -1464,6 +1464,69 @@
     "version": "1.0.0",
     "enabled": true,
     "partition": "system"
+  },
+  {
+    "id": "permission.grant",
+    "name": "Grant Permission",
+    "type": "function",
+    "description": "运行时授权（v0.4.4）：把一项 registry 能力授予 subagent 实例（宽集外叠加）；one_shot 用后自动回收，ttl 限时 N 秒过期回收；全量写 permission_grants 审计表；仅执行中台与获递归授权的 subagent 可调用",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "target_agent_id": {"type": "string"},
+        "capability_id": {"type": "string"},
+        "mode": {"type": "string", "enum": ["one_shot", "ttl"]},
+        "ttl_secs": {"type": "integer", "minimum": 1, "maximum": 86400}
+      },
+      "required": ["target_agent_id", "capability_id", "mode"],
+      "additionalProperties": false
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "id": {"type": "string"},
+        "target_agent_id": {"type": "string"},
+        "capability_id": {"type": "string"},
+        "mode": {"type": "string"},
+        "expires_at": {"type": ["string", "null"]}
+      },
+      "required": ["id", "target_agent_id", "capability_id", "mode"],
+      "additionalProperties": false
+    },
+    "executor": "builtin:permission.grant",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
+  },
+  {
+    "id": "permission.revoke",
+    "name": "Revoke Permission",
+    "type": "function",
+    "description": "运行时撤销授权（v0.4.4）：从 subagent 实例 allowlist 移除一项能力并把活跃授权记录标记 revoked；全量写 permission_grants 审计表；仅执行中台与获递归授权的 subagent 可调用",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "target_agent_id": {"type": "string"},
+        "capability_id": {"type": "string"}
+      },
+      "required": ["target_agent_id", "capability_id"],
+      "additionalProperties": false
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "target_agent_id": {"type": "string"},
+        "capability_id": {"type": "string"},
+        "removed_from_allowlist": {"type": "boolean"},
+        "revoked_records": {"type": "integer"}
+      },
+      "required": ["target_agent_id", "capability_id"],
+      "additionalProperties": false
+    },
+    "executor": "builtin:permission.revoke",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
   }
 ]
 

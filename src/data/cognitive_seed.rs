@@ -1,6 +1,7 @@
 use crate::common::{AgentError, Result};
 use crate::data::permissions::{ensure_private_directory, secure_existing_file};
 use crate::data::triviumdb::TriviumDb;
+use duckdb::OptionalExt;
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
@@ -221,13 +222,15 @@ pub fn import_factory_defaults(conn: &duckdb::Connection, data_dir: &Path) -> Re
         }
     }
     // 主 agent 上下文排除内部管理分子：subagent.* 由执行中台专属平台 agent 使用，
-    // usage_method.observe 由洞察平台专属 agent 使用，二者都不进入主 agent 上下文。
+    // usage_method.observe 由洞察平台专属 agent 使用，permission.* 由执行中台（或
+    // 获递归授权的 subagent）使用——三者都不进入主 agent 上下文。
     let agent_capability_allowlist: Vec<String> = capability_ids
         .iter()
         .filter(|id| {
             !id.starts_with("memory.")
                 && !id.starts_with("db.")
                 && !id.starts_with("subagent.")
+                && !id.starts_with("permission.")
                 && *id != "usage_method.observe"
         })
         .cloned()
@@ -485,21 +488,10 @@ pub fn seed_subagent_templates(conn: &duckdb::Connection) -> Result<()> {
 /// 失败回环重试上限）。
 ///
 /// INSERT ON CONFLICT DO NOTHING，幂等；已存在的行（含用户手工改动）不被覆盖。
+/// execution-platform 单独处理（v0.4.4 追加 permission.grant/revoke，见
+/// `seed_execution_platform`）：旧数据目录平台行必须升级拿到两能力。
 pub fn seed_platform_agents(conn: &duckdb::Connection) -> Result<()> {
     let agents: &[(&str, &str, &[&str], Option<&str>)] = &[
-        (
-            "execution-platform",
-            "Execution Platform",
-            &[
-                "subagent.create",
-                "subagent.run",
-                "subagent.update",
-                "subagent.sleep",
-                "subagent.wake",
-                "subagent.delete",
-            ],
-            None,
-        ),
         (
             "insight-platform",
             "Insight Platform",
@@ -528,6 +520,63 @@ pub fn seed_platform_agents(conn: &duckdb::Connection) -> Result<()> {
         )
         .map_err(|error| AgentError::Bootstrap(format!("seed platform agent {id}: {error}")))?;
     }
+
+    seed_execution_platform(conn)
+}
+
+/// execution-platform 平台行（v0.4.4）：六个 subagent.* + permission.grant/revoke。
+///
+/// 升级策略：读现有 allowlist → 追加合并（去重）→ UPSERT（ON CONFLICT DO UPDATE 仅改
+/// capability_allowlist，保留用户对 name/config 的手工改动；追加语义保证旧数据目录
+/// 升级后拿到两能力，同时不覆盖用户已授权的其他叠加能力）。
+fn seed_execution_platform(conn: &duckdb::Connection) -> Result<()> {
+    const BASE_CAPS: &[&str] = &[
+        "subagent.create",
+        "subagent.run",
+        "subagent.update",
+        "subagent.sleep",
+        "subagent.wake",
+        "subagent.delete",
+    ];
+    const GRANT_CAPS: &[&str] = &["permission.grant", "permission.revoke"];
+
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT CAST(capability_allowlist AS VARCHAR) FROM agent \
+             WHERE id = 'execution-platform'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| {
+            AgentError::Bootstrap(format!("seed execution-platform read allowlist: {error}"))
+        })?;
+    let mut allowlist: Vec<String> = match existing {
+        Some(text) => serde_json::from_str(&text).map_err(|error| {
+            AgentError::Parse(format!(
+                "parse execution-platform capability_allowlist: {error}"
+            ))
+        })?,
+        None => Vec::new(),
+    };
+    for capability_id in BASE_CAPS.iter().chain(GRANT_CAPS) {
+        if !allowlist.iter().any(|value| value == capability_id) {
+            allowlist.push((*capability_id).to_string());
+        }
+    }
+    let caps_json = serde_json::to_string(&allowlist).map_err(|error| {
+        AgentError::Parse(format!(
+            "serialize execution-platform capability_allowlist: {error}"
+        ))
+    })?;
+    conn.execute(
+        "INSERT INTO agent (id, name, mode, capability_allowlist, display_name, is_default) \
+         VALUES ('execution-platform', 'Execution Platform', 'platform', CAST(? AS JSON), \
+                 'Execution Platform', false) \
+         ON CONFLICT (id) DO UPDATE SET capability_allowlist = excluded.capability_allowlist",
+        duckdb::params![caps_json],
+    )
+    .map_err(|error| AgentError::Bootstrap(format!("seed execution-platform: {error}")))?;
     Ok(())
 }
 
@@ -835,7 +884,73 @@ mod tests {
     }
 
     #[test]
-    fn main_agent_allowlist_excludes_subagent_and_observe() {
+    fn seed_upgrades_legacy_execution_platform_with_permission_abilities() {
+        // 旧数据目录升级：execution-platform 行仅含 6 个 subagent.*（+用户叠加的 shell.exec）
+        // → seed 后追加 permission.grant/revoke，保留既有叠加能力（追加合并，不覆盖用户改动）。
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        crate::data::duckdb::schema::create_all_tables(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO agent (id, name, mode, capability_allowlist, display_name, is_default) \
+             VALUES ('execution-platform', 'Execution Platform', 'platform', \
+                     CAST(? AS JSON), 'Execution Platform', false)",
+            duckdb::params![r#"["subagent.create","subagent.run","subagent.update","subagent.sleep","subagent.wake","subagent.delete","shell.exec"]"#],
+        )
+        .unwrap();
+        let dir = tempdir().unwrap();
+        ensure_default_capabilities(dir.path()).unwrap();
+        import_factory_defaults(&conn, dir.path()).unwrap();
+
+        let text: Option<String> = conn
+            .query_row(
+                "SELECT CAST(capability_allowlist AS VARCHAR) FROM agent \
+                 WHERE id = 'execution-platform'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let allowlist: serde_json::Value = serde_json::from_str(&text.unwrap()).unwrap();
+        let ids: Vec<&str> = allowlist
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        for expected in [
+            "subagent.create",
+            "subagent.run",
+            "subagent.update",
+            "subagent.sleep",
+            "subagent.wake",
+            "subagent.delete",
+            "permission.grant",
+            "permission.revoke",
+            "shell.exec",
+        ] {
+            assert!(
+                ids.contains(&expected),
+                "execution-platform 升级后缺少 {expected}"
+            );
+        }
+        // 幂等：再 seed 一次不重复追加。
+        import_factory_defaults(&conn, dir.path()).unwrap();
+        let text: Option<String> = conn
+            .query_row(
+                "SELECT CAST(capability_allowlist AS VARCHAR) FROM agent \
+                 WHERE id = 'execution-platform'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let allowlist: serde_json::Value = serde_json::from_str(&text.unwrap()).unwrap();
+        assert_eq!(
+            allowlist.as_array().unwrap().len(),
+            9,
+            "再次 seed 不得重复追加能力"
+        );
+    }
+
+    #[test]
+    fn main_agent_allowlist_excludes_subagent_observe_and_permission() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
         crate::data::duckdb::schema::create_all_tables(&conn).unwrap();
         let dir = tempdir().unwrap();
@@ -857,6 +972,7 @@ mod tests {
             .filter_map(|value| value.as_str())
             .collect();
         assert!(!ids.iter().any(|id| id.starts_with("subagent.")));
+        assert!(!ids.iter().any(|id| id.starts_with("permission.")));
         assert!(!ids.contains(&"usage_method.observe"));
         assert!(ids.contains(&"file.read"));
     }
@@ -890,6 +1006,8 @@ mod tests {
             "subagent.sleep",
             "subagent.wake",
             "subagent.delete",
+            "permission.grant",
+            "permission.revoke",
         ] {
             assert!(
                 exec_ids.contains(&expected),

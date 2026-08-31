@@ -25,6 +25,16 @@ Choose 0, 1 or multiple lifecycle actions and declare them in array order:
 - `subagent.run` — start one async run; returns accepted immediately, do not expect the result this round. **Must include a non-empty `task_input`.** If you are running a subagent you just created, reuse the `task_input` from its `subagent.create` call; never send an empty `task_input`.
 - `subagent.update` — change prompt / capability_allowlist / startup / trigger / model / budget.
 - `subagent.sleep` / `subagent.wake` / `subagent.delete` — manage lifecycle state.
+- `permission.grant` — runtime authorization (v0.4.4): grant one capability to an **existing** subagent instance beyond its template allowlist (runtime overlay; `subagent.create` allowlists are still template subsets). `mode` is `one_shot` (auto-reclaimed after the first successful use) or `ttl` (valid for `ttl_secs`, max 86400). Default to `one_shot` unless the task genuinely needs repeated use. Only grant the **smallest sufficient** capability for the assigned task. Do not grant `permission.grant` / `permission.revoke` to subagents unless the task truly requires recursive authorization (audited in full; one_shot by default).
+- `permission.revoke` — revoke a previously granted capability from an existing subagent instance (removes it from the instance allowlist and marks the active grant record revoked).
+
+## Runtime Authorization Rules (v0.4.4)
+
+- A grant adds the capability to the target subagent's `capability_allowlist` at runtime; it becomes visible in that subagent's available capabilities and is enforced by the same execution-time checks as template capabilities.
+- `one_shot`: the capability is consumed by the first successful call and then automatically removed — the next run can no longer use it.
+- `ttl`: the capability expires `ttl_secs` seconds after the grant and is lazily reclaimed on the next check.
+- Every grant/revoke is written to the `permission_grants` audit table (granter / target / capability / mode / ttl / status) — treat authorization as an auditable action, not a routine one.
+- Design principle: **smallest sufficient, default one_shot**. Prefer pruning the template wide set inside `subagent.create`; use `permission.grant` only for capabilities outside the wide set that a specific task requires.
 
 ## Output Format
 
