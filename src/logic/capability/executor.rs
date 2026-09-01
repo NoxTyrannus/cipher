@@ -70,6 +70,12 @@ impl CapabilityExecutor {
         self.host_context = HostContext::for_workspace(workspace_root.to_path_buf());
     }
 
+    /// v0.4.8：把 `[fs] read_roots` 追加为额外文件读根（不改写根）。
+    /// 需在 `set_workspace_root` 之后调用；extra 为空时无操作（行为与现状一致）。
+    pub fn set_extra_read_roots(&mut self, extra: &[PathBuf]) {
+        self.host_context.add_read_roots(extra);
+    }
+
     fn execute_builtin(
         &self,
         actor_id: &str,
@@ -591,6 +597,65 @@ mod tests {
         assert!(
             bad.get("error").and_then(|v| v.as_str()).is_some(),
             "结构化错误必须含 error 字段: {bad}"
+        );
+    }
+
+    /// TD 接线验收：executor 层 `set_extra_read_roots` 后 file.read 可读追加根；
+    /// 未配置时行为与现状一致（追加根内文件不可读）。
+    #[test]
+    fn builtin_file_read_via_set_extra_read_roots_allows_append_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let extra = dir.path().join("extra");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        std::fs::write(extra.join("note.txt"), "from-extra").unwrap();
+
+        let mut reg = Registry::new();
+        reg.base_capabilities.insert(
+            "file.read".into(),
+            BaseCapabilityRow {
+                id: "file.read".into(),
+                name: "Read File".into(),
+                cap_type: "function".into(),
+                description: "read".into(),
+                schema_in: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+                schema_out: serde_json::json!({}),
+                executor: "builtin:file.read".into(),
+                version: "1.0.0".into(),
+                enabled: true,
+                tombstoned_at: None,
+                metadata: None,
+            },
+        );
+
+        let mut ex = CapabilityExecutor::new();
+        ex.set_workspace_root(&ws);
+
+        // 未配置额外读根：追加根内文件不可读（行为与现状一致，返回结构化错误）。
+        let denied = ex
+            .execute(
+                "actor",
+                "file.read",
+                &reg,
+                &serde_json::json!({"path": extra.join("note.txt").to_string_lossy()}),
+            )
+            .expect("追加根未配置时应返回结构化结果而非 trap");
+        assert_eq!(denied.get("success").and_then(|v| v.as_bool()), Some(false));
+
+        // v0.4.8：set_extra_read_roots 接线后，追加根内文件可读。
+        ex.set_extra_read_roots(std::slice::from_ref(&extra));
+        let ok = ex
+            .execute(
+                "actor",
+                "file.read",
+                &reg,
+                &serde_json::json!({"path": extra.join("note.txt").to_string_lossy()}),
+            )
+            .expect("追加根内文件应可读");
+        assert_eq!(
+            ok.get("content").and_then(|v| v.as_str()),
+            Some("from-extra")
         );
     }
 }

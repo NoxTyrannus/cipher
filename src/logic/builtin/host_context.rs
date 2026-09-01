@@ -64,6 +64,15 @@ impl HostContext {
         }
     }
 
+    /// v0.4.8：追加额外文件读根（不改写根）。
+    /// 供 `CapabilityExecutor::set_extra_read_roots` 在 `set_workspace_root` 之后调用，
+    /// 把 `[fs] read_roots` 并入读根列表。extra 为空时无操作（读根保持现状）。
+    pub fn add_read_roots(&mut self, extra: &[PathBuf]) {
+        self.permission
+            .file_read_roots
+            .extend(extra.iter().cloned());
+    }
+
     pub fn deny_all() -> Self {
         Self::default()
     }

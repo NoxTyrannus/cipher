@@ -266,6 +266,8 @@ pub async fn run_normal(
     let exec_executor = {
         let mut ex = crate::logic::capability::executor::CapabilityExecutor::new();
         ex.set_workspace_root(&std::env::current_dir().unwrap_or_default());
+        // v0.4.8：[fs] read_roots 追加文件读根（缺省空=仅 workspace_root，行为与现状一致）。
+        ex.set_extra_read_roots(&config.fs.read_roots);
         ex.set_triviumdb(std::sync::Arc::clone(&trivium_db));
         ex.set_thought_store(std::sync::Arc::clone(&shared_thought_store));
         ex.set_duckdb(std::sync::Arc::clone(&exec_duckdb_conn));
