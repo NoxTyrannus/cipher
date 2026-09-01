@@ -6,29 +6,14 @@ use async_trait::async_trait;
 pub struct LoopMode {
     iteration_count: u32,
     max_iterations: u32,
-    idle_rounds: u32,
-    max_idle_rounds: u32,
 }
 
 impl LoopMode {
     pub fn new() -> Self {
-        Self {
-            idle_rounds: 0,
-            max_idle_rounds: 3,
-            ..Self::default()
-        }
+        Self::default()
     }
     pub fn iteration_count(&self) -> u32 {
         self.iteration_count
-    }
-    pub fn note_noop(&mut self) {
-        self.idle_rounds += 1;
-    }
-    pub fn reset_idle(&mut self) {
-        self.idle_rounds = 0;
-    }
-    pub fn should_stop_idle(&self) -> bool {
-        self.idle_rounds >= self.max_idle_rounds
     }
 }
 
@@ -113,16 +98,21 @@ mod tests {
     }
 
     #[test]
-    fn loop_idle_convergence_stops_after_three_noops() {
-        let mut m = LoopMode::new();
-        assert!(!m.should_stop_idle());
-        m.note_noop();
-        m.note_noop();
-        assert!(!m.should_stop_idle());
-        m.note_noop();
-        assert!(m.should_stop_idle());
-        m.reset_idle();
-        assert!(!m.should_stop_idle());
+    fn loop_mode_has_no_idle_convergence_state() {
+        // v0.4.5：LOOP 移除 3-noop idle 收敛（任务书 §1，2026-08-26 用户确认）——
+        // LOOP = 永续思考，真正允许空转，空转是正常状态；停只靠用户中断/未来降频能力。
+        // LoopMode 不再持有 idle_rounds/max_idle_rounds 状态，note_noop/reset_idle/
+        // should_stop_idle 已删除。语义回归守卫：若未来重新引入 idle 收敛状态，
+        // Debug 输出将出现 idle 字段，本断言立即报警。
+        let debug = format!("{:?}", LoopMode::new());
+        assert!(
+            !debug.contains("idle"),
+            "LoopMode must not hold idle convergence state, got: {debug}"
+        );
+        assert!(
+            !debug.contains("noop"),
+            "LoopMode must not hold noop counters, got: {debug}"
+        );
     }
 
     #[tokio::test]

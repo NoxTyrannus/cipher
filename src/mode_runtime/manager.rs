@@ -328,22 +328,6 @@ impl ModeManager {
         }
     }
 
-    pub fn loop_note_noop(&mut self) {
-        if self.current == ModeKind::Loop {
-            self.loop_mode.note_noop();
-        }
-    }
-
-    pub fn loop_reset_idle(&mut self) {
-        if self.current == ModeKind::Loop {
-            self.loop_mode.reset_idle();
-        }
-    }
-
-    pub fn loop_should_stop_idle(&self) -> bool {
-        self.current == ModeKind::Loop && self.loop_mode.should_stop_idle()
-    }
-
     pub fn active_is_empty(&self) -> bool {
         self.active.is_empty()
     }

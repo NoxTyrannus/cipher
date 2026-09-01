@@ -959,7 +959,6 @@ pub async fn run_streaming_loop(
 
                                 // 用户输入最高优先级：打断后台空转/反思循环。
                                 mode_manager.cancel_all_active();
-                                mode_manager.loop_reset_idle();
 
                                 match mode_manager.spawn(input).await {
                                     Ok(id) => {
@@ -1151,32 +1150,6 @@ pub async fn run_streaming_loop(
                                 continue;
                             }
                             tracker.record_instance();
-                        }
-                        // LOOP idle 收敛：触发轮空转（无动作且无 subagent 在跑）达到阈值则停止迭代。
-                        if mode_name == "loop" {
-                            let ctx = pool.get_turn_context(&event.turn_id).await;
-                            let actions_empty = ctx
-                                .as_ref()
-                                .and_then(|c| c.execution.as_ref())
-                                .map(|e| e.lifecycle_actions.is_empty())
-                                .unwrap_or(true);
-                            let subagents_running = pool
-                                .subagent_states()
-                                .await
-                                .iter()
-                                .any(|s| s.lifecycle == crate::agent::execution_types::SubagentLifecycle::Running);
-                            if actions_empty && !subagents_running {
-                                mode_manager.loop_note_noop();
-                                if mode_manager.loop_should_stop_idle() {
-                                    tracing::info!(
-                                        "streaming_loop: LOOP idle convergence reached, waiting for user input (thought_id={})",
-                                        event.turn_id
-                                    );
-                                    continue;
-                                }
-                            } else {
-                                mode_manager.loop_reset_idle();
-                            }
                         }
                         // UNNI 跟随用户停止规则（任务书 §2.2，2026-08-26 用户确认）：
                         // 无 subagent 场景：用户轮后恰一轮回环（输出轮），随后停，等用户下一次输入
