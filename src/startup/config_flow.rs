@@ -24,7 +24,7 @@ pub fn run(app: &AppState) -> Result<(), AgentError> {
             "工作区管理",
             "agent 改名",
             "切默认 workspace/agent",
-            "协作设置 (KEEP 预算)",
+            "模式设置",
             "退出 /config",
         ];
         let sel = Select::new()
@@ -44,7 +44,9 @@ pub fn run(app: &AppState) -> Result<(), AgentError> {
     }
 }
 
-/// 全局协作设置：KEEP 预算（放弃项 1/2/10：协同节点固定洞察 + mix 机制删除，只沉淀不触发）。
+/// 模式设置（与 TUI 面板「模式设置」分组一致）：
+/// UNNI 模式设置（思考输出 开/关）/ KEEP 模式设置（Token/时间预算）。
+/// 放弃项 1/2/10：协同节点固定洞察 + mix 机制删除，只沉淀不触发；LOOP 暂无模式项。
 fn manage_mode_styles() -> Result<(), AgentError> {
     let config_path = Config::default_path();
     let Some(mut config) = Config::load(&config_path)? else {
@@ -52,31 +54,108 @@ fn manage_mode_styles() -> Result<(), AgentError> {
         return Ok(());
     };
     loop {
-        let keep = config.mode_styles.keep;
-        let unni_show = match config.mode_styles.unni.as_ref().and_then(|u| u.show_think) {
+        let items = vec![
+            "UNNI 模式设置".to_string(),
+            "KEEP 模式设置".to_string(),
+            "返回 /config 主菜单".to_string(),
+        ];
+        let sel = Select::new()
+            .with_prompt("模式设置 — 选择模式")
+            .items(&items)
+            .default(0)
+            .interact()
+            .map_err(|e| AgentError::Parse(format!("mode styles select: {e}")))?;
+        match sel {
+            0 => manage_unni_mode(&mut config, &config_path)?,
+            1 => manage_keep_mode(&mut config, &config_path)?,
+            _ => return Ok(()),
+        }
+    }
+}
+
+/// UNNI 模式设置分组：思考输出 开/关 二选（只写 `[mode_styles.unni] show_think`，
+/// 不暴露全局 `[ui] show_think`；只控制 TUI 渲染，不改 thinking 执行链）。
+fn manage_unni_mode(config: &mut Config, config_path: &std::path::Path) -> Result<(), AgentError> {
+    loop {
+        let current = config.mode_styles.unni.as_ref().and_then(|u| u.show_think);
+        let current_display = match current {
             None => "跟随全局".to_string(),
             Some(true) => "开".to_string(),
             Some(false) => "关".to_string(),
         };
         let items = vec![
-            format!("KEEP Token 预算 (当前: {}K)", keep.token_budget / 1000),
-            format!("KEEP 时间预算 (当前: {}min)", keep.time_budget_secs / 60),
-            format!(
-                "UI 思考显示 (全局: {}, UNNI: {unni_show})",
-                if config.ui.show_think { "开" } else { "关" }
-            ),
-            "返回 /config 主菜单".to_string(),
+            format!("思考输出 (当前: {current_display})"),
+            "返回模式设置菜单".to_string(),
         ];
         let sel = Select::new()
-            .with_prompt("协作设置 — 选择管理项 (KEEP 预算 / UI 思考显示)")
+            .with_prompt("UNNI 模式设置")
             .items(&items)
             .default(0)
             .interact()
-            .map_err(|e| AgentError::Parse(format!("collaboration select: {e}")))?;
+            .map_err(|e| AgentError::Parse(format!("unni mode select: {e}")))?;
         match sel {
-            0 => manage_keep_token(&mut config, &config_path)?,
-            1 => manage_keep_time(&mut config, &config_path)?,
-            2 => manage_ui_show_think(&mut config, &config_path)?,
+            0 => set_unni_show_think(config, config_path)?,
+            _ => return Ok(()),
+        }
+    }
+}
+
+/// 思考输出 开/关 二选 → `[mode_styles.unni] show_think = Some(bool)`。
+fn set_unni_show_think(
+    config: &mut Config,
+    config_path: &std::path::Path,
+) -> Result<(), AgentError> {
+    let current = config.mode_styles.unni.as_ref().and_then(|u| u.show_think);
+    let items = ["开（显示思考输出）", "关（隐藏思考输出）"];
+    let default = if current == Some(false) { 1 } else { 0 };
+    let sel = Select::new()
+        .with_prompt("思考输出")
+        .items(&items)
+        .default(default)
+        .interact()
+        .map_err(|e| AgentError::Parse(format!("unni show_think select: {e}")))?;
+    let show = sel == 0;
+    config
+        .mode_styles
+        .unni
+        .get_or_insert_with(UnniStyle::default)
+        .show_think = Some(show);
+    config.save(config_path)?;
+    println!(
+        "UNNI 思考输出已设为 {} (config.toml [mode_styles.unni] show_think={show})",
+        if show { "开" } else { "关" }
+    );
+    Ok(())
+}
+
+/// KEEP 模式设置分组：Token 预算 / 时间预算（交互逻辑原样搬入分组）。
+fn manage_keep_mode(config: &mut Config, config_path: &std::path::Path) -> Result<(), AgentError> {
+    loop {
+        let keep = config.mode_styles.keep;
+        let token_display = if keep.token_budget == 0 {
+            "无限".to_string()
+        } else {
+            format!("{}K", keep.token_budget / 1000)
+        };
+        let time_display = if keep.time_budget_secs == 0 {
+            "无限".to_string()
+        } else {
+            format!("{}min", keep.time_budget_secs / 60)
+        };
+        let items = vec![
+            format!("Token 预算 (当前: {token_display})"),
+            format!("时间预算 (当前: {time_display})"),
+            "返回模式设置菜单".to_string(),
+        ];
+        let sel = Select::new()
+            .with_prompt("KEEP 模式设置")
+            .items(&items)
+            .default(0)
+            .interact()
+            .map_err(|e| AgentError::Parse(format!("keep mode select: {e}")))?;
+        match sel {
+            0 => manage_keep_token(config, config_path)?,
+            1 => manage_keep_time(config, config_path)?,
             _ => return Ok(()),
         }
     }
@@ -90,7 +169,7 @@ fn manage_keep_token(config: &mut Config, config_path: &std::path::Path) -> Resu
     };
     let input = Input::<u64>::new()
         .with_prompt(format!(
-            "KEEP Token 预算 (当前: {current_display}, 0=无限, 单位 千 token, 最小 100)"
+            "Token 预算 (当前: {current_display}, 0=无限, 单位 千 token, 最小 100)"
         ))
         .default(if config.mode_styles.keep.token_budget == 0 {
             0
@@ -111,7 +190,7 @@ fn manage_keep_token(config: &mut Config, config_path: &std::path::Path) -> Resu
     config.mode_styles.keep.token_budget = budget;
     config.save(config_path)?;
     println!(
-        "KEEP Token 预算已设为 {} (config.toml)",
+        "Token 预算已设为 {} (config.toml)",
         if budget == 0 {
             "无限".to_string()
         } else {
@@ -121,63 +200,7 @@ fn manage_keep_token(config: &mut Config, config_path: &std::path::Path) -> Resu
     Ok(())
 }
 
-/// UI 思考显示设置：全局 `[ui] show_think` + UNNI per-mode 覆盖（跟随全局/强制开/强制关）。
-fn manage_ui_show_think(
-    config: &mut Config,
-    config_path: &std::path::Path,
-) -> Result<(), AgentError> {
-    let global_items = ["开（显示思考面板）", "关（隐藏思考面板）"];
-    let global = Select::new()
-        .with_prompt(format!(
-            "全局思考显示 (当前: {})",
-            if config.ui.show_think { "开" } else { "关" }
-        ))
-        .items(&global_items)
-        .default(if config.ui.show_think { 0 } else { 1 })
-        .interact()
-        .map_err(|e| AgentError::Parse(format!("ui show_think select: {e}")))?;
-    let new_global = global == 0;
-    config.ui.show_think = new_global;
-
-    let unni_items = ["跟随全局", "强制开", "强制关"];
-    let current = config.mode_styles.unni.as_ref().and_then(|u| u.show_think);
-    let default_idx = match current {
-        None => 0,
-        Some(true) => 1,
-        Some(false) => 2,
-    };
-    let sel = Select::new()
-        .with_prompt(format!(
-            "UNNI 模式思考显示覆盖 (当前: {})",
-            match current {
-                None => "跟随全局".to_string(),
-                Some(true) => "开".to_string(),
-                Some(false) => "关".to_string(),
-            }
-        ))
-        .items(&unni_items)
-        .default(default_idx)
-        .interact()
-        .map_err(|e| AgentError::Parse(format!("unni show_think select: {e}")))?;
-    config
-        .mode_styles
-        .unni
-        .get_or_insert_with(UnniStyle::default)
-        .show_think = match sel {
-        0 => None,
-        1 => Some(true),
-        _ => Some(false),
-    };
-
-    config.save(config_path)?;
-    println!(
-        "UI 思考显示已保存 (config.toml): 全局={}, UNNI 覆盖={:?}",
-        config.ui.show_think,
-        config.mode_styles.unni.as_ref().and_then(|u| u.show_think)
-    );
-    Ok(())
-}
-
+/// KEEP 时间预算（KEEP 模式设置分组内）。
 fn manage_keep_time(config: &mut Config, config_path: &std::path::Path) -> Result<(), AgentError> {
     let current_display = if config.mode_styles.keep.time_budget_secs == 0 {
         "无限".to_string()
@@ -186,7 +209,7 @@ fn manage_keep_time(config: &mut Config, config_path: &std::path::Path) -> Resul
     };
     let input = Input::<u64>::new()
         .with_prompt(format!(
-            "KEEP 时间预算 (当前: {current_display}, 0=无限, 单位 min, 最小 5)"
+            "时间预算 (当前: {current_display}, 0=无限, 单位 min, 最小 5)"
         ))
         .default(if config.mode_styles.keep.time_budget_secs == 0 {
             0
@@ -207,7 +230,7 @@ fn manage_keep_time(config: &mut Config, config_path: &std::path::Path) -> Resul
     config.mode_styles.keep.time_budget_secs = secs;
     config.save(config_path)?;
     println!(
-        "KEEP 时间预算已设为 {} (config.toml)",
+        "时间预算已设为 {} (config.toml)",
         if secs == 0 {
             "无限".to_string()
         } else {

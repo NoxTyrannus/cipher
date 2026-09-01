@@ -1,4 +1,4 @@
-use super::config::{Config, RuntimeStyles};
+use super::config::{Config, RuntimeStyles, UnniStyle};
 use super::{init, self_check};
 use crate::agent::context_assembler::{ContextAssembler, ContextConfig};
 use crate::common::AgentError;
@@ -853,7 +853,7 @@ pub async fn run_streaming_loop(
                                 let mut config = crate::startup::init::init(&config_path)?;
                                 let mut styles = *mode_styles_shared.lock().unwrap();
                                 // 放弃项 1/2/10：协同节点固定洞察 + mix 机制整体删除，
-                                // 协作设置仅保留 KEEP 预算（target 0=Token，1=时间）。
+                                // 模式设置仅保留 KEEP 预算（target 0=Token，1=时间）。
                                 let msg = match target {
                                     0 => {
                                         // 0=无限；非 0 时 clamp 到默认最小值 100K。
@@ -880,11 +880,39 @@ pub async fn run_streaming_loop(
                                             format!("KEEP 时间预算已切换 → {}min", secs / 60)
                                         }
                                     }
-                                    _ => "未知协作设置项".to_string(),
+                                    _ => "未知模式设置项".to_string(),
                                 };
                                 config.save(&config_path)?;
                                 *mode_styles_shared.lock().unwrap() = styles;
                                 state.config_panel.message = Some((msg, false));
+                                state.config_panel.view = ConfigView::ModeStyleSubMenu { cursor: 0 };
+                                state.config_panel.clear_db_request();
+                            }
+                            DbRequest::SaveShowThink { show } => {
+                                let config_path = crate::startup::Config::default_path();
+                                let mut config = crate::startup::init::init(&config_path)?;
+                                // 只写 [mode_styles.unni] show_think：菜单不暴露全局 [ui] show_think，
+                                // 全局字段保留在 config/渲染层（程序默认 true、手动高级配置可用）。
+                                config
+                                    .mode_styles
+                                    .unni
+                                    .get_or_insert_with(UnniStyle::default)
+                                    .show_think = Some(show);
+                                config.save(&config_path)?;
+                                // 同步运行期快照（RuntimeStyles 整体重建，避免与 config 漂移）
+                                // 与 TuiState 两字段（KEEP 分支无此步，此处必须有——
+                                // 否则退出面板后 render_messages 仍按旧值渲染）。
+                                let styles = RuntimeStyles::from_config(&config);
+                                *mode_styles_shared.lock().unwrap() = styles;
+                                state.ui_show_think = styles.ui_show_think;
+                                state.unni_show_think = styles.unni_show_think;
+                                state.config_panel.message = Some((
+                                    format!(
+                                        "UNNI 思考输出已切换 → {}",
+                                        if show { "开" } else { "关" }
+                                    ),
+                                    false,
+                                ));
                                 state.config_panel.view = ConfigView::ModeStyleSubMenu { cursor: 0 };
                                 state.config_panel.clear_db_request();
                             }

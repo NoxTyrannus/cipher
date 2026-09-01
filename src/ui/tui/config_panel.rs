@@ -14,12 +14,19 @@ const MENU_ITEMS: &[(&str, bool)] = &[
     ("Model + Provider", true),
     ("工作区管理", false),
     ("Agent 改名", true),
-    ("协同模式风格 (Mode Style)", true),
+    ("模式设置", true),
 ];
 
-/// 协作设置子菜单项（与 /config CLI 的 manage_mode_styles 保持一致）。
-/// 放弃项 1/2/10：协同节点固定洞察 + mix 机制删除，仅保留 KEEP 预算两项。
+/// 模式设置子菜单项（与 /config CLI 的 manage_mode_styles 保持一致）：
+/// 按模式分组 —— UNNI 模式设置（思考输出）/ KEEP 模式设置（Token/时间预算）。
+/// 放弃项 1/2/10：协同节点固定洞察 + mix 机制删除；LOOP 暂无模式项，后续有需求再加。
 const MODE_STYLE_SUBMENU_LEN: usize = 2;
+/// UNNI 模式设置分组内项数（当前仅「思考输出」）。
+const UNNI_MODE_MENU_LEN: usize = 1;
+/// KEEP 模式设置分组内项数（Token 预算 / 时间预算）。
+const KEEP_MODE_MENU_LEN: usize = 2;
+/// 思考输出二选：开 / 关。
+const SHOW_THINK_OPTIONS_LEN: usize = 2;
 
 #[derive(Debug, Clone)]
 pub enum ActionResult {
@@ -70,6 +77,13 @@ pub struct KeepBudgetInput {
     pub submitted: bool,
 }
 
+/// 思考输出二选（UNNI 模式设置分组内）：cursor=0 开 / 1 关。
+#[derive(Debug, Clone)]
+pub struct ShowThinkSelect {
+    pub cursor: usize,
+    pub submitted: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum ConfigView {
     Menu,
@@ -86,13 +100,26 @@ pub enum ConfigView {
 
     DeleteModelConfirm(DeleteModelConfirm),
 
-    /// 协作模式风格：子菜单（KEEP Token 预算 / KEEP 时间预算）。
-    /// 放弃项 1/2/10：协同节点选择与 Mix 项已删除（协同节点固定洞察）。
+    /// 模式设置：按模式分组子菜单（UNNI 模式设置 / KEEP 模式设置）。
+    /// 放弃项 1/2/10：协同节点固定洞察与 Mix 项已删除（协同节点固定洞察）。
     ModeStyleSubMenu {
         cursor: usize,
     },
 
-    /// KEEP 预算数字输入表单（子菜单 target=0 token / target=1 时间）。
+    /// UNNI 模式设置分组（当前仅「思考输出」）。
+    UnniModeMenu {
+        cursor: usize,
+    },
+
+    /// 思考输出 开/关 二选（UNNI 分组内）。
+    ShowThinkSelect(ShowThinkSelect),
+
+    /// KEEP 模式设置分组（Token 预算 / 时间预算）。
+    KeepModeMenu {
+        cursor: usize,
+    },
+
+    /// KEEP 预算数字输入表单（KEEP 分组内 target=0 token / target=1 时间）。
     KeepBudgetInput(KeepBudgetInput),
 
     RenameAgent(RenameAgentForm),
@@ -139,6 +166,12 @@ pub enum DbRequest {
     SaveModeStyle {
         target: usize,
         value: String,
+    },
+
+    /// UNNI 思考输出（[mode_styles.unni] show_think）：show=true 开 / false 关。
+    /// 只控制 TUI 渲染是否显示 think 实例输出，不改变 thinking 执行链。
+    SaveShowThink {
+        show: bool,
     },
 
     SubmitRenameAgent {
@@ -202,6 +235,9 @@ impl ConfigPanel {
                 target: form.target,
                 value: form.input.trim().to_string(),
             },
+            ConfigView::ShowThinkSelect(sel) if sel.submitted => DbRequest::SaveShowThink {
+                show: sel.cursor == 0,
+            },
             ConfigView::RenameAgent(form) if form.submitted => DbRequest::SubmitRenameAgent {
                 display_name: form.name.clone(),
             },
@@ -215,6 +251,7 @@ impl ConfigPanel {
             ConfigView::SetDefault(s) => s.submitted = false,
             ConfigView::DeleteModelConfirm(f) => f.submitted = false,
             ConfigView::KeepBudgetInput(form) => form.submitted = false,
+            ConfigView::ShowThinkSelect(sel) => sel.submitted = false,
             ConfigView::RenameAgent(f) => f.submitted = false,
             _ => {}
         }
@@ -262,6 +299,30 @@ impl ConfigPanel {
 
                 if matches!(self.view, ConfigView::Menu) && self.expanded.is_some() {
                     self.view = ConfigView::ModeStyleSubMenu { cursor };
+                }
+                r
+            }
+            ConfigView::UnniModeMenu { mut cursor } => {
+                let r = self.handle_unni_mode_menu_key(key, &mut cursor);
+
+                if matches!(self.view, ConfigView::Menu) && self.expanded.is_some() {
+                    self.view = ConfigView::UnniModeMenu { cursor };
+                }
+                r
+            }
+            ConfigView::ShowThinkSelect(mut sel) => {
+                let r = self.handle_show_think_select_key(key, &mut sel);
+
+                if matches!(self.view, ConfigView::Menu) && self.expanded.is_some() {
+                    self.view = ConfigView::ShowThinkSelect(sel);
+                }
+                r
+            }
+            ConfigView::KeepModeMenu { mut cursor } => {
+                let r = self.handle_keep_mode_menu_key(key, &mut cursor);
+
+                if matches!(self.view, ConfigView::Menu) && self.expanded.is_some() {
+                    self.view = ConfigView::KeepModeMenu { cursor };
                 }
                 r
             }
@@ -557,6 +618,102 @@ impl ConfigPanel {
             }
             KeyCode::Esc => ActionResult::Exit,
             KeyCode::Right | KeyCode::Enter => {
+                // cursor 0 = UNNI 模式设置分组；1 = KEEP 模式设置分组。
+                self.view = if *cursor == 0 {
+                    ConfigView::UnniModeMenu { cursor: 0 }
+                } else {
+                    ConfigView::KeepModeMenu { cursor: 0 }
+                };
+                ActionResult::Navigate
+            }
+            _ => ActionResult::Navigate,
+        }
+    }
+
+    fn handle_unni_mode_menu_key(&mut self, key: KeyCode, cursor: &mut usize) -> ActionResult {
+        match key {
+            KeyCode::Up => {
+                if *cursor > 0 {
+                    *cursor -= 1;
+                }
+                ActionResult::Navigate
+            }
+            KeyCode::Down => {
+                // UNNI_MODE_MENU_LEN 当前为 1：`cursor < LEN - 1` 恒假会触发 clippy，
+                // 改用 `cursor + 1 < LEN`（LEN 增长后语义不变）。
+                if *cursor + 1 < UNNI_MODE_MENU_LEN {
+                    *cursor += 1;
+                }
+                ActionResult::Navigate
+            }
+            KeyCode::Left => {
+                self.view = ConfigView::ModeStyleSubMenu { cursor: 0 };
+                ActionResult::Navigate
+            }
+            KeyCode::Esc => ActionResult::Exit,
+            KeyCode::Right | KeyCode::Enter => {
+                // 当前仅「思考输出」一项 → 开/关 二选。
+                self.view = ConfigView::ShowThinkSelect(ShowThinkSelect {
+                    cursor: 0,
+                    submitted: false,
+                });
+                ActionResult::Navigate
+            }
+            _ => ActionResult::Navigate,
+        }
+    }
+
+    fn handle_show_think_select_key(
+        &mut self,
+        key: KeyCode,
+        sel: &mut ShowThinkSelect,
+    ) -> ActionResult {
+        match key {
+            KeyCode::Up => {
+                if sel.cursor > 0 {
+                    sel.cursor -= 1;
+                }
+                ActionResult::Navigate
+            }
+            KeyCode::Down => {
+                if sel.cursor < SHOW_THINK_OPTIONS_LEN - 1 {
+                    sel.cursor += 1;
+                }
+                ActionResult::Navigate
+            }
+            KeyCode::Left => {
+                self.view = ConfigView::UnniModeMenu { cursor: 0 };
+                ActionResult::Navigate
+            }
+            KeyCode::Esc => ActionResult::Exit,
+            KeyCode::Right | KeyCode::Enter => {
+                sel.submitted = true;
+                ActionResult::Navigate
+            }
+            _ => ActionResult::Navigate,
+        }
+    }
+
+    fn handle_keep_mode_menu_key(&mut self, key: KeyCode, cursor: &mut usize) -> ActionResult {
+        match key {
+            KeyCode::Up => {
+                if *cursor > 0 {
+                    *cursor -= 1;
+                }
+                ActionResult::Navigate
+            }
+            KeyCode::Down => {
+                if *cursor < KEEP_MODE_MENU_LEN - 1 {
+                    *cursor += 1;
+                }
+                ActionResult::Navigate
+            }
+            KeyCode::Left => {
+                self.view = ConfigView::ModeStyleSubMenu { cursor: 1 };
+                ActionResult::Navigate
+            }
+            KeyCode::Esc => ActionResult::Exit,
+            KeyCode::Right | KeyCode::Enter => {
                 let target = *cursor;
                 self.view = ConfigView::KeepBudgetInput(KeepBudgetInput {
                     target,
@@ -584,13 +741,13 @@ impl ConfigPanel {
                 ActionResult::Navigate
             }
             KeyCode::Left => {
-                self.view = ConfigView::ModeStyleSubMenu {
+                self.view = ConfigView::KeepModeMenu {
                     cursor: form.target,
                 };
                 ActionResult::Navigate
             }
             KeyCode::Esc => {
-                self.view = ConfigView::ModeStyleSubMenu {
+                self.view = ConfigView::KeepModeMenu {
                     cursor: form.target,
                 };
                 ActionResult::Navigate
@@ -644,9 +801,10 @@ impl ConfigPanel {
             }
             ConfigView::AddModelSelectTemplate { .. }
             | ConfigView::SetDefault(_)
-            | ConfigView::ModeStyleSubMenu { .. } => {
-                "← 返回上级    ↑↓ 选择    → 确认    Esc 退出设置"
-            }
+            | ConfigView::ModeStyleSubMenu { .. }
+            | ConfigView::UnniModeMenu { .. }
+            | ConfigView::ShowThinkSelect(_)
+            | ConfigView::KeepModeMenu { .. } => "← 返回上级    ↑↓ 选择    → 确认    Esc 退出设置",
             ConfigView::AddModel(_) => "← 取消        Tab 下一字段  Enter 确认    Esc 退出设置",
             ConfigView::DeleteModelConfirm(_) => "Enter 确认删除  ←/Esc 取消",
             ConfigView::KeepBudgetInput(_) => {
@@ -702,6 +860,15 @@ pub fn render(panel: &ConfigPanel, frame: &mut Frame, area: Rect) {
         }
         ConfigView::ModeStyleSubMenu { cursor } => {
             render_mode_style_submenu(panel, frame, content_area, *cursor);
+        }
+        ConfigView::UnniModeMenu { cursor } => {
+            render_unni_mode_menu(panel, frame, content_area, *cursor);
+        }
+        ConfigView::ShowThinkSelect(sel) => {
+            render_show_think_select(panel, frame, content_area, sel);
+        }
+        ConfigView::KeepModeMenu { cursor } => {
+            render_keep_mode_menu(panel, frame, content_area, *cursor);
         }
         ConfigView::KeepBudgetInput(form) => {
             render_keep_budget_input(panel, frame, content_area, form);
@@ -992,22 +1159,21 @@ fn render_set_default(_panel: &ConfigPanel, frame: &mut Frame, area: Rect, sel: 
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_mode_style_submenu(_panel: &ConfigPanel, frame: &mut Frame, area: Rect, cursor: usize) {
+/// 通用「标题 + (名称, 描述) 列表」渲染（模式设置各层子菜单共用）。
+fn render_select_list(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    items: &[(&str, &str)],
+    cursor: usize,
+) {
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::Paragraph;
 
-    let items: [(&str, &str); MODE_STYLE_SUBMENU_LEN] = [
-        ("KEEP Token 预算", "0=无限, 最小 100K"),
-        ("KEEP 时间预算", "0=无限, 最小 5min"),
-    ];
-
     let mut lines: Vec<Line> = vec![
         Line::from(""),
-        Line::from(vec![Span::styled(
-            "协作设置 (UNNI/KEEP/LOOP 共用):",
-            Style::default().fg(Color::Gray),
-        )]),
+        Line::from(vec![Span::styled(title, Style::default().fg(Color::Gray))]),
         Line::from(""),
     ];
     for (i, (name, desc)) in items.iter().enumerate() {
@@ -1029,6 +1195,42 @@ fn render_mode_style_submenu(_panel: &ConfigPanel, frame: &mut Frame, area: Rect
     }
     frame.render_widget(Paragraph::new(lines), area);
 }
+
+/// 模式设置：按模式分组子菜单（UNNI 模式设置 / KEEP 模式设置）。
+fn render_mode_style_submenu(_panel: &ConfigPanel, frame: &mut Frame, area: Rect, cursor: usize) {
+    let items: [(&str, &str); MODE_STYLE_SUBMENU_LEN] = [
+        ("UNNI 模式设置", "思考输出"),
+        ("KEEP 模式设置", "Token/时间预算"),
+    ];
+    render_select_list(frame, area, "模式设置:", &items, cursor);
+}
+
+/// UNNI 模式设置分组（当前仅「思考输出」→ 开/关 二选）。
+fn render_unni_mode_menu(_panel: &ConfigPanel, frame: &mut Frame, area: Rect, cursor: usize) {
+    let items: [(&str, &str); UNNI_MODE_MENU_LEN] = [("思考输出", "开 / 关")];
+    render_select_list(frame, area, "UNNI 模式设置:", &items, cursor);
+}
+
+/// 思考输出 开/关 二选（UNNI 分组内；只控制 TUI 渲染，不改 thinking 执行链）。
+fn render_show_think_select(
+    _panel: &ConfigPanel,
+    frame: &mut Frame,
+    area: Rect,
+    sel: &ShowThinkSelect,
+) {
+    let items: [(&str, &str); SHOW_THINK_OPTIONS_LEN] =
+        [("开", "显示思考输出"), ("关", "隐藏思考输出")];
+    render_select_list(frame, area, "思考输出:", &items, sel.cursor);
+}
+
+/// KEEP 模式设置分组（Token 预算 / 时间预算）。
+fn render_keep_mode_menu(_panel: &ConfigPanel, frame: &mut Frame, area: Rect, cursor: usize) {
+    let items: [(&str, &str); KEEP_MODE_MENU_LEN] = [
+        ("Token 预算", "0=无限, 最小 100K"),
+        ("时间预算", "0=无限, 最小 5min"),
+    ];
+    render_select_list(frame, area, "KEEP 模式设置:", &items, cursor);
+}
 fn render_keep_budget_input(
     _panel: &ConfigPanel,
     frame: &mut Frame,
@@ -1040,9 +1242,9 @@ fn render_keep_budget_input(
     use ratatui::widgets::Paragraph;
 
     let (title, unit, minimum, minimum_label) = if form.target == 0 {
-        ("KEEP Token 预算", "K", "100", "100K (100,000 token)")
+        ("Token 预算", "K", "100", "100K (100,000 token)")
     } else {
-        ("KEEP 时间预算", "min", "5", "5min (300 秒)")
+        ("时间预算", "min", "5", "5min (300 秒)")
     };
     let lines = vec![
         Line::from(""),
@@ -1144,29 +1346,72 @@ mod tests {
         assert!(text.contains("Model + Provider"), "menu item 1");
         assert!(text.contains('工'), "menu item 2");
         assert!(text.contains("Agent"), "menu item 3 (Agent prefix)");
-        assert!(text.contains("Mode Style"), "menu item 4");
+        // CJK 宽字符在 ratatui buffer 中占 2 格，续格符号为空格 → 先去空格再断言。
+        assert!(
+            text.replace(' ', "").contains("模式设置"),
+            "menu item 4, got: {text}"
+        );
+        assert!(!text.contains("Mode Style"), "old wording removed");
+        assert!(!text.contains("协同模式风格"), "old wording removed");
         assert!(!text.contains("默认设置"), "default settings removed");
         assert!(!text.contains("上下文编辑"), "context editing removed");
 
         let pending_count = text.matches('(').count();
         assert_eq!(
-            pending_count, 2,
-            "1 disabled item shows (待后续) + 1 item title has parens, got: {text}"
+            pending_count, 1,
+            "only 1 disabled item shows (待后续), got: {text}"
         );
     }
 
     #[test]
-    fn mode_style_submenu_renders_without_panic() {
+    fn mode_style_submenu_renders_groups_without_panic() {
         let mut panel = ConfigPanel::new();
         panel.expanded = Some(3);
         panel.view = ConfigView::ModeStyleSubMenu { cursor: 1 };
         let text = render_to_text(&panel).replace(' ', "");
-        assert!(text.contains("协作设置"), "submenu title: {text}");
-        assert!(text.contains("KEEPToken"), "item 1: {text}");
-        assert!(text.contains("KEEP时间"), "item 2: {text}");
+        assert!(text.contains("模式设置:"), "submenu title: {text}");
+        assert!(text.contains("UNNI模式设置"), "group 1: {text}");
+        assert!(text.contains("KEEP模式设置"), "group 2: {text}");
+        assert!(!text.contains("协作设置"), "old title removed: {text}");
         assert!(!text.contains("协同节点"), "node item removed: {text}");
         assert!(!text.contains("Mix"), "mix item removed: {text}");
         assert!(!text.contains("UNNI协同方式"), "style item removed: {text}");
+    }
+
+    #[test]
+    fn unni_mode_menu_renders_think_output_item() {
+        let mut panel = ConfigPanel::new();
+        panel.expanded = Some(3);
+        panel.view = ConfigView::UnniModeMenu { cursor: 0 };
+        let text = render_to_text(&panel).replace(' ', "");
+        assert!(text.contains("UNNI模式设置:"), "title: {text}");
+        assert!(text.contains("思考输出"), "think output item: {text}");
+    }
+
+    #[test]
+    fn keep_mode_menu_renders_budget_items() {
+        let mut panel = ConfigPanel::new();
+        panel.expanded = Some(3);
+        panel.view = ConfigView::KeepModeMenu { cursor: 1 };
+        let text = render_to_text(&panel).replace(' ', "");
+        assert!(text.contains("KEEP模式设置:"), "title: {text}");
+        assert!(text.contains("Token预算"), "token item: {text}");
+        assert!(text.contains("时间预算"), "time item: {text}");
+        assert!(!text.contains("KEEPToken"), "no double KEEP prefix: {text}");
+    }
+
+    #[test]
+    fn show_think_select_renders_on_off() {
+        let mut panel = ConfigPanel::new();
+        panel.expanded = Some(3);
+        panel.view = ConfigView::ShowThinkSelect(ShowThinkSelect {
+            cursor: 0,
+            submitted: false,
+        });
+        let text = render_to_text(&panel).replace(' ', "");
+        assert!(text.contains("思考输出:"), "title: {text}");
+        assert!(text.contains("显示思考输出"), "on option: {text}");
+        assert!(text.contains("隐藏思考输出"), "off option: {text}");
     }
 
     #[test]
@@ -1243,22 +1488,135 @@ mod tests {
     }
 
     #[test]
-    fn mode_style_submenu_enter_opens_keep_budget_input() {
+    fn mode_style_submenu_enter_opens_mode_groups() {
         let mut p = ConfigPanel::new();
         p.expanded = Some(3);
         p.view = ConfigView::ModeStyleSubMenu { cursor: 0 };
+        p.handle_key(KeyCode::Enter);
+        assert!(matches!(p.view, ConfigView::UnniModeMenu { cursor: 0 }));
+
+        p.view = ConfigView::ModeStyleSubMenu { cursor: 1 };
+        p.handle_key(KeyCode::Enter);
+        assert!(matches!(p.view, ConfigView::KeepModeMenu { cursor: 0 }));
+    }
+
+    #[test]
+    fn unni_mode_menu_enter_opens_show_think_select() {
+        let mut p = ConfigPanel::new();
+        p.expanded = Some(3);
+        p.view = ConfigView::UnniModeMenu { cursor: 0 };
+        p.handle_key(KeyCode::Enter);
+        assert!(matches!(
+            p.view,
+            ConfigView::ShowThinkSelect(ShowThinkSelect {
+                cursor: 0,
+                submitted: false
+            })
+        ));
+    }
+
+    #[test]
+    fn unni_mode_menu_left_returns_to_mode_style_submenu() {
+        let mut p = ConfigPanel::new();
+        p.expanded = Some(3);
+        p.view = ConfigView::UnniModeMenu { cursor: 0 };
+        p.handle_key(KeyCode::Left);
+        assert!(matches!(p.view, ConfigView::ModeStyleSubMenu { cursor: 0 }));
+    }
+
+    #[test]
+    fn show_think_select_on_submits_save_show_think() {
+        let mut p = ConfigPanel::new();
+        // handle_key 的 mem::replace 恢复依赖 expanded（真实路径：从主菜单 → 模式设置进入）。
+        p.expanded = Some(3);
+        p.view = ConfigView::ShowThinkSelect(ShowThinkSelect {
+            cursor: 0,
+            submitted: false,
+        });
+        p.handle_key(KeyCode::Enter);
+        assert_eq!(
+            p.pending_db_request(),
+            DbRequest::SaveShowThink { show: true }
+        );
+        p.clear_db_request();
+        assert_eq!(p.pending_db_request(), DbRequest::None);
+    }
+
+    #[test]
+    fn show_think_select_off_submits_save_show_think_false() {
+        let mut p = ConfigPanel::new();
+        p.expanded = Some(3);
+        p.view = ConfigView::ShowThinkSelect(ShowThinkSelect {
+            cursor: 0,
+            submitted: false,
+        });
+        p.handle_key(KeyCode::Down);
+        p.handle_key(KeyCode::Enter);
+        if let ConfigView::ShowThinkSelect(sel) = &p.view {
+            assert_eq!(sel.cursor, 1);
+        } else {
+            panic!("still ShowThinkSelect");
+        }
+        assert_eq!(
+            p.pending_db_request(),
+            DbRequest::SaveShowThink { show: false }
+        );
+    }
+
+    #[test]
+    fn show_think_select_left_returns_to_unni_menu() {
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::ShowThinkSelect(ShowThinkSelect {
+            cursor: 1,
+            submitted: false,
+        });
+        p.handle_key(KeyCode::Left);
+        assert!(matches!(p.view, ConfigView::UnniModeMenu { cursor: 0 }));
+    }
+
+    #[test]
+    fn two_level_navigation_reaches_save_show_think() {
+        let mut p = ConfigPanel::new();
+        // 模式设置 → UNNI 模式设置 → 思考输出 开/关 → 提交
+        p.expanded = Some(3);
+        p.view = ConfigView::ModeStyleSubMenu { cursor: 0 };
+        p.handle_key(KeyCode::Enter);
+        assert!(matches!(p.view, ConfigView::UnniModeMenu { .. }));
+        p.handle_key(KeyCode::Enter);
+        assert!(matches!(p.view, ConfigView::ShowThinkSelect(_)));
+        p.handle_key(KeyCode::Enter);
+        assert_eq!(
+            p.pending_db_request(),
+            DbRequest::SaveShowThink { show: true }
+        );
+    }
+
+    #[test]
+    fn keep_mode_menu_enter_opens_keep_budget_input() {
+        let mut p = ConfigPanel::new();
+        p.expanded = Some(3);
+        p.view = ConfigView::KeepModeMenu { cursor: 0 };
         p.handle_key(KeyCode::Enter);
         assert!(matches!(
             p.view,
             ConfigView::KeepBudgetInput(KeepBudgetInput { target: 0, .. })
         ));
 
-        p.view = ConfigView::ModeStyleSubMenu { cursor: 1 };
+        p.view = ConfigView::KeepModeMenu { cursor: 1 };
         p.handle_key(KeyCode::Enter);
         assert!(matches!(
             p.view,
             ConfigView::KeepBudgetInput(KeepBudgetInput { target: 1, .. })
         ));
+    }
+
+    #[test]
+    fn keep_mode_menu_left_returns_to_mode_style_submenu() {
+        let mut p = ConfigPanel::new();
+        p.expanded = Some(3);
+        p.view = ConfigView::KeepModeMenu { cursor: 1 };
+        p.handle_key(KeyCode::Left);
+        assert!(matches!(p.view, ConfigView::ModeStyleSubMenu { cursor: 1 }));
     }
 
     #[test]
@@ -1320,7 +1678,7 @@ mod tests {
     }
 
     #[test]
-    fn keep_budget_input_esc_cancels_to_submenu() {
+    fn keep_budget_input_esc_cancels_to_keep_mode_menu() {
         let mut p = ConfigPanel::new();
         p.view = ConfigView::KeepBudgetInput(KeepBudgetInput {
             target: 1,
@@ -1328,7 +1686,7 @@ mod tests {
             submitted: false,
         });
         p.handle_key(KeyCode::Esc);
-        assert!(matches!(p.view, ConfigView::ModeStyleSubMenu { cursor: 1 }));
+        assert!(matches!(p.view, ConfigView::KeepModeMenu { cursor: 1 }));
     }
 
     #[test]
