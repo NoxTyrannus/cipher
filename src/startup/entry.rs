@@ -129,6 +129,7 @@ pub async fn run_setup(
     }
     crate::data::cognitive_seed::ensure_default_capabilities(&config.data_dir)?;
     crate::data::cognitive_seed::import_factory_defaults(&app_state.duckdb, &config.data_dir)?;
+    crate::data::cognitive_seed::upgrade_seed_deltas(&app_state.duckdb, &config.data_dir)?;
     tracing::info!("setup: 初始化完成");
     Ok(())
 }
@@ -229,6 +230,7 @@ pub async fn run_normal(
 
     crate::data::cognitive_seed::ensure_default_capabilities(&config.data_dir)?;
     crate::data::cognitive_seed::import_factory_defaults(&app_state.duckdb, &config.data_dir)?;
+    crate::data::cognitive_seed::upgrade_seed_deltas(&app_state.duckdb, &config.data_dir)?;
 
     // 关键：能力/agent 种子在 import_factory_defaults 中才写入 DuckDB，
     // 而 `app_state.registry` 在 bootstrap() 时已加载（早于种子）。
@@ -358,6 +360,7 @@ pub async fn run_normal(
             Some(exec_executor),
             exec_duckdb,
             exec_storage_root,
+            config.execution.merge_enabled,
         )
         .await;
     });
@@ -383,6 +386,7 @@ pub async fn run_normal(
             capability_memory_tx,
             insight_prompts_dir,
             insight_storage_root,
+            config.insight.merge_enabled,
         )
         .await;
     });
@@ -506,6 +510,7 @@ pub async fn run_normal(
             Some(experience_tx),
             Some(preference_tx),
             Some(cognitive_tx),
+            config.memory.merge_enabled,
         )
         .await;
     });
@@ -651,6 +656,7 @@ pub async fn run_config(
     crate::data::cognitive_seed::ensure_default_cognitive_seed(&config.data_dir)?;
     crate::data::cognitive_seed::ensure_default_capabilities(&config.data_dir)?;
     crate::data::cognitive_seed::import_factory_defaults(&app_state.duckdb, &config.data_dir)?;
+    crate::data::cognitive_seed::upgrade_seed_deltas(&app_state.duckdb, &config.data_dir)?;
     crate::startup::config_flow::run(&app_state)?;
     tracing::info!("config: 完成");
     Ok(())

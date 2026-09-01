@@ -41,6 +41,9 @@ mod tests {
             context: ContextSection::default(),
             ui: crate::startup::config::UiSection::default(),
             web: crate::startup::config::WebSection::default(),
+            execution: crate::startup::config::MergeSection::default(),
+            insight: crate::startup::config::MergeSection::default(),
+            memory: crate::startup::config::MergeSection::default(),
         };
         saved.save(&path).unwrap();
 

@@ -100,6 +100,9 @@ pub struct ExecutionPlatform {
     executor: Option<Arc<crate::logic::capability::executor::CapabilityExecutor>>,
     duckdb: Option<Arc<Mutex<duckdb::Connection>>>,
     storage_root: Option<PathBuf>,
+    /// 机制式排队合并开关（v0.4.7）：true=批=连续处理组（逐轮产物逐轮执行/触发，
+    /// 飞行缓冲消除队列空隙）；false=完全回退逐条现状。
+    merge_enabled: bool,
 }
 
 impl ExecutionPlatform {
@@ -115,6 +118,7 @@ impl ExecutionPlatform {
         executor: Option<Arc<crate::logic::capability::executor::CapabilityExecutor>>,
         duckdb: Option<Arc<Mutex<duckdb::Connection>>>,
         storage_root: Option<PathBuf>,
+        merge_enabled: bool,
     ) -> Self {
         Self {
             execution_rx,
@@ -127,24 +131,41 @@ impl ExecutionPlatform {
             executor,
             duckdb,
             storage_root,
+            merge_enabled,
         }
     }
 
     pub fn spawn(mut self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            tracing::info!("execution_platform: started, polling rx");
+            tracing::info!(
+                "execution_platform: started, polling rx (merge_enabled={})",
+                self.merge_enabled
+            );
             let heartbeat = AgentPool::spawn_core_heartbeat(
                 &self.pool,
                 "execution-platform",
                 "execution-platform",
             );
-            while let Some(msg) = self.execution_rx.recv().await {
-                let pending = self.execution_rx.len();
-                self.pool
-                    .update_platform_status(move |s| s.execution_pending = pending)
-                    .await;
-                match msg {
-                    AgentMessage::Execute { turn_id } => {
+            if self.merge_enabled {
+                // v0.4.7 机制式合并：批 = 连续处理组；批内逐轮 handle_execute（每轮独立
+                // LLM 调用、独立 ExecutionOutput、逐轮触发 ExecutionDone/execution_complete）；
+                // 飞行缓冲消除队列空隙（处理中到达的 Execute 立即进下一批连续处理）。
+                let mut queue = crate::agent::batch_queue::PendingBatchQueue::<AgentMessage>::new();
+                loop {
+                    let Some(batch) = queue.next_batch(&mut self.execution_rx).await else {
+                        break;
+                    };
+                    queue.absorb_channel(&mut self.execution_rx);
+                    let batch_len = batch.len();
+                    for (i, msg) in batch.into_iter().enumerate() {
+                        let turn_id = match msg {
+                            AgentMessage::Execute { turn_id } => turn_id,
+                            AgentMessage::Cancel { .. } => continue,
+                            other => {
+                                tracing::warn!("execution_platform: unexpected message: {other:?}");
+                                continue;
+                            }
+                        };
                         self.pool
                             .update_platform_status(|s| s.execution_active = Some(turn_id.clone()))
                             .await;
@@ -154,11 +175,7 @@ impl ExecutionPlatform {
                                 crate::agent::agent_pool::registry::AgentStatus::Running,
                             )
                             .await;
-
-                        // §8.1 排队合并：执行中台执行中积压的 Execute 全部并入下一次调用。
-                        let batch = self.drain_execute_batch(turn_id);
-                        self.handle_execute_batch(&batch).await;
-
+                        self.handle_execute(&turn_id).await;
                         self.pool
                             .set_core_agent_status(
                                 "execution-platform",
@@ -168,74 +185,87 @@ impl ExecutionPlatform {
                         self.pool
                             .update_platform_status(|s| s.execution_active = None)
                             .await;
+
+                        // 待处理消息数口径 = 飞行缓冲 + 本批剩余。
+                        queue.absorb_channel(&mut self.execution_rx);
+                        let pending = queue.len() + (batch_len - 1 - i);
+                        self.pool
+                            .update_platform_status(move |s| s.execution_pending = pending)
+                            .await;
                     }
-                    AgentMessage::Cancel { .. } => {}
-                    other => {
-                        tracing::warn!("execution_platform: unexpected message: {other:?}");
-                    }
+                    queue.on_batch_finished();
+                    self.pool.snapshot_detailed().await;
                 }
-                self.pool.snapshot_detailed().await;
+            } else {
+                // 完全回退逐条现状（v0.4.6 及以前行为）。
+                while let Some(msg) = self.execution_rx.recv().await {
+                    let pending = self.execution_rx.len();
+                    self.pool
+                        .update_platform_status(move |s| s.execution_pending = pending)
+                        .await;
+                    match msg {
+                        AgentMessage::Execute { turn_id } => {
+                            self.pool
+                                .update_platform_status(|s| {
+                                    s.execution_active = Some(turn_id.clone())
+                                })
+                                .await;
+                            self.pool
+                                .set_core_agent_status(
+                                    "execution-platform",
+                                    crate::agent::agent_pool::registry::AgentStatus::Running,
+                                )
+                                .await;
+                            self.handle_execute(&turn_id).await;
+                            self.pool
+                                .set_core_agent_status(
+                                    "execution-platform",
+                                    crate::agent::agent_pool::registry::AgentStatus::Idle,
+                                )
+                                .await;
+                            self.pool
+                                .update_platform_status(|s| s.execution_active = None)
+                                .await;
+                        }
+                        AgentMessage::Cancel { .. } => {}
+                        other => {
+                            tracing::warn!("execution_platform: unexpected message: {other:?}");
+                        }
+                    }
+                    self.pool.snapshot_detailed().await;
+                }
             }
             heartbeat.abort();
             tracing::info!("execution_platform: rx closed, shutting down");
         })
     }
 
-    fn drain_execute_batch(&mut self, first: String) -> Vec<String> {
-        let mut batch = vec![first];
-        while let Ok(next) = self.execution_rx.try_recv() {
-            match next {
-                AgentMessage::Execute { turn_id } => batch.push(turn_id),
-                AgentMessage::Cancel { .. } => {}
-                other => {
-                    tracing::warn!(
-                        "execution_platform: dropping unexpected queued message: {other:?}"
-                    );
-                }
-            }
-        }
-        batch
-    }
-
-    async fn handle_execute_batch(&self, turn_ids: &[String]) {
-        let mut contexts = Vec::new();
-        for turn_id in turn_ids {
-            match self.pool.get_turn_context(turn_id).await {
-                Some(ctx) => contexts.push(ctx),
-                None => {
-                    tracing::warn!(
-                        "execution_platform: TurnContext not found for turn_id={turn_id}"
-                    );
-                }
-            }
-        }
-        if contexts.is_empty() {
+    /// 单轮执行：读 TurnContext → 组装执行中台上下文 → 恰好一次 LLM 调用 → 解析
+    /// task_design/task_status + capability_calls → 逐项执行 → 发布 ExecutionOutput +
+    /// ExecutionDone/execution_complete（v0.4.7 逐轮产物逐轮触发语义）。
+    async fn handle_execute(&self, turn_id: &str) {
+        let Some(ctx) = self.pool.get_turn_context(turn_id).await else {
+            tracing::warn!("execution_platform: TurnContext not found for turn_id={turn_id}");
             return;
-        }
-        // 合并结果落在仍然可解析的最新 turn 上。
-        let representative = contexts
-            .last()
-            .map(|ctx| ctx.turn_id.clone())
-            .unwrap_or_default();
+        };
 
         if let Err(e) = self.refresh_subagent_states().await {
             tracing::warn!(
-                "execution_platform: refresh_subagent_states failed for turn_id={representative}: {e}"
+                "execution_platform: refresh_subagent_states failed for turn_id={turn_id}: {e}"
             );
         }
 
         let pool_entries = self.pool.snapshot().await;
         let subagent_states = self.pool.subagent_states().await;
         let prompt = self.build_execution_base_prompt(&pool_entries, &subagent_states);
-        let messages = self.build_execution_messages(&contexts, &prompt);
+        let messages = self.build_execution_messages(std::slice::from_ref(&ctx), &prompt);
 
         let req = match LlmRequest::from_model_row(&self.model_row, messages, self.api_key.clone())
         {
             Ok(req) => req,
             Err(e) => {
                 let output = failure_output(format!("build LLM request failed: {e}"));
-                self.publish_execution_batch(&representative, turn_ids, output)
-                    .await;
+                self.publish_execution(turn_id, output).await;
                 return;
             }
         };
@@ -243,19 +273,15 @@ impl ExecutionPlatform {
         let raw = match self.provider.call(&req).await {
             Ok(response) => parse_execution_output(&response.content),
             Err(e) => {
-                tracing::error!(
-                    "execution_platform: LLM call failed for turn_id={representative}: {e}"
-                );
+                tracing::error!("execution_platform: LLM call failed for turn_id={turn_id}: {e}");
                 let output = failure_output(format!("LLM call failed: {e}"));
-                self.publish_execution_batch(&representative, turn_ids, output)
-                    .await;
+                self.publish_execution(turn_id, output).await;
                 return;
             }
         };
 
         let output = self.execute_capability_calls(raw).await;
-        self.publish_execution_batch(&representative, turn_ids, output)
-            .await;
+        self.publish_execution(turn_id, output).await;
     }
 
     fn build_execution_base_prompt(
@@ -313,19 +339,6 @@ impl ExecutionPlatform {
             kind: SystemKind::Primary,
         });
         messages
-    }
-
-    async fn publish_execution_batch(
-        &self,
-        representative: &str,
-        turn_ids: &[String],
-        output: ExecutionOutput,
-    ) {
-        // 合并执行只产出一个结果：关闭较早 turn，结果落在代表 turn（最新一条）。
-        for turn_id in turn_ids.iter().filter(|id| id.as_str() != representative) {
-            self.pool.mark_done(turn_id).await;
-        }
-        self.publish_execution(representative, output).await;
     }
 
     fn thinking_input_section(ctx: &crate::agent::communication::TurnContext) -> String {
@@ -1006,6 +1019,7 @@ pub async fn run(
     executor: Option<Arc<crate::logic::capability::executor::CapabilityExecutor>>,
     duckdb: Option<Arc<Mutex<duckdb::Connection>>>,
     storage_root: Option<PathBuf>,
+    merge_enabled: bool,
 ) {
     let platform = ExecutionPlatform::new(
         rx,
@@ -1018,6 +1032,7 @@ pub async fn run(
         executor,
         duckdb,
         storage_root,
+        merge_enabled,
     );
     let handle = platform.spawn();
     match handle.await {
@@ -1315,6 +1330,7 @@ mod tests {
             Some(executor),
             Some(duckdb),
             Some(temp.path().to_path_buf()),
+            true,
         );
 
         let created = platform
@@ -1374,14 +1390,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_execute_batch_merges_queued_executes_in_order() {
+    async fn merged_loop_processes_each_turn_individually_in_order() {
+        // v0.4.7 机制式合并（执行中台）：批 = 连续处理组，批内逐轮独立产出/触发下游。
+        // 四个 turn 依次到达 → 每轮都有独立 ExecutionOutput（NoopProvider 空响应 →
+        // failure_output，task_status 以 raw: 开头），且保序处理、不漏轮。
+        let (pool, mut receivers) = AgentPool::new();
+        let pool = Arc::new(pool);
+        for t in ["t1", "t2", "t3", "t4"] {
+            pool.create_turn_context(execution_turn_context(t, "user", "think"))
+                .await;
+        }
         let (tx, rx) = mpsc::channel(8);
-        let mut platform = ExecutionPlatform::new(
+        let platform = ExecutionPlatform::new(
             rx,
-            {
-                let (pool, _) = AgentPool::new();
-                Arc::new(pool)
-            },
+            pool.clone(),
             Arc::new(NoopProvider),
             crate::data::ModelRow {
                 id: "m1".into(),
@@ -1400,22 +1422,102 @@ mod tests {
             None,
             None,
             None,
+            true,
         );
-        for turn in ["t1", "t2", "t3"] {
+        let handle = platform.spawn();
+
+        for t in ["t1", "t2", "t3"] {
             tx.send(AgentMessage::Execute {
-                turn_id: turn.to_string(),
+                turn_id: t.to_string(),
             })
             .await
             .unwrap();
         }
-        tx.send(AgentMessage::Cancel {
-            turn_id: "ignored".into(),
+        // 处理中再补发 t4（飞行缓冲路径）——与 t3 同批或下一批，均逐轮处理。
+        tx.send(AgentMessage::Execute {
+            turn_id: "t4".into(),
         })
         .await
         .unwrap();
+        drop(tx);
 
-        let batch = platform.drain_execute_batch("t0".into());
-        assert_eq!(batch, vec!["t0", "t1", "t2", "t3"]);
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("platform task 应在 rx 关闭后退出")
+            .expect("platform task 不得 panic");
+
+        // 逐轮产物：每个 turn 都有独立 ExecutionOutput。
+        for t in ["t1", "t2", "t3", "t4"] {
+            let ctx = pool.get_turn_context(t).await.expect("turn context 存在");
+            let exec = ctx.execution.as_ref().expect("每轮都有执行产物");
+            assert!(
+                exec.task_status.starts_with("raw:"),
+                "NoopProvider 空响应 → failure_output（task_status 以 raw: 开头），got {:?}",
+                exec.task_status
+            );
+        }
+        // 每个 turn 都触发了 ExecutionDone → 洞察 channel 收到 4 条（合并不得吞消息）。
+        let mut done_count = 0;
+        while let Ok(msg) = receivers.insight_rx.try_recv() {
+            if matches!(msg, AgentMessage::ExecutionDone { .. }) {
+                done_count += 1;
+            }
+        }
+        assert_eq!(done_count, 4, "逐轮触发 ExecutionDone，不得合并吞消息");
+    }
+
+    #[tokio::test]
+    async fn merged_loop_single_turn_degradation_identical() {
+        // 单条到达：批=[1 条]=单条处理，无额外延迟；行为与逐条现状一致。
+        let (pool, mut receivers) = AgentPool::new();
+        let pool = Arc::new(pool);
+        pool.create_turn_context(execution_turn_context("t1", "user", "think"))
+            .await;
+        let (tx, rx) = mpsc::channel(8);
+        let platform = ExecutionPlatform::new(
+            rx,
+            pool.clone(),
+            Arc::new(NoopProvider),
+            crate::data::ModelRow {
+                id: "m1".into(),
+                name: "test".into(),
+                provider: "p".into(),
+                api_url: "u".into(),
+                api_type: "openai".into(),
+                api_protocol: "openai-v1".into(),
+                api_key: None,
+                model_id: "model-x".into(),
+                config: None,
+            },
+            SecretString::from("x".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+        );
+        let handle = platform.spawn();
+        tx.send(AgentMessage::Execute {
+            turn_id: "t1".into(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("platform task 应退出")
+            .expect("platform task 不得 panic");
+
+        let ctx = pool.get_turn_context("t1").await.unwrap();
+        assert!(ctx.execution.is_some(), "单条退化行为与逐条现状一致");
+        let mut done_count = 0;
+        while let Ok(msg) = receivers.insight_rx.try_recv() {
+            if matches!(msg, AgentMessage::ExecutionDone { .. }) {
+                done_count += 1;
+            }
+        }
+        assert_eq!(done_count, 1);
     }
 
     fn execution_turn_context(
@@ -1465,6 +1567,7 @@ mod tests {
             None,
             None,
             None,
+            true,
         )
     }
 
@@ -1601,6 +1704,7 @@ mod tests {
             None,
             None,
             None,
+            true,
         );
 
         let section = platform.full_capability_registry_section();
@@ -1652,6 +1756,7 @@ mod tests {
             None,
             None,
             None,
+            true,
         )
         .models_section();
         assert!(!platform_section_text.contains("super-secret"));

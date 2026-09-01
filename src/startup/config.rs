@@ -47,6 +47,33 @@ pub struct Config {
     /// - 匹配规则：host 精确匹配或为其子域（`www.kaggle.com` 匹配 `kaggle.com`），端口忽略。
     #[serde(default)]
     pub web: WebSection,
+
+    /// 三中台机制式排队合并开关（v0.4.7）：`[execution] merge_enabled` /
+    /// `[insight] merge_enabled` / `[memory] merge_enabled`，缺省均 true。
+    /// - true = 批 = 连续处理组（飞行缓冲消除队列空隙，状态驱动、无定时窗口）；
+    /// - false = 完全回退逐条现状（与 v0.4.6 及以前行为一致）。
+    #[serde(default)]
+    pub execution: MergeSection,
+    #[serde(default)]
+    pub insight: MergeSection,
+    #[serde(default)]
+    pub memory: MergeSection,
+}
+
+/// 三中台合并开关段（v0.4.7）：`merge_enabled` 缺省 true。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeSection {
+    /// 机制式排队合并开关（缺省 true）。
+    #[serde(default = "default_true")]
+    pub merge_enabled: bool,
+}
+
+impl Default for MergeSection {
+    fn default() -> Self {
+        Self {
+            merge_enabled: default_true(),
+        }
+    }
 }
 
 /// `[ui]` 段：UI 显示开关（v0.4.6）。
@@ -261,6 +288,9 @@ impl Config {
             context: ContextSection::default(),
             ui: UiSection::default(),
             web: WebSection::default(),
+            execution: MergeSection::default(),
+            insight: MergeSection::default(),
+            memory: MergeSection::default(),
         }
     }
 
@@ -675,6 +705,34 @@ mod tests {
     }
 
     #[test]
+    fn merge_sections_default_to_enabled_and_parse_explicit() {
+        // v0.4.7：三中台合并开关缺省均 true；显式 false 可解析；缺省段不报错。
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.execution.merge_enabled);
+        assert!(cfg.insight.merge_enabled);
+        assert!(cfg.memory.merge_enabled);
+
+        let explicit = r#"
+            [execution]
+            merge_enabled = false
+
+            [memory]
+            merge_enabled = false
+        "#;
+        let cfg: Config = toml::from_str(explicit).unwrap();
+        assert!(!cfg.execution.merge_enabled);
+        assert!(cfg.insight.merge_enabled, "未写段缺省 true");
+        assert!(!cfg.memory.merge_enabled);
+
+        // 旧配置无新段：缺省 true，且与旧字段共存。
+        let legacy: Config =
+            toml::from_str("[web]\nallowed_domains = [\"kaggle.com\"]\n[ui]\nshow_think = false\n")
+                .unwrap();
+        assert!(legacy.memory.merge_enabled);
+        assert_eq!(legacy.web.allowed_domains, vec!["kaggle.com".to_string()]);
+    }
+
+    #[test]
     fn load_ignores_legacy_collaboration_keys_on_disk() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
@@ -729,6 +787,9 @@ mod tests {
             context: ContextSection::default(),
             ui: UiSection::default(),
             web: WebSection::default(),
+            execution: MergeSection::default(),
+            insight: MergeSection::default(),
+            memory: MergeSection::default(),
         };
         cfg.save(&p).expect("save ok");
         let loaded = Config::load(&p).expect("load ok").expect("exists");
@@ -765,6 +826,9 @@ mod tests {
             context: ContextSection::default(),
             ui: UiSection::default(),
             web: WebSection::default(),
+            execution: MergeSection::default(),
+            insight: MergeSection::default(),
+            memory: MergeSection::default(),
         };
         cfg.save(&p).expect("save ok");
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;

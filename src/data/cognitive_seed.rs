@@ -12,6 +12,13 @@ const MAX_SEED_COGNITIVE_NODES: usize = 50;
 const SEEDED_MARKER: &str = ".seeded";
 const CAPABILITY_SEED_DIR: &str = "seed/capabilities";
 
+/// capability seed 版本（v0.4.7）：今后种子变更 +1。
+///
+/// 版本判定只作用于 `base_capabilities.json`（唯一版本化的种子文件）：
+/// - 新格式：`{"seed_version": N, "capabilities": [...]}`；
+/// - 旧格式（v0.4.6 及以前）：纯数组，视为 version 1 → 触发重写。
+pub const CAPABILITY_SEED_VERSION: u32 = 2;
+
 pub const COGNITIVE_SEED_MANIFEST: &str = include_str!("../../data/seed/cognitive/manifest.json");
 pub const COGNITIVE_SEED_NODES: &str = include_str!("../../data/seed/cognitive/nodes.json");
 pub const COGNITIVE_SEED_EDGES: &str = include_str!("../../data/seed/cognitive/edges.json");
@@ -157,6 +164,28 @@ pub fn seed_cognitive_memory(data_dir: &Path, db: &mut TriviumDb) -> Result<()> 
     Ok(())
 }
 
+/// 读取已落盘 `base_capabilities.json` 的 seed_version：
+/// - 新格式对象 `{"seed_version": N, ...}` → N；
+/// - 旧格式纯数组 → 1（v0.4.6 及以前写入的版本）；
+/// - 缺失 / 不可解析 / 无 seed_version 字段 → 0（触发重写）。
+fn base_capabilities_seed_version(path: &Path) -> u32 {
+    let Ok(text) = fs::read_to_string(path) else {
+        return 0;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return 0;
+    };
+    match value {
+        serde_json::Value::Array(_) => 1,
+        serde_json::Value::Object(obj) => obj
+            .get("seed_version")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
 pub fn ensure_default_capabilities(data_dir: &Path) -> Result<()> {
     let seed_root = data_dir.join(CAPABILITY_SEED_DIR);
     ensure_private_directory(&seed_root)?;
@@ -169,9 +198,12 @@ pub fn ensure_default_capabilities(data_dir: &Path) -> Result<()> {
 
     for (name, content) in files {
         let path = seed_root.join(name);
-        let should_write = match fs::read_to_string(&path) {
-            Ok(existing) => existing.contains("wasm:"),
-            Err(_) => true,
+        // v0.4.7 覆盖判定：base_capabilities.json 版本化（缺失 / seed_version 落后 / 旧纯数组
+        // 格式 → 以内置最新重写）；composite/usage 未版本化（缺失才写入）。`wasm:` 特判已删除。
+        let should_write = if *name == "base_capabilities.json" {
+            base_capabilities_seed_version(&path) < CAPABILITY_SEED_VERSION
+        } else {
+            !path.exists()
         };
         if should_write {
             fs::write(&path, content)
@@ -187,8 +219,24 @@ pub fn import_factory_defaults(conn: &duckdb::Connection, data_dir: &Path) -> Re
 
     let base_text = fs::read_to_string(seed_root.join("base_capabilities.json"))
         .map_err(|e| AgentError::Io(format!("read base_capabilities.json: {e}")))?;
-    let base_rows: Vec<serde_json::Value> = serde_json::from_str(&base_text)
+    // v0.4.7 读侧兼容两种格式：对象（新格式，取 capabilities 字段）与纯数组（旧格式，
+    // 视为 version 1 处理）。旧文件在 ensure_default_capabilities 中已被重写为最新格式，
+    // 此处兼容保证「重写失败/手工旧文件」等异常路径仍可导入。
+    let base_value: serde_json::Value = serde_json::from_str(&base_text)
         .map_err(|e| AgentError::Parse(format!("parse base_capabilities.json: {e}")))?;
+    let base_rows: Vec<serde_json::Value> = match base_value {
+        serde_json::Value::Array(rows) => rows,
+        serde_json::Value::Object(mut obj) => obj
+            .remove("capabilities")
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default(),
+        other => {
+            return Err(AgentError::Parse(format!(
+                "parse base_capabilities.json: unexpected top-level type {}",
+                json_type_name(&other)
+            )));
+        }
+    };
     let mut capability_ids: Vec<String> = Vec::new();
     for row in &base_rows {
         let id = row["id"].as_str().unwrap_or_default();
@@ -330,65 +378,169 @@ pub fn import_factory_defaults(conn: &duckdb::Connection, data_dir: &Path) -> Re
     Ok(())
 }
 
+/// serde_json::Value 顶层类型名（错误信息用）。
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// 记忆 agent 内置定义（id, display_name, allowlist）——seed 与 upgrade_seed_deltas 共用。
+const MEMORY_AGENT_DEFS: &[(&str, &str, &[&str])] = &[
+    (
+        "attention-agent",
+        "Attention Agent",
+        &[
+            "memory.list",
+            "memory.retrieve",
+            "memory.delete",
+            "memory.attention.write",
+            "memory.attention.retire",
+        ],
+    ),
+    (
+        "experience-agent",
+        "Experience Agent",
+        &[
+            "memory.list",
+            "memory.retrieve",
+            "memory.evidence.lookup",
+            "memory.experience.write",
+        ],
+    ),
+    (
+        "preference-agent",
+        "Preference Agent",
+        &[
+            "memory.list",
+            "memory.retrieve",
+            "memory.evidence.lookup",
+            "memory.preference.write",
+        ],
+    ),
+    (
+        "cognitive-agent",
+        "Cognitive Agent",
+        &[
+            "memory.list",
+            "memory.retrieve",
+            "memory.evidence.lookup",
+            "memory.cognitive.update",
+        ],
+    ),
+];
+
 /// 记忆 agent 全部入表：Desktop 阶段用户可以直接查看/改造/创建这些 agent。
 /// 使用 ON CONFLICT DO NOTHING，已有行（含用户手工修改）不被覆盖。
 pub fn seed_memory_agents(conn: &duckdb::Connection) -> Result<()> {
-    let agents: &[(&str, &str, &[&str])] = &[
-        (
-            "attention-agent",
-            "Attention Agent",
-            &[
-                "memory.list",
-                "memory.retrieve",
-                "memory.delete",
-                "memory.attention.write",
-                "memory.attention.retire",
-            ],
-        ),
-        (
-            "experience-agent",
-            "Experience Agent",
-            &[
-                "memory.list",
-                "memory.retrieve",
-                "memory.evidence.lookup",
-                "memory.experience.write",
-            ],
-        ),
-        (
-            "preference-agent",
-            "Preference Agent",
-            &[
-                "memory.list",
-                "memory.retrieve",
-                "memory.evidence.lookup",
-                "memory.preference.write",
-            ],
-        ),
-        (
-            "cognitive-agent",
-            "Cognitive Agent",
-            &[
-                "memory.list",
-                "memory.retrieve",
-                "memory.evidence.lookup",
-                "memory.cognitive.update",
-            ],
-        ),
-    ];
-    for (id, name, caps) in agents {
-        let caps_json = serde_json::to_string(caps).map_err(|e| {
-            AgentError::Parse(format!("serialize capability_allowlist for {id}: {e}"))
-        })?;
-        conn.execute(
-            "INSERT INTO agent (id, name, mode, capability_allowlist, display_name, is_default) \
-             VALUES (?, ?, 'unni', CAST(? AS JSON), ?, false) \
-             ON CONFLICT (id) DO NOTHING",
-            duckdb::params![id, name, caps_json, name],
-        )
-        .map_err(|e| AgentError::Bootstrap(format!("seed memory agent {id}: {e}")))?;
+    for (id, name, caps) in MEMORY_AGENT_DEFS {
+        insert_memory_agent_row(conn, id, name, caps)?;
     }
     Ok(())
+}
+
+fn insert_memory_agent_row(
+    conn: &duckdb::Connection,
+    id: &str,
+    name: &str,
+    caps: &[&str],
+) -> Result<()> {
+    let caps_json = serde_json::to_string(caps)
+        .map_err(|e| AgentError::Parse(format!("serialize capability_allowlist for {id}: {e}")))?;
+    conn.execute(
+        "INSERT INTO agent (id, name, mode, capability_allowlist, display_name, is_default) \
+         VALUES (?, ?, 'unni', CAST(? AS JSON), ?, false) \
+         ON CONFLICT (id) DO NOTHING",
+        duckdb::params![id, name, caps_json, name],
+    )
+    .map_err(|e| AgentError::Bootstrap(format!("seed memory agent {id}: {e}")))?;
+    Ok(())
+}
+
+/// 四 subagent 模板内置定义（id, display_name, lifecycle_kind, startup）——
+/// seed 与 upgrade_seed_deltas 共用。
+const SUBAGENT_TEMPLATE_DEFS: &[(&str, &str, &str, &str)] = &[
+    (
+        "subagent.template.normal",
+        "Normal Subagent Template",
+        "temporary",
+        "normal",
+    ),
+    (
+        "subagent.template.resident",
+        "Resident Subagent Template",
+        "resident",
+        "normal",
+    ),
+    (
+        "subagent.template.scheduled",
+        "Scheduled Subagent Template",
+        "temporary",
+        "scheduled",
+    ),
+    (
+        "subagent.template.condition",
+        "Condition Subagent Template",
+        "resident",
+        "condition",
+    ),
+];
+
+/// 模板宽安全集（模板 = 类型封装 + 宽集；实例只做子集裁剪）。
+const TEMPLATE_WIDE_ALLOWLIST: &[&str] = &[
+    "file.read",
+    "file.list",
+    "file.write",
+    "path.exists",
+    "text.grep",
+    "shell.exec",
+];
+
+/// 按内置定义构建模板行的（prompt, allowlist_json, config_json）——seed 与
+/// upgrade_seed_deltas 共用，保证两条路径写入的定义一致。
+fn build_subagent_template_row(
+    id: &str,
+    name: &str,
+    lifecycle: &str,
+    startup: &str,
+) -> Result<(String, String, String)> {
+    let trigger = match startup {
+        "scheduled" => serde_json::json!({
+            "type": "schedule",
+            "cron": "* * * * *",
+            "description": "定时触发范例（v0.3.1 不实现调度器）"
+        }),
+        "condition" => serde_json::json!({
+            "type": "condition",
+            "description": "条件触发范例（v0.3.1 不实现调度器）"
+        }),
+        _ => serde_json::Value::Null,
+    };
+    let config = serde_json::json!({
+        "subagent": {
+            "lifecycle": lifecycle,
+            "startup": startup,
+            "trigger": trigger,
+            "memory_window_pct": 80,
+            "briefing": true,
+            "max_retries": 0,
+            "attempt_timeout_seconds": 600,
+            "total_timeout_seconds": 3600,
+        }
+    });
+    let prompt = format!(
+        "你是 subagent「{name}」，一个有最小记忆的异步工作单元。\n             ## 角色与任务边界\n             - 只处理执行中台分配的任务，不越界，不访问未授权能力，不创建/删除其他 subagent。\n             - 完成分配任务后立即以简报合同收口，不额外继续工作。\n             ## 能力调用规范\n             - 能力调用规范见系统提供的统一片段（capability_call.md 由运行时按需拼接），不要自行重写调用协议。\n             - 你只能调用 available_capabilities 中已授权的能力。\n             ## 运行方式\n             - 每轮从固定能力组选择 0/1/多个能力，多个调用按声明顺序依次执行；能力调用结果不回到本轮 LLM。\n             - 每轮只做一次模型调用。\n             ## 简报输出合同\n             - 任务完成时输出：{{\"done\": true, \"summary\": \"简明结果\"}}"
+    );
+    let allowlist_json =
+        serde_json::to_string(&TEMPLATE_WIDE_ALLOWLIST.to_vec()).map_err(|error| {
+            AgentError::Parse(format!("serialize template allowlist for {id}: {error}"))
+        })?;
+    Ok((prompt, allowlist_json, config.to_string()))
 }
 
 /// 四个 subagent 模板行（§5.1 / §14）。
@@ -401,88 +553,56 @@ pub fn seed_memory_agents(conn: &duckdb::Connection) -> Result<()> {
 /// 旧数据目录模板行（窄集）在 seed 时自动宽化为当前宽集（幂等，仅对已知四模板 id，
 /// 不改用户自建模板行）。
 pub fn seed_subagent_templates(conn: &duckdb::Connection) -> Result<()> {
-    // (id, display_name, lifecycle_kind, startup, allowlist)
-    // 宽安全集：模板 = 类型封装（生命周期/触发/默认基线）+ 宽集；实例只做子集裁剪。
-    let wide_allowlist: &[&str] = &[
-        "file.read",
-        "file.list",
-        "file.write",
-        "path.exists",
-        "text.grep",
-        "shell.exec",
-    ];
-    let templates: &[(&str, &str, &str, &str)] = &[
-        (
-            "subagent.template.normal",
-            "Normal Subagent Template",
-            "temporary",
-            "normal",
-        ),
-        (
-            "subagent.template.resident",
-            "Resident Subagent Template",
-            "resident",
-            "normal",
-        ),
-        (
-            "subagent.template.scheduled",
-            "Scheduled Subagent Template",
-            "temporary",
-            "scheduled",
-        ),
-        (
-            "subagent.template.condition",
-            "Condition Subagent Template",
-            "resident",
-            "condition",
-        ),
-    ];
-    for (id, name, lifecycle, startup) in templates {
-        let trigger = match *startup {
-            "scheduled" => serde_json::json!({
-                "type": "schedule",
-                "cron": "* * * * *",
-                "description": "定时触发范例（v0.3.1 不实现调度器）"
-            }),
-            "condition" => serde_json::json!({
-                "type": "condition",
-                "description": "条件触发范例（v0.3.1 不实现调度器）"
-            }),
-            _ => serde_json::Value::Null,
-        };
-        let config = serde_json::json!({
-            "subagent": {
-                "lifecycle": lifecycle,
-                "startup": startup,
-                "trigger": trigger,
-                "memory_window_pct": 80,
-                "briefing": true,
-                "max_retries": 0,
-                "attempt_timeout_seconds": 600,
-                "total_timeout_seconds": 3600,
-            }
-        });
-        let prompt = format!(
-            "你是 subagent「{name}」，一个有最小记忆的异步工作单元。\n             ## 角色与任务边界\n             - 只处理执行中台分配的任务，不越界，不访问未授权能力，不创建/删除其他 subagent。\n             - 完成分配任务后立即以简报合同收口，不额外继续工作。\n             ## 能力调用规范\n             - 能力调用规范见系统提供的统一片段（capability_call.md 由运行时按需拼接），不要自行重写调用协议。\n             - 你只能调用 available_capabilities 中已授权的能力。\n             ## 运行方式\n             - 每轮从固定能力组选择 0/1/多个能力，多个调用按声明顺序依次执行；能力调用结果不回到本轮 LLM。\n             - 每轮只做一次模型调用。\n             ## 简报输出合同\n             - 任务完成时输出：{{\"done\": true, \"summary\": \"简明结果\"}}"
-        );
-        let allowlist_json = serde_json::to_string(&wide_allowlist.to_vec()).map_err(|error| {
-            AgentError::Parse(format!("serialize template allowlist for {id}: {error}"))
-        })?;
+    for (id, name, lifecycle, startup) in SUBAGENT_TEMPLATE_DEFS {
+        let (prompt, allowlist_json, config_json) =
+            build_subagent_template_row(id, name, lifecycle, startup)?;
         conn.execute(
             "INSERT INTO agent (id, name, mode, prompt, capability_allowlist, config, display_name, is_default) \
              VALUES (?, ?, 'subagent_template', ?, CAST(? AS JSON), CAST(? AS JSON), ?, false) \
              ON CONFLICT (id) DO UPDATE SET capability_allowlist = excluded.capability_allowlist",
-            duckdb::params![
-                id,
-                name,
-                prompt,
-                allowlist_json,
-                config.to_string(),
-                name,
-            ],
+            duckdb::params![id, name, prompt, allowlist_json, config_json, name],
         )
         .map_err(|error| AgentError::Bootstrap(format!("seed subagent template {id}: {error}")))?;
     }
+    Ok(())
+}
+
+/// 平台 agent 内置定义（insight-platform / capability-memory-agent）——seed 与
+/// upgrade_seed_deltas 共用。execution-platform 单独处理（追加合并语义见
+/// seed_execution_platform；upgrade_seed_deltas 仅缺 id 插入，见 insert_execution_platform_row）。
+const PLATFORM_AGENT_DEFS: &[(&str, &str, &[&str], Option<&str>)] = &[
+    (
+        "insight-platform",
+        "Insight Platform",
+        &["usage_method.observe"],
+        None,
+    ),
+    (
+        "capability-memory-agent",
+        "Capability Memory Agent",
+        &["usage_method.observe"],
+        Some(r#"{"max_turns":2}"#),
+    ),
+];
+
+fn insert_platform_agent_row(
+    conn: &duckdb::Connection,
+    id: &str,
+    name: &str,
+    caps: &[&str],
+    config: Option<&str>,
+) -> Result<()> {
+    let caps_json = serde_json::to_string(caps).map_err(|error| {
+        AgentError::Parse(format!("serialize capability_allowlist for {id}: {error}"))
+    })?;
+    let config_json = config.unwrap_or("null").to_string();
+    conn.execute(
+        "INSERT INTO agent (id, name, mode, capability_allowlist, config, display_name, is_default) \
+         VALUES (?, ?, 'platform', CAST(? AS JSON), CAST(? AS JSON), ?, false) \
+         ON CONFLICT (id) DO NOTHING",
+        duckdb::params![id, name, caps_json, config_json, name],
+    )
+    .map_err(|error| AgentError::Bootstrap(format!("seed platform agent {id}: {error}")))?;
     Ok(())
 }
 
@@ -494,38 +614,24 @@ pub fn seed_subagent_templates(conn: &duckdb::Connection) -> Result<()> {
 /// execution-platform 单独处理（v0.4.4 追加 permission.grant/revoke，见
 /// `seed_execution_platform`）：旧数据目录平台行必须升级拿到两能力。
 pub fn seed_platform_agents(conn: &duckdb::Connection) -> Result<()> {
-    let agents: &[(&str, &str, &[&str], Option<&str>)] = &[
-        (
-            "insight-platform",
-            "Insight Platform",
-            &["usage_method.observe"],
-            None,
-        ),
-        (
-            "capability-memory-agent",
-            "Capability Memory Agent",
-            &["usage_method.observe"],
-            Some(r#"{"max_turns":2}"#),
-        ),
-    ];
-    for (id, name, caps, config) in agents {
-        let caps_json = serde_json::to_string(caps).map_err(|error| {
-            AgentError::Parse(format!("serialize capability_allowlist for {id}: {error}"))
-        })?;
-        let config_json = config
-            .map(str::to_string)
-            .unwrap_or_else(|| "null".to_string());
-        conn.execute(
-            "INSERT INTO agent (id, name, mode, capability_allowlist, config, display_name, is_default) \
-             VALUES (?, ?, 'platform', CAST(? AS JSON), CAST(? AS JSON), ?, false) \
-             ON CONFLICT (id) DO NOTHING",
-            duckdb::params![id, name, caps_json, config_json, name],
-        )
-        .map_err(|error| AgentError::Bootstrap(format!("seed platform agent {id}: {error}")))?;
+    for (id, name, caps, config) in PLATFORM_AGENT_DEFS {
+        insert_platform_agent_row(conn, id, name, caps, *config)?;
     }
 
     seed_execution_platform(conn)
 }
+
+/// execution-platform 内置能力集（v0.4.4 起：六个 subagent.* + permission.grant/revoke）。
+const EXECUTION_PLATFORM_CAPS: &[&str] = &[
+    "subagent.create",
+    "subagent.run",
+    "subagent.update",
+    "subagent.sleep",
+    "subagent.wake",
+    "subagent.delete",
+    "permission.grant",
+    "permission.revoke",
+];
 
 /// execution-platform 平台行（v0.4.4）：六个 subagent.* + permission.grant/revoke。
 ///
@@ -533,16 +639,6 @@ pub fn seed_platform_agents(conn: &duckdb::Connection) -> Result<()> {
 /// capability_allowlist，保留用户对 name/config 的手工改动；追加语义保证旧数据目录
 /// 升级后拿到两能力，同时不覆盖用户已授权的其他叠加能力）。
 fn seed_execution_platform(conn: &duckdb::Connection) -> Result<()> {
-    const BASE_CAPS: &[&str] = &[
-        "subagent.create",
-        "subagent.run",
-        "subagent.update",
-        "subagent.sleep",
-        "subagent.wake",
-        "subagent.delete",
-    ];
-    const GRANT_CAPS: &[&str] = &["permission.grant", "permission.revoke"];
-
     let existing: Option<String> = conn
         .query_row(
             "SELECT CAST(capability_allowlist AS VARCHAR) FROM agent \
@@ -562,7 +658,7 @@ fn seed_execution_platform(conn: &duckdb::Connection) -> Result<()> {
         })?,
         None => Vec::new(),
     };
-    for capability_id in BASE_CAPS.iter().chain(GRANT_CAPS) {
+    for capability_id in EXECUTION_PLATFORM_CAPS {
         if !allowlist.iter().any(|value| value == capability_id) {
             allowlist.push((*capability_id).to_string());
         }
@@ -580,6 +676,94 @@ fn seed_execution_platform(conn: &duckdb::Connection) -> Result<()> {
         duckdb::params![caps_json],
     )
     .map_err(|error| AgentError::Bootstrap(format!("seed execution-platform: {error}")))?;
+    Ok(())
+}
+
+/// 注册表缺 id 判定（upgrade_seed_deltas 使用）。
+fn agent_row_exists(conn: &duckdb::Connection, id: &str) -> Result<bool> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent WHERE id = ?",
+            duckdb::params![id],
+            |row| row.get(0),
+        )
+        .map_err(|e| AgentError::Bootstrap(format!("check agent row {id}: {e}")))?;
+    Ok(count > 0)
+}
+
+/// 缺 id 时插入 execution-platform 内置行（仅 upgrade_seed_deltas 使用；已存在 → 不动，
+/// 不叠加用户改动）。seed_execution_platform 负责「已存在行的追加升级」。
+fn insert_execution_platform_row(conn: &duckdb::Connection) -> Result<()> {
+    let caps_json = serde_json::to_string(&EXECUTION_PLATFORM_CAPS.to_vec()).map_err(|error| {
+        AgentError::Parse(format!(
+            "serialize execution-platform capability_allowlist: {error}"
+        ))
+    })?;
+    conn.execute(
+        "INSERT INTO agent (id, name, mode, capability_allowlist, display_name, is_default) \
+         VALUES ('execution-platform', 'Execution Platform', 'platform', CAST(? AS JSON), \
+                 'Execution Platform', false) \
+         ON CONFLICT (id) DO NOTHING",
+        duckdb::params![caps_json],
+    )
+    .map_err(|error| AgentError::Bootstrap(format!("insert execution-platform: {error}")))?;
+    Ok(())
+}
+
+/// 缺 id 时插入 subagent 模板内置行（仅 upgrade_seed_deltas 使用；已存在 → 不动，
+/// 含用户对 allowlist/config/prompt 的修改全部保留）。seed_subagent_templates 负责
+/// 「已存在行的宽集升级」。
+fn insert_subagent_template_row(
+    conn: &duckdb::Connection,
+    id: &str,
+    name: &str,
+    lifecycle: &str,
+    startup: &str,
+) -> Result<()> {
+    let (prompt, allowlist_json, config_json) =
+        build_subagent_template_row(id, name, lifecycle, startup)?;
+    conn.execute(
+        "INSERT INTO agent (id, name, mode, prompt, capability_allowlist, config, display_name, is_default) \
+         VALUES (?, ?, 'subagent_template', ?, CAST(? AS JSON), CAST(? AS JSON), ?, false) \
+         ON CONFLICT (id) DO NOTHING",
+        duckdb::params![id, name, prompt, allowlist_json, config_json, name],
+    )
+    .map_err(|error| AgentError::Bootstrap(format!("insert subagent template {id}: {error}")))?;
+    Ok(())
+}
+
+/// agent/模板缺失补插（v0.4.7，TA-C）：在 import_factory_defaults 之后调用。
+///
+/// 遍历内置清单——平台 agents（execution-platform/insight-platform/capability-memory-agent）、
+/// 四记忆 agent、四 subagent 模板——注册表缺 id → 按内置定义插入行（含 config/allowlist）；
+/// 已存在 → 不动（含用户手工修改，与 seed_* 的升级语义分离）；内置已删除的 id → 不动。
+/// 幂等（重复启动无副作用）。
+pub fn upgrade_seed_deltas(conn: &duckdb::Connection, _data_dir: &Path) -> Result<()> {
+    // 1) 平台 agents。
+    for (id, name, caps, config) in PLATFORM_AGENT_DEFS {
+        if !agent_row_exists(conn, id)? {
+            insert_platform_agent_row(conn, id, name, caps, *config)?;
+            tracing::info!("upgrade_seed_deltas: inserted missing platform agent {id}");
+        }
+    }
+    if !agent_row_exists(conn, "execution-platform")? {
+        insert_execution_platform_row(conn)?;
+        tracing::info!("upgrade_seed_deltas: inserted missing platform agent execution-platform");
+    }
+    // 2) 四记忆 agent。
+    for (id, name, caps) in MEMORY_AGENT_DEFS {
+        if !agent_row_exists(conn, id)? {
+            insert_memory_agent_row(conn, id, name, caps)?;
+            tracing::info!("upgrade_seed_deltas: inserted missing memory agent {id}");
+        }
+    }
+    // 3) 四 subagent 模板。
+    for (id, name, lifecycle, startup) in SUBAGENT_TEMPLATE_DEFS {
+        if !agent_row_exists(conn, id)? {
+            insert_subagent_template_row(conn, id, name, lifecycle, startup)?;
+            tracing::info!("upgrade_seed_deltas: inserted missing subagent template {id}");
+        }
+    }
     Ok(())
 }
 
@@ -1078,5 +1262,258 @@ mod tests {
             .filter_map(|value| value.as_str())
             .collect();
         assert_eq!(insight_ids, vec!["usage_method.observe"]);
+    }
+
+    /// 新目录（v0.4.7）：ensure_default_capabilities 写入含 seed_version 的新格式对象，
+    /// 导入后注册表含 web.fetch.public（v0.4.6 缺口在旧目录的唯一修复路径）。
+    #[test]
+    fn new_dir_writes_versioned_format_and_registers_web_fetch_public() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        crate::data::duckdb::schema::create_all_tables(&conn).unwrap();
+        let dir = tempdir().unwrap();
+        ensure_default_capabilities(dir.path()).unwrap();
+
+        let base_path = dir.path().join("seed/capabilities/base_capabilities.json");
+        let text = std::fs::read_to_string(&base_path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            value["seed_version"].as_u64(),
+            Some(CAPABILITY_SEED_VERSION as u64),
+            "新目录应写入版本化对象格式"
+        );
+        let caps = value["capabilities"].as_array().expect("capabilities 数组");
+        assert!(caps.iter().any(|c| c["id"] == "web.fetch.public"));
+        assert!(base_capabilities_seed_version(&base_path) >= CAPABILITY_SEED_VERSION);
+
+        import_factory_defaults(&conn, dir.path()).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM base_capability WHERE id = 'web.fetch.public'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "web.fetch.public 应进入注册表");
+    }
+
+    /// 旧目录升级：base_capabilities.json 为旧纯数组格式（version 1，且缺 web.fetch.public）
+    /// → 启动重写为最新版本化格式 → 导入补齐新能力（v0.4.6 缺口修复验证）。
+    #[test]
+    fn legacy_flat_array_dir_rewritten_and_capabilities_registered() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        crate::data::duckdb::schema::create_all_tables(&conn).unwrap();
+        let dir = tempdir().unwrap();
+        let seed_root = dir.path().join("seed/capabilities");
+        std::fs::create_dir_all(&seed_root).unwrap();
+
+        // 模拟 v0.4.6 旧文件：纯数组、无 web.fetch.public。
+        let builtin: serde_json::Value = serde_json::from_str(CAPABILITY_SEED_BASE).unwrap();
+        let legacy_caps: Vec<serde_json::Value> = builtin["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["id"] != "web.fetch.public")
+            .cloned()
+            .collect();
+        std::fs::write(
+            seed_root.join("base_capabilities.json"),
+            serde_json::to_string(&legacy_caps).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            base_capabilities_seed_version(&seed_root.join("base_capabilities.json")),
+            1,
+            "纯数组应判定为 version 1"
+        );
+
+        // 启动链：ensure → 重写；composite/usage 缺失 → 补写。
+        ensure_default_capabilities(dir.path()).unwrap();
+
+        let rewritten = std::fs::read_to_string(seed_root.join("base_capabilities.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
+        assert_eq!(
+            value["seed_version"].as_u64(),
+            Some(CAPABILITY_SEED_VERSION as u64),
+            "旧纯数组文件应被重写为最新版本化格式"
+        );
+        assert!(
+            rewritten.contains("web.fetch.public"),
+            "重写后含 web.fetch.public"
+        );
+
+        import_factory_defaults(&conn, dir.path()).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM base_capability WHERE id = 'web.fetch.public'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "旧目录升级后注册表补齐 web.fetch.public");
+    }
+
+    /// 最新目录（version 2 文件）：不重写——文件保持原样（用户/历史内容不被覆盖）。
+    #[test]
+    fn version2_dir_not_rewritten() {
+        let dir = tempdir().unwrap();
+        ensure_default_capabilities(dir.path()).unwrap();
+        let base_path = dir.path().join("seed/capabilities/base_capabilities.json");
+
+        // 篡改为另一个 version 2 内容（不含 web.fetch.public）——模拟已升级目录的本地状态。
+        let custom = serde_json::json!({
+            "seed_version": 2,
+            "capabilities": [
+                {"id": "file.read", "name": "Read File", "type": "function",
+                 "description": "custom", "schema_in": {}, "schema_out": {},
+                 "executor": "builtin:file.read", "version": "1.0.0",
+                 "enabled": true, "partition": "system"}
+            ]
+        });
+        std::fs::write(&base_path, serde_json::to_string(&custom).unwrap()).unwrap();
+
+        ensure_default_capabilities(dir.path()).unwrap();
+
+        let text = std::fs::read_to_string(&base_path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            value["seed_version"].as_u64(),
+            Some(CAPABILITY_SEED_VERSION as u64),
+            "version 2 文件保持原版本号"
+        );
+        assert!(
+            !text.contains("web.fetch.public"),
+            "version 2 文件不得被重写"
+        );
+    }
+
+    /// import_factory_defaults 读侧兼容：旧纯数组格式（version 1 文件）也能完整导入。
+    #[test]
+    fn import_factory_defaults_reads_legacy_array_format() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        crate::data::duckdb::schema::create_all_tables(&conn).unwrap();
+        let dir = tempdir().unwrap();
+        let seed_root = dir.path().join("seed/capabilities");
+        std::fs::create_dir_all(&seed_root).unwrap();
+        // 旧格式纯数组（直接写内置数组内容）。
+        let builtin: serde_json::Value = serde_json::from_str(CAPABILITY_SEED_BASE).unwrap();
+        std::fs::write(
+            seed_root.join("base_capabilities.json"),
+            serde_json::to_string(builtin["capabilities"].as_array().unwrap()).unwrap(),
+        )
+        .unwrap();
+        // composite/usage 用内置内容（不重跑 ensure，保持旧文件形态）。
+        std::fs::write(
+            seed_root.join("composite_capabilities.json"),
+            CAPABILITY_SEED_COMPOSITE,
+        )
+        .unwrap();
+        std::fs::write(seed_root.join("usage_methods.json"), CAPABILITY_SEED_USAGE).unwrap();
+
+        import_factory_defaults(&conn, dir.path()).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM base_capability WHERE id = 'web.fetch.public'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "旧数组格式读侧应兼容导入（含 web.fetch.public）");
+        let agent_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agent", [], |row| row.get(0))
+            .unwrap();
+        assert!(agent_count >= 4, "记忆 agent 正常导入: {agent_count}");
+    }
+
+    /// upgrade_seed_deltas：缺 id 插入（平台/记忆/模板三类）、已有不覆盖（含用户改的
+    /// allowlist 保持）、内置已删除的 id 不动、幂等。
+    #[test]
+    fn upgrade_seed_deltas_inserts_missing_keeps_existing_and_idempotent() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        crate::data::duckdb::schema::create_all_tables(&conn).unwrap();
+        let dir = tempdir().unwrap();
+        ensure_default_capabilities(dir.path()).unwrap();
+        import_factory_defaults(&conn, dir.path()).unwrap();
+
+        // 用户改 insight-platform 的 allowlist（自定义叠加，不覆盖）。
+        conn.execute(
+            "UPDATE agent SET capability_allowlist = CAST(? AS JSON) WHERE id = 'insight-platform'",
+            duckdb::params![r#"["usage_method.observe","shell.exec"]"#],
+        )
+        .unwrap();
+        // 模拟缺失：删三类各一行 + 一记忆 agent 行。
+        conn.execute(
+            "DELETE FROM agent WHERE id IN \
+             ('execution-platform', 'attention-agent', 'subagent.template.scheduled')",
+            [],
+        )
+        .unwrap();
+
+        upgrade_seed_deltas(&conn, dir.path()).unwrap();
+
+        // 缺失行被补回。
+        for id in [
+            "execution-platform",
+            "attention-agent",
+            "subagent.template.scheduled",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM agent WHERE id = ?",
+                    duckdb::params![id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{id} 应被补插");
+        }
+        // 补插行含内置 allowlist（execution-platform 8 能力）。
+        let exec_text: Option<String> = conn
+            .query_row(
+                "SELECT CAST(capability_allowlist AS VARCHAR) FROM agent WHERE id = 'execution-platform'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let exec_value: serde_json::Value = serde_json::from_str(&exec_text.unwrap()).unwrap();
+        let exec_ids: Vec<&str> = exec_value
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for expected in [
+            "subagent.create",
+            "subagent.run",
+            "permission.grant",
+            "permission.revoke",
+        ] {
+            assert!(
+                exec_ids.contains(&expected),
+                "execution-platform 缺 {expected}"
+            );
+        }
+        // 用户改的 allowlist 保持。
+        let insight_text: Option<String> = conn
+            .query_row(
+                "SELECT CAST(capability_allowlist AS VARCHAR) FROM agent WHERE id = 'insight-platform'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            insight_text.unwrap(),
+            r#"["usage_method.observe","shell.exec"]"#,
+            "已存在行（含用户修改）不得被覆盖"
+        );
+
+        // 幂等：再跑一遍，行数与 allowlist 均不变。
+        let total_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agent", [], |row| row.get(0))
+            .unwrap();
+        upgrade_seed_deltas(&conn, dir.path()).unwrap();
+        let total_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agent", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total_before, total_after, "重复启动无副作用");
     }
 }

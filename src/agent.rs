@@ -1,4 +1,5 @@
 pub mod agent_pool;
+pub mod batch_queue;
 pub mod capability_protocol;
 pub mod communication;
 pub mod context_assembler;

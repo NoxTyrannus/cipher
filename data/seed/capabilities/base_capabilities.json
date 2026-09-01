@@ -1,1572 +1,1831 @@
-[
-  {
-    "id": "file.read",
-    "name": "Read File",
-    "type": "function",
-    "description": "读取文件内容",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "path": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "path"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "content": {
-          "type": "string"
-        },
-        "size": {
-          "type": "integer"
-        }
-      },
-      "required": [
-        "content",
-        "size"
-      ]
-    },
-    "executor": "builtin:file.read",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "file.write",
-    "name": "Write File",
-    "type": "function",
-    "description": "写入文件内容",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "path": {
-          "type": "string"
-        },
-        "content": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "path",
-        "content"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "success": {
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "success"
-      ]
-    },
-    "executor": "builtin:file.write",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "file.list",
-    "name": "List Directory",
-    "type": "function",
-    "description": "列出目录内容",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "path": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "path"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "entries": {
-          "type": "array",
-          "items": {
+{
+  "seed_version": 2,
+  "capabilities": [
+    {
+      "id": "file.read",
+      "name": "Read File",
+      "type": "function",
+      "description": "读取文件内容",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "path": {
             "type": "string"
           }
         },
-        "success": {
-          "type": "boolean"
+        "required": [
+          "path"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "size": {
+            "type": "integer"
+          }
         },
-        "count": {
-          "type": "integer"
-        }
+        "required": [
+          "content",
+          "size"
+        ]
       },
-      "required": [
-        "success",
-        "entries",
-        "count"
-      ]
+      "executor": "builtin:file.read",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
     },
-    "executor": "builtin:file.list",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "file.delete",
-    "name": "Delete File",
-    "type": "function",
-    "description": "删除文件",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "path": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "path"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "success": {
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "success"
-      ]
-    },
-    "executor": "builtin:file.delete",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "file.move",
-    "name": "Move File",
-    "type": "function",
-    "description": "移动或重命名文件",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "from": {
-          "type": "string"
+    {
+      "id": "file.write",
+      "name": "Write File",
+      "type": "function",
+      "description": "写入文件内容",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          }
         },
-        "to": {
-          "type": "string"
-        }
+        "required": [
+          "path",
+          "content"
+        ]
       },
-      "required": [
-        "from",
-        "to"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "success": {
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "success"
-      ]
-    },
-    "executor": "builtin:file.move",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "text.grep",
-    "name": "Grep Text",
-    "type": "function",
-    "description": "在文件中搜索文本模式；path 为目录且 recursive=true 时递归搜索目录内文件",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "pattern": {
-          "type": "string"
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean"
+          }
         },
-        "path": {
-          "type": "string"
-        },
-        "recursive": {
-          "type": "boolean",
-          "description": "path 为目录时必须为 true，递归搜索目录内所有文件"
-        }
+        "required": [
+          "success"
+        ]
       },
-      "required": [
-        "pattern",
-        "path"
-      ]
+      "executor": "builtin:file.write",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
     },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "matches": {
-          "type": "array",
+    {
+      "id": "file.list",
+      "name": "List Directory",
+      "type": "function",
+      "description": "列出目录内容",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "count": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "success",
+          "entries",
+          "count"
+        ]
+      },
+      "executor": "builtin:file.list",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "file.delete",
+      "name": "Delete File",
+      "type": "function",
+      "description": "删除文件",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success"
+        ]
+      },
+      "executor": "builtin:file.delete",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "file.move",
+      "name": "Move File",
+      "type": "function",
+      "description": "移动或重命名文件",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "from": {
+            "type": "string"
+          },
+          "to": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "from",
+          "to"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success"
+        ]
+      },
+      "executor": "builtin:file.move",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "text.grep",
+      "name": "Grep Text",
+      "type": "function",
+      "description": "在文件中搜索文本模式；path 为目录且 recursive=true 时递归搜索目录内文件",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "recursive": {
+            "type": "boolean",
+            "description": "path 为目录时必须为 true，递归搜索目录内所有文件"
+          }
+        },
+        "required": [
+          "pattern",
+          "path"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "matches": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "matches"
+        ]
+      },
+      "executor": "builtin:text.grep",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "shell.exec",
+      "name": "Execute Shell",
+      "type": "function",
+      "description": "在工作区执行 shell 命令",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "stdout": {
+            "type": "string"
+          },
+          "stderr": {
+            "type": "string"
+          },
+          "exit_code": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "stdout",
+          "stderr",
+          "exit_code"
+        ]
+      },
+      "executor": "builtin:shell.exec",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "db.insert",
+      "name": "Database Insert",
+      "type": "function",
+      "description": "向注册表插入数据",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "table": {
+            "type": "string"
+          },
+          "data": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "table",
+          "data"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "rows_affected": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rows_affected"
+        ]
+      },
+      "executor": "builtin:db.insert",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "db.update",
+      "name": "Database Update",
+      "type": "function",
+      "description": "更新注册表数据",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "table": {
+            "type": "string"
+          },
+          "data": {
+            "type": "object"
+          },
+          "where": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "table",
+          "data"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "rows_affected": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rows_affected"
+        ]
+      },
+      "executor": "builtin:db.update",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "db.delete",
+      "name": "Database Delete",
+      "type": "function",
+      "description": "删除注册表数据",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "table": {
+            "type": "string"
+          },
+          "where": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "table",
+          "where"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "rows_affected": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rows_affected"
+        ]
+      },
+      "executor": "builtin:db.delete",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "db.query",
+      "name": "Database Query",
+      "type": "function",
+      "description": "查询注册表数据",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "table": {
+            "type": "string"
+          },
+          "where": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "table"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "rows": {
+            "type": "array"
+          }
+        },
+        "required": [
+          "rows"
+        ]
+      },
+      "executor": "builtin:db.query",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "file.chunk_read",
+      "name": "Chunk Read File",
+      "type": "function",
+      "description": "分块读取大文件，支持 offset/size",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "offset": {
+            "type": "integer"
+          },
+          "size": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "bytes_read": {
+            "type": "integer"
+          },
+          "is_eof": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "content",
+          "bytes_read",
+          "is_eof"
+        ]
+      },
+      "executor": "builtin:file.chunk_read",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "code.exec",
+      "name": "Execute Code",
+      "type": "function",
+      "description": "在沙箱内执行代码片段",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "language": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "stdout": {
+            "type": "string"
+          },
+          "stderr": {
+            "type": "string"
+          },
+          "exit_code": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "stdout",
+          "stderr",
+          "exit_code"
+        ]
+      },
+      "executor": "builtin:code.exec",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "memory.list",
+      "name": "List Memory",
+      "type": "function",
+      "description": "按记忆类型列出记忆条目，最新优先",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "memory_type": {
+            "type": "string",
+            "enum": [
+              "attention",
+              "experience",
+              "preference",
+              "cognitive"
+            ]
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000
+          }
+        },
+        "required": [
+          "memory_type"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
           "items": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "count": {
+            "type": "integer"
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "items",
+          "count"
+        ]
+      },
+      "executor": "builtin:memory.list",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "memory.retrieve",
+      "name": "Retrieve Memory",
+      "type": "function",
+      "description": "按记忆类型和关键词检索记忆条目",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "memory_type": {
+            "type": "string",
+            "enum": [
+              "attention",
+              "experience",
+              "preference",
+              "cognitive"
+            ]
+          },
+          "query": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000
+          }
+        },
+        "required": [
+          "memory_type"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "count": {
+            "type": "integer"
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "items",
+          "count"
+        ]
+      },
+      "executor": "builtin:memory.retrieve",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "memory.delete",
+      "name": "Delete Memory",
+      "type": "function",
+      "description": "按类型和 id/focus 删除记忆条目",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "memory_type": {
+            "type": "string",
+            "enum": [
+              "attention",
+              "experience",
+              "preference",
+              "cognitive"
+            ]
+          },
+          "id": {
+            "type": "integer"
+          },
+          "focus": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "memory_type"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "removed": {
+            "type": "integer"
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "removed"
+        ]
+      },
+      "executor": "builtin:memory.delete",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "memory.attention.write",
+      "name": "Write Attention Memory",
+      "type": "function",
+      "description": "写入注意力记忆，可携带原始 thought_id 索引",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "entries": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 100,
+            "items": {
+              "type": "object",
+              "properties": {
+                "focus": {
+                  "type": "string"
+                },
+                "content": {
+                  "type": "string"
+                },
+                "source_refs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": [
+                "focus",
+                "content"
+              ]
+            }
+          }
+        },
+        "required": [
+          "entries"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "written": {
+            "type": "integer"
+          },
+          "ids": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "written",
+          "ids"
+        ]
+      },
+      "executor": "builtin:memory.attention.write",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "memory.attention.retire",
+      "name": "Retire Attention Memory",
+      "type": "function",
+      "description": "按 focus 淘汰注意力记忆",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "focus": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "focus"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "removed": {
+            "type": "integer"
+          },
+          "retired": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "removed",
+          "retired"
+        ]
+      },
+      "executor": "builtin:memory.attention.retire",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "memory.experience.write",
+      "name": "Write Experience Memory",
+      "type": "function",
+      "description": "写入经验记忆，可携带来源索引",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "entries": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 100,
+            "items": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "string"
+                },
+                "summary": {
+                  "type": "string"
+                },
+                "source_refs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": [
+                "title",
+                "summary"
+              ]
+            }
+          }
+        },
+        "required": [
+          "entries"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "written": {
+            "type": "integer"
+          },
+          "ids": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "written",
+          "ids"
+        ]
+      },
+      "executor": "builtin:memory.experience.write",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "memory.preference.write",
+      "name": "Write Preference Memory",
+      "type": "function",
+      "description": "写入偏好记忆，可携带来源索引",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "entries": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 100,
+            "items": {
+              "type": "object",
+              "properties": {
+                "key": {
+                  "type": "string"
+                },
+                "value": {
+                  "type": "string"
+                },
+                "source_refs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": [
+                "key",
+                "value"
+              ]
+            }
+          }
+        },
+        "required": [
+          "entries"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "written": {
+            "type": "integer"
+          },
+          "ids": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "written",
+          "ids"
+        ]
+      },
+      "executor": "builtin:memory.preference.write",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "memory.cognitive.update",
+      "name": "Update Cognitive Graph",
+      "type": "function",
+      "description": "原子更新认知图节点和边",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "nodes": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "object",
+              "properties": {
+                "action": {
+                  "type": "string",
+                  "enum": [
+                    "upsert",
+                    "delete"
+                  ]
+                },
+                "node_id": {
+                  "type": "string"
+                },
+                "insight": {
+                  "type": "string"
+                },
+                "context": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "edges": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "object",
+              "properties": {
+                "action": {
+                  "type": "string",
+                  "enum": [
+                    "upsert",
+                    "delete"
+                  ]
+                },
+                "from": {
+                  "type": "string"
+                },
+                "to": {
+                  "type": "string"
+                },
+                "relation": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "from",
+                "to",
+                "relation"
+              ]
+            }
+          }
+        },
+        "required": []
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "node_changes": {
+            "type": "integer"
+          },
+          "edge_changes": {
+            "type": "integer"
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "success",
+          "node_changes",
+          "edge_changes"
+        ]
+      },
+      "executor": "builtin:memory.cognitive.update",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "memory.evidence.lookup",
+      "name": "Lookup Memory Evidence",
+      "type": "function",
+      "description": "按 thought_id 索引查找原始对话证据",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "source_refs": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string"
+            }
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000
+          }
+        },
+        "required": [
+          "source_refs"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "count": {
+            "type": "integer"
+          },
+          "success": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "items",
+          "count"
+        ]
+      },
+      "executor": "builtin:memory.evidence.lookup",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "capability.import",
+      "name": "Import Capability",
+      "type": "function",
+      "description": "原子化导入用户定义的能力定义（base/composite/usage），用于把 skill/插件描述转化为 cipher 自身能力。executor 仅允许已知 builtin。",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "base_capabilities": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "composite_capabilities": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "usage_methods": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "grant_to_agent": {
             "type": "string"
           }
         }
       },
-      "required": [
-        "matches"
-      ]
-    },
-    "executor": "builtin:text.grep",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "shell.exec",
-    "name": "Execute Shell",
-    "type": "function",
-    "description": "在工作区执行 shell 命令",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "command": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "command"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "stdout": {
-          "type": "string"
-        },
-        "stderr": {
-          "type": "string"
-        },
-        "exit_code": {
-          "type": "integer"
-        }
-      },
-      "required": [
-        "stdout",
-        "stderr",
-        "exit_code"
-      ]
-    },
-    "executor": "builtin:shell.exec",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "db.insert",
-    "name": "Database Insert",
-    "type": "function",
-    "description": "向注册表插入数据",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "table": {
-          "type": "string"
-        },
-        "data": {
-          "type": "object"
-        }
-      },
-      "required": [
-        "table",
-        "data"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "rows_affected": {
-          "type": "integer"
-        }
-      },
-      "required": [
-        "rows_affected"
-      ]
-    },
-    "executor": "builtin:db.insert",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "db.update",
-    "name": "Database Update",
-    "type": "function",
-    "description": "更新注册表数据",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "table": {
-          "type": "string"
-        },
-        "data": {
-          "type": "object"
-        },
-        "where": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "table",
-        "data"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "rows_affected": {
-          "type": "integer"
-        }
-      },
-      "required": [
-        "rows_affected"
-      ]
-    },
-    "executor": "builtin:db.update",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "db.delete",
-    "name": "Database Delete",
-    "type": "function",
-    "description": "删除注册表数据",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "table": {
-          "type": "string"
-        },
-        "where": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "table",
-        "where"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "rows_affected": {
-          "type": "integer"
-        }
-      },
-      "required": [
-        "rows_affected"
-      ]
-    },
-    "executor": "builtin:db.delete",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "db.query",
-    "name": "Database Query",
-    "type": "function",
-    "description": "查询注册表数据",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "table": {
-          "type": "string"
-        },
-        "where": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "table"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "rows": {
-          "type": "array"
-        }
-      },
-      "required": [
-        "rows"
-      ]
-    },
-    "executor": "builtin:db.query",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "file.chunk_read",
-    "name": "Chunk Read File",
-    "type": "function",
-    "description": "分块读取大文件，支持 offset/size",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "path": {
-          "type": "string"
-        },
-        "offset": {
-          "type": "integer"
-        },
-        "size": {
-          "type": "integer"
-        }
-      },
-      "required": [
-        "path"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "content": {
-          "type": "string"
-        },
-        "bytes_read": {
-          "type": "integer"
-        },
-        "is_eof": {
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "content",
-        "bytes_read",
-        "is_eof"
-      ]
-    },
-    "executor": "builtin:file.chunk_read",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "code.exec",
-    "name": "Execute Code",
-    "type": "function",
-    "description": "在沙箱内执行代码片段",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "code": {
-          "type": "string"
-        },
-        "language": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "code"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "stdout": {
-          "type": "string"
-        },
-        "stderr": {
-          "type": "string"
-        },
-        "exit_code": {
-          "type": "integer"
-        }
-      },
-      "required": [
-        "stdout",
-        "stderr",
-        "exit_code"
-      ]
-    },
-    "executor": "builtin:code.exec",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "memory.list",
-    "name": "List Memory",
-    "type": "function",
-    "description": "按记忆类型列出记忆条目，最新优先",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "memory_type": {
-          "type": "string",
-          "enum": [
-            "attention",
-            "experience",
-            "preference",
-            "cognitive"
-          ]
-        },
-        "limit": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 1000
-        }
-      },
-      "required": [
-        "memory_type"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "items": {
-          "type": "array",
-          "items": {
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "imported": {
             "type": "object"
-          }
-        },
-        "count": {
-          "type": "integer"
-        },
-        "success": {
-          "type": "boolean"
-        },
-        "error": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "items",
-        "count"
-      ]
-    },
-    "executor": "builtin:memory.list",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "memory.retrieve",
-    "name": "Retrieve Memory",
-    "type": "function",
-    "description": "按记忆类型和关键词检索记忆条目",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "memory_type": {
-          "type": "string",
-          "enum": [
-            "attention",
-            "experience",
-            "preference",
-            "cognitive"
-          ]
-        },
-        "query": {
-          "type": "string"
-        },
-        "limit": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 1000
-        }
-      },
-      "required": [
-        "memory_type"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "items": {
-          "type": "array",
-          "items": {
-            "type": "object"
-          }
-        },
-        "count": {
-          "type": "integer"
-        },
-        "success": {
-          "type": "boolean"
-        },
-        "error": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "items",
-        "count"
-      ]
-    },
-    "executor": "builtin:memory.retrieve",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "memory.delete",
-    "name": "Delete Memory",
-    "type": "function",
-    "description": "按类型和 id/focus 删除记忆条目",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "memory_type": {
-          "type": "string",
-          "enum": [
-            "attention",
-            "experience",
-            "preference",
-            "cognitive"
-          ]
-        },
-        "id": {
-          "type": "integer"
-        },
-        "focus": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "memory_type"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "removed": {
-          "type": "integer"
-        },
-        "success": {
-          "type": "boolean"
-        },
-        "error": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "removed"
-      ]
-    },
-    "executor": "builtin:memory.delete",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "memory.attention.write",
-    "name": "Write Attention Memory",
-    "type": "function",
-    "description": "写入注意力记忆，可携带原始 thought_id 索引",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "entries": {
-          "type": "array",
-          "minItems": 1,
-          "maxItems": 100,
-          "items": {
-            "type": "object",
-            "properties": {
-              "focus": {
-                "type": "string"
-              },
-              "content": {
-                "type": "string"
-              },
-              "source_refs": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              }
-            },
-            "required": [
-              "focus",
-              "content"
+          },
+          "error": {
+            "type": "string"
+          },
+          "granted_to_agent": {
+            "type": [
+              "string",
+              "null"
             ]
           }
-        }
+        },
+        "required": [
+          "success",
+          "imported"
+        ]
       },
-      "required": [
-        "entries"
-      ]
+      "executor": "builtin:capability.import",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
     },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "written": {
-          "type": "integer"
-        },
-        "ids": {
-          "type": "array",
-          "items": {
-            "type": "integer"
-          }
-        },
-        "success": {
-          "type": "boolean"
-        },
-        "error": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "written",
-        "ids"
-      ]
-    },
-    "executor": "builtin:memory.attention.write",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "memory.attention.retire",
-    "name": "Retire Attention Memory",
-    "type": "function",
-    "description": "按 focus 淘汰注意力记忆",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "focus": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
+    {
+      "id": "path.exists",
+      "name": "Path Exists",
+      "type": "function",
+      "description": "检查工作区路径是否存在，并返回文件/目录类型",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "path": {
             "type": "string"
           }
-        }
-      },
-      "required": [
-        "focus"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "removed": {
-          "type": "integer"
         },
-        "retired": {
-          "type": "array",
-          "items": {
+        "required": [
+          "path"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "exists": {
+            "type": "boolean"
+          },
+          "is_file": {
+            "type": "boolean"
+          },
+          "is_dir": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "exists",
+          "is_file",
+          "is_dir"
+        ]
+      },
+      "executor": "builtin:path.exists",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "file.glob",
+      "name": "Glob Files",
+      "type": "function",
+      "description": "按 glob 模式在工作区内匹配文件路径（支持 *、**、?）",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string"
+          },
+          "root": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "pattern"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "matches": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "count": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "matches",
+          "count"
+        ]
+      },
+      "executor": "builtin:file.glob",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "json.validate",
+      "name": "Validate JSON",
+      "type": "function",
+      "description": "校验 JSON 文本，可选 JSON Schema 校验，返回错误列表",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "schema": {
             "type": "object"
           }
         },
-        "success": {
-          "type": "boolean"
-        },
-        "error": {
-          "type": "string"
-        }
+        "required": [
+          "text"
+        ]
       },
-      "required": [
-        "removed",
-        "retired"
-      ]
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "valid": {
+            "type": "boolean"
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "valid",
+          "errors"
+        ]
+      },
+      "executor": "builtin:json.validate",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
     },
-    "executor": "builtin:memory.attention.retire",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "memory.experience.write",
-    "name": "Write Experience Memory",
-    "type": "function",
-    "description": "写入经验记忆，可携带来源索引",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "entries": {
-          "type": "array",
-          "minItems": 1,
-          "maxItems": 100,
-          "items": {
-            "type": "object",
-            "properties": {
-              "title": {
-                "type": "string"
-              },
-              "summary": {
-                "type": "string"
-              },
-              "source_refs": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              }
-            },
-            "required": [
-              "title",
-              "summary"
+    {
+      "id": "subagent.create",
+      "name": "Create Subagent",
+      "type": "molecule",
+      "description": "从表内 subagent 模板创建实例：校验 allowlist ⊆ 模板、model 存在，prewrite invocation 后生成 sg_ 实例行并初始化记忆/last_output 文件",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "template_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "task_input": {
+            "type": "string"
+          },
+          "capability_allowlist": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "lifecycle": {
+            "type": "string",
+            "enum": [
+              "temporary",
+              "resident"
             ]
-          }
-        }
-      },
-      "required": [
-        "entries"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "written": {
-          "type": "integer"
-        },
-        "ids": {
-          "type": "array",
-          "items": {
-            "type": "integer"
-          }
-        },
-        "success": {
-          "type": "boolean"
-        },
-        "error": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "written",
-        "ids"
-      ]
-    },
-    "executor": "builtin:memory.experience.write",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "memory.preference.write",
-    "name": "Write Preference Memory",
-    "type": "function",
-    "description": "写入偏好记忆，可携带来源索引",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "entries": {
-          "type": "array",
-          "minItems": 1,
-          "maxItems": 100,
-          "items": {
-            "type": "object",
-            "properties": {
-              "key": {
-                "type": "string"
-              },
-              "value": {
-                "type": "string"
-              },
-              "source_refs": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              }
-            },
-            "required": [
-              "key",
-              "value"
+          },
+          "startup": {
+            "type": "string",
+            "enum": [
+              "normal",
+              "scheduled",
+              "condition"
             ]
-          }
-        }
-      },
-      "required": [
-        "entries"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "written": {
-          "type": "integer"
-        },
-        "ids": {
-          "type": "array",
-          "items": {
-            "type": "integer"
-          }
-        },
-        "success": {
-          "type": "boolean"
-        },
-        "error": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "written",
-        "ids"
-      ]
-    },
-    "executor": "builtin:memory.preference.write",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "memory.cognitive.update",
-    "name": "Update Cognitive Graph",
-    "type": "function",
-    "description": "原子更新认知图节点和边",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "nodes": {
-          "type": "array",
-          "maxItems": 100,
-          "items": {
+          },
+          "trigger": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "model_id": {
+            "type": "string"
+          },
+          "budget": {
             "type": "object",
             "properties": {
-              "action": {
-                "type": "string",
-                "enum": [
-                  "upsert",
-                  "delete"
-                ]
+              "max_retries": {
+                "type": "integer",
+                "minimum": 0
               },
-              "node_id": {
-                "type": "string"
+              "attempt_timeout_seconds": {
+                "type": "integer",
+                "minimum": 1
               },
-              "insight": {
-                "type": "string"
-              },
-              "context": {
-                "type": "string"
+              "total_timeout_seconds": {
+                "type": "integer",
+                "minimum": 1
               }
             }
           }
         },
-        "edges": {
-          "type": "array",
-          "maxItems": 100,
-          "items": {
+        "required": [
+          "template_id"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "subagent_id": {
+            "type": "string"
+          },
+          "lifecycle": {
+            "type": "string"
+          },
+          "capability_allowlist": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "model_id": {
+            "type": "string"
+          },
+          "memory_ref": {
+            "type": "string"
+          },
+          "last_output_ref": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "subagent_id",
+          "lifecycle"
+        ]
+      },
+      "executor": "builtin:subagent.create",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "subagent.update",
+      "name": "Update Subagent",
+      "type": "molecule",
+      "description": "修改 subagent 实例的 prompt / capability_allowlist / startup / trigger / model_id / budget；变更后 allowlist 仍必须 ⊆ 来源模板；running 中只写持久行",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "subagent_id": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "capability_allowlist": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "startup": {
+            "type": "string",
+            "enum": [
+              "normal",
+              "scheduled",
+              "condition"
+            ]
+          },
+          "trigger": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "model_id": {
+            "type": "string"
+          },
+          "budget": {
             "type": "object",
             "properties": {
-              "action": {
-                "type": "string",
-                "enum": [
-                  "upsert",
-                  "delete"
-                ]
+              "max_retries": {
+                "type": "integer",
+                "minimum": 0
               },
-              "from": {
+              "attempt_timeout_seconds": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "total_timeout_seconds": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        },
+        "required": [
+          "subagent_id"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "subagent_id": {
+            "type": "string"
+          },
+          "lifecycle": {
+            "type": "string"
+          },
+          "updated_fields": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "subagent_id",
+          "lifecycle"
+        ]
+      },
+      "executor": "builtin:subagent.update",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "subagent.run",
+      "name": "Run Subagent",
+      "type": "molecule",
+      "description": "按启动方式派发一次异步运行：前置 idle/failed，冻结定义快照，persist running，通知 runtime spawn，立即返回 accepted 不等待",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "subagent_id": {
+            "type": "string"
+          },
+          "task_input": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "subagent_id"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "subagent_id": {
+            "type": "string"
+          },
+          "accepted": {
+            "type": "boolean"
+          },
+          "lifecycle": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "subagent_id",
+          "accepted"
+        ]
+      },
+      "executor": "builtin:subagent.run",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "subagent.sleep",
+      "name": "Sleep Subagent",
+      "type": "molecule",
+      "description": "休眠 subagent：前置 idle/failed，persist lifecycle=sleeping",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "subagent_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "subagent_id"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "subagent_id": {
+            "type": "string"
+          },
+          "lifecycle": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "subagent_id",
+          "lifecycle"
+        ]
+      },
+      "executor": "builtin:subagent.sleep",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "subagent.wake",
+      "name": "Wake Subagent",
+      "type": "molecule",
+      "description": "唤醒 sleeping 的 subagent 回到 idle：仅前置 sleeping",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "subagent_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "subagent_id"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "subagent_id": {
+            "type": "string"
+          },
+          "lifecycle": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "subagent_id",
+          "lifecycle"
+        ]
+      },
+      "executor": "builtin:subagent.wake",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "subagent.delete",
+      "name": "Delete Subagent",
+      "type": "molecule",
+      "description": "软删除/归档 subagent：前置 idle/sleeping/failed（running 拒绝，tombstoned 幂等），persist tombstoned_at，记忆/last_output 文件保留",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "subagent_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "subagent_id"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "subagent_id": {
+            "type": "string"
+          },
+          "lifecycle": {
+            "type": "string"
+          },
+          "archived": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "subagent_id",
+          "lifecycle"
+        ]
+      },
+      "executor": "builtin:subagent.delete",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "usage_method.observe",
+      "name": "Observe Usage Method",
+      "type": "molecule",
+      "description": "把洞察中台的 usage observation 提案写回 usage_method：capability_id 必须出现在最近一次能力调用日志中；只 UPDATE usage_method 行，禁止改 base/composite 稳定契约",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "capability_id": {
+            "type": "string"
+          },
+          "observation": {
+            "type": "string"
+          },
+          "suggestion": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "capability_id",
+          "observation",
+          "suggestion"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "capability_id": {
+            "type": "string"
+          },
+          "usage_method_id": {
+            "type": "string"
+          },
+          "created": {
+            "type": "boolean"
+          },
+          "updated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "success"
+        ]
+      },
+      "executor": "builtin:usage_method.observe",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "permission.grant",
+      "name": "Grant Permission",
+      "type": "function",
+      "description": "运行时授权（v0.4.4）：把一项 registry 能力授予 subagent 实例（宽集外叠加）；one_shot 用后自动回收，ttl 限时 N 秒过期回收；全量写 permission_grants 审计表；仅执行中台与获递归授权的 subagent 可调用",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "target_agent_id": {
+            "type": "string"
+          },
+          "capability_id": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "one_shot",
+              "ttl"
+            ]
+          },
+          "ttl_secs": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 86400
+          }
+        },
+        "required": [
+          "target_agent_id",
+          "capability_id",
+          "mode"
+        ],
+        "additionalProperties": false
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "target_agent_id": {
+            "type": "string"
+          },
+          "capability_id": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "target_agent_id",
+          "capability_id",
+          "mode"
+        ],
+        "additionalProperties": false
+      },
+      "executor": "builtin:permission.grant",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "permission.revoke",
+      "name": "Revoke Permission",
+      "type": "function",
+      "description": "运行时撤销授权（v0.4.4）：从 subagent 实例 allowlist 移除一项能力并把活跃授权记录标记 revoked；全量写 permission_grants 审计表；仅执行中台与获递归授权的 subagent 可调用",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "target_agent_id": {
+            "type": "string"
+          },
+          "capability_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_agent_id",
+          "capability_id"
+        ],
+        "additionalProperties": false
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "target_agent_id": {
+            "type": "string"
+          },
+          "capability_id": {
+            "type": "string"
+          },
+          "removed_from_allowlist": {
+            "type": "boolean"
+          },
+          "revoked_records": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "target_agent_id",
+          "capability_id"
+        ],
+        "additionalProperties": false
+      },
+      "executor": "builtin:permission.revoke",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "web.fetch.public",
+      "name": "Fetch Public Web Page",
+      "type": "function",
+      "description": "抓取公开网页正文（v0.4.6）：仅 HTTPS、域名白名单（[web] allowed_domains，缺省空=拒绝全部）、拒绝重定向、响应体 ≤200KB、10s 超时；正文 UTF-8 截断 50K 字符返回（不做 HTML→Markdown 转换）；每次调用全量写 web_fetch_audit 审计表。不默认授权给任何 agent——须经 permission.grant 显式授予",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "additionalProperties": false
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "url": {
+            "type": "string"
+          },
+          "http_code": {
+            "type": "integer"
+          },
+          "bytes": {
+            "type": "integer"
+          },
+          "extracted_chars": {
+            "type": "integer"
+          },
+          "content": {
+            "type": "string"
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
                 "type": "string"
               },
-              "to": {
-                "type": "string"
-              },
-              "relation": {
+              "message": {
                 "type": "string"
               }
             },
             "required": [
-              "from",
-              "to",
-              "relation"
-            ]
-          }
-        }
-      },
-      "required": []
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "success": {
-          "type": "boolean"
-        },
-        "node_changes": {
-          "type": "integer"
-        },
-        "edge_changes": {
-          "type": "integer"
-        },
-        "error": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "success",
-        "node_changes",
-        "edge_changes"
-      ]
-    },
-    "executor": "builtin:memory.cognitive.update",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "memory.evidence.lookup",
-    "name": "Lookup Memory Evidence",
-    "type": "function",
-    "description": "按 thought_id 索引查找原始对话证据",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "source_refs": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "type": "string"
+              "code",
+              "message"
+            ],
+            "additionalProperties": false
           }
         },
-        "limit": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 1000
-        }
+        "required": [
+          "success"
+        ],
+        "additionalProperties": false
       },
-      "required": [
-        "source_refs"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "items": {
-          "type": "array",
-          "items": {
-            "type": "object"
-          }
-        },
-        "count": {
-          "type": "integer"
-        },
-        "success": {
-          "type": "boolean"
-        },
-        "error": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "items",
-        "count"
-      ]
-    },
-    "executor": "builtin:memory.evidence.lookup",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "capability.import",
-    "name": "Import Capability",
-    "type": "function",
-    "description": "原子化导入用户定义的能力定义（base/composite/usage），用于把 skill/插件描述转化为 cipher 自身能力。executor 仅允许已知 builtin。",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "base_capabilities": {
-          "type": "array",
-          "items": {
-            "type": "object"
-          }
-        },
-        "composite_capabilities": {
-          "type": "array",
-          "items": {
-            "type": "object"
-          }
-        },
-        "usage_methods": {
-          "type": "array",
-          "items": {
-            "type": "object"
-          }
-        },
-        "grant_to_agent": {
-          "type": "string"
-        }
-      }
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "success": {
-          "type": "boolean"
-        },
-        "imported": {
-          "type": "object"
-        },
-        "error": {
-          "type": "string"
-        },
-        "granted_to_agent": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "success",
-        "imported"
-      ]
-    },
-    "executor": "builtin:capability.import",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "path.exists",
-    "name": "Path Exists",
-    "type": "function",
-    "description": "检查工作区路径是否存在，并返回文件/目录类型",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "path": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "path"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "exists": {
-          "type": "boolean"
-        },
-        "is_file": {
-          "type": "boolean"
-        },
-        "is_dir": {
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "exists",
-        "is_file",
-        "is_dir"
-      ]
-    },
-    "executor": "builtin:path.exists",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "file.glob",
-    "name": "Glob Files",
-    "type": "function",
-    "description": "按 glob 模式在工作区内匹配文件路径（支持 *、**、?）",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "pattern": {
-          "type": "string"
-        },
-        "root": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "pattern"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "matches": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "count": {
-          "type": "integer"
-        }
-      },
-      "required": [
-        "matches",
-        "count"
-      ]
-    },
-    "executor": "builtin:file.glob",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "json.validate",
-    "name": "Validate JSON",
-    "type": "function",
-    "description": "校验 JSON 文本，可选 JSON Schema 校验，返回错误列表",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "text": {
-          "type": "string"
-        },
-        "schema": {
-          "type": "object"
-        }
-      },
-      "required": [
-        "text"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "valid": {
-          "type": "boolean"
-        },
-        "errors": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        }
-      },
-      "required": [
-        "valid",
-        "errors"
-      ]
-    },
-    "executor": "builtin:json.validate",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "subagent.create",
-    "name": "Create Subagent",
-    "type": "molecule",
-    "description": "从表内 subagent 模板创建实例：校验 allowlist ⊆ 模板、model 存在，prewrite invocation 后生成 sg_ 实例行并初始化记忆/last_output 文件",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "template_id": {"type": "string"},
-        "name": {"type": "string"},
-        "task_input": {"type": "string"},
-        "capability_allowlist": {"type": "array", "items": {"type": "string"}},
-        "lifecycle": {"type": "string", "enum": ["temporary", "resident"]},
-        "startup": {"type": "string", "enum": ["normal", "scheduled", "condition"]},
-        "trigger": {"type": ["object", "null"]},
-        "model_id": {"type": "string"},
-        "budget": {
-          "type": "object",
-          "properties": {
-            "max_retries": {"type": "integer", "minimum": 0},
-            "attempt_timeout_seconds": {"type": "integer", "minimum": 1},
-            "total_timeout_seconds": {"type": "integer", "minimum": 1}
-          }
-        }
-      },
-      "required": ["template_id"]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "subagent_id": {"type": "string"},
-        "lifecycle": {"type": "string"},
-        "capability_allowlist": {"type": "array", "items": {"type": "string"}},
-        "model_id": {"type": "string"},
-        "memory_ref": {"type": "string"},
-        "last_output_ref": {"type": "string"}
-      },
-      "required": ["subagent_id", "lifecycle"]
-    },
-    "executor": "builtin:subagent.create",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "subagent.update",
-    "name": "Update Subagent",
-    "type": "molecule",
-    "description": "修改 subagent 实例的 prompt / capability_allowlist / startup / trigger / model_id / budget；变更后 allowlist 仍必须 ⊆ 来源模板；running 中只写持久行",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "subagent_id": {"type": "string"},
-        "prompt": {"type": "string"},
-        "capability_allowlist": {"type": "array", "items": {"type": "string"}},
-        "startup": {"type": "string", "enum": ["normal", "scheduled", "condition"]},
-        "trigger": {"type": ["object", "null"]},
-        "model_id": {"type": "string"},
-        "budget": {
-          "type": "object",
-          "properties": {
-            "max_retries": {"type": "integer", "minimum": 0},
-            "attempt_timeout_seconds": {"type": "integer", "minimum": 1},
-            "total_timeout_seconds": {"type": "integer", "minimum": 1}
-          }
-        }
-      },
-      "required": ["subagent_id"]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "subagent_id": {"type": "string"},
-        "lifecycle": {"type": "string"},
-        "updated_fields": {"type": "array", "items": {"type": "string"}}
-      },
-      "required": ["subagent_id", "lifecycle"]
-    },
-    "executor": "builtin:subagent.update",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "subagent.run",
-    "name": "Run Subagent",
-    "type": "molecule",
-    "description": "按启动方式派发一次异步运行：前置 idle/failed，冻结定义快照，persist running，通知 runtime spawn，立即返回 accepted 不等待",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "subagent_id": {"type": "string"},
-        "task_input": {"type": "string"}
-      },
-      "required": ["subagent_id"]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "subagent_id": {"type": "string"},
-        "accepted": {"type": "boolean"},
-        "lifecycle": {"type": "string"}
-      },
-      "required": ["subagent_id", "accepted"]
-    },
-    "executor": "builtin:subagent.run",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "subagent.sleep",
-    "name": "Sleep Subagent",
-    "type": "molecule",
-    "description": "休眠 subagent：前置 idle/failed，persist lifecycle=sleeping",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "subagent_id": {"type": "string"}
-      },
-      "required": ["subagent_id"]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "subagent_id": {"type": "string"},
-        "lifecycle": {"type": "string"}
-      },
-      "required": ["subagent_id", "lifecycle"]
-    },
-    "executor": "builtin:subagent.sleep",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "subagent.wake",
-    "name": "Wake Subagent",
-    "type": "molecule",
-    "description": "唤醒 sleeping 的 subagent 回到 idle：仅前置 sleeping",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "subagent_id": {"type": "string"}
-      },
-      "required": ["subagent_id"]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "subagent_id": {"type": "string"},
-        "lifecycle": {"type": "string"}
-      },
-      "required": ["subagent_id", "lifecycle"]
-    },
-    "executor": "builtin:subagent.wake",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "subagent.delete",
-    "name": "Delete Subagent",
-    "type": "molecule",
-    "description": "软删除/归档 subagent：前置 idle/sleeping/failed（running 拒绝，tombstoned 幂等），persist tombstoned_at，记忆/last_output 文件保留",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "subagent_id": {"type": "string"}
-      },
-      "required": ["subagent_id"]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "subagent_id": {"type": "string"},
-        "lifecycle": {"type": "string"},
-        "archived": {"type": "boolean"}
-      },
-      "required": ["subagent_id", "lifecycle"]
-    },
-    "executor": "builtin:subagent.delete",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "usage_method.observe",
-    "name": "Observe Usage Method",
-    "type": "molecule",
-    "description": "把洞察中台的 usage observation 提案写回 usage_method：capability_id 必须出现在最近一次能力调用日志中；只 UPDATE usage_method 行，禁止改 base/composite 稳定契约",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "capability_id": {"type": "string"},
-        "observation": {"type": "string"},
-        "suggestion": {"type": "string"}
-      },
-      "required": ["capability_id", "observation", "suggestion"]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "success": {"type": "boolean"},
-        "capability_id": {"type": "string"},
-        "usage_method_id": {"type": "string"},
-        "created": {"type": "boolean"},
-        "updated": {"type": "boolean"}
-      },
-      "required": ["success"]
-    },
-    "executor": "builtin:usage_method.observe",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "permission.grant",
-    "name": "Grant Permission",
-    "type": "function",
-    "description": "运行时授权（v0.4.4）：把一项 registry 能力授予 subagent 实例（宽集外叠加）；one_shot 用后自动回收，ttl 限时 N 秒过期回收；全量写 permission_grants 审计表；仅执行中台与获递归授权的 subagent 可调用",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "target_agent_id": {"type": "string"},
-        "capability_id": {"type": "string"},
-        "mode": {"type": "string", "enum": ["one_shot", "ttl"]},
-        "ttl_secs": {"type": "integer", "minimum": 1, "maximum": 86400}
-      },
-      "required": ["target_agent_id", "capability_id", "mode"],
-      "additionalProperties": false
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "id": {"type": "string"},
-        "target_agent_id": {"type": "string"},
-        "capability_id": {"type": "string"},
-        "mode": {"type": "string"},
-        "expires_at": {"type": ["string", "null"]}
-      },
-      "required": ["id", "target_agent_id", "capability_id", "mode"],
-      "additionalProperties": false
-    },
-    "executor": "builtin:permission.grant",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "permission.revoke",
-    "name": "Revoke Permission",
-    "type": "function",
-    "description": "运行时撤销授权（v0.4.4）：从 subagent 实例 allowlist 移除一项能力并把活跃授权记录标记 revoked；全量写 permission_grants 审计表；仅执行中台与获递归授权的 subagent 可调用",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "target_agent_id": {"type": "string"},
-        "capability_id": {"type": "string"}
-      },
-      "required": ["target_agent_id", "capability_id"],
-      "additionalProperties": false
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "target_agent_id": {"type": "string"},
-        "capability_id": {"type": "string"},
-        "removed_from_allowlist": {"type": "boolean"},
-        "revoked_records": {"type": "integer"}
-      },
-      "required": ["target_agent_id", "capability_id"],
-      "additionalProperties": false
-    },
-    "executor": "builtin:permission.revoke",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "web.fetch.public",
-    "name": "Fetch Public Web Page",
-    "type": "function",
-    "description": "抓取公开网页正文（v0.4.6）：仅 HTTPS、域名白名单（[web] allowed_domains，缺省空=拒绝全部）、拒绝重定向、响应体 ≤200KB、10s 超时；正文 UTF-8 截断 50K 字符返回（不做 HTML→Markdown 转换）；每次调用全量写 web_fetch_audit 审计表。不默认授权给任何 agent——须经 permission.grant 显式授予",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "url": {"type": "string"}
-      },
-      "required": ["url"],
-      "additionalProperties": false
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "success": {"type": "boolean"},
-        "url": {"type": "string"},
-        "http_code": {"type": "integer"},
-        "bytes": {"type": "integer"},
-        "extracted_chars": {"type": "integer"},
-        "content": {"type": "string"},
-        "error": {
-          "type": "object",
-          "properties": {
-            "code": {"type": "string"},
-            "message": {"type": "string"}
-          },
-          "required": ["code", "message"],
-          "additionalProperties": false
-        }
-      },
-      "required": ["success"],
-      "additionalProperties": false
-    },
-    "executor": "builtin:web.fetch.public",
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  }
-]
-
+      "executor": "builtin:web.fetch.public",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    }
+  ]
+}

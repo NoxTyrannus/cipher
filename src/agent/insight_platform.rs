@@ -39,6 +39,9 @@ pub struct InsightPlatform {
     prompts_dir: Option<PathBuf>,
     /// subagent 记忆证据目录（<storage_root>/subagents/<id>/memory.json + last_output.json）。
     storage_root: Option<PathBuf>,
+    /// 机制式排队合并开关（v0.4.7）：true=批=连续处理组（逐轮洞察发布，回环时序不变）；
+    /// false=完全回退逐条现状。
+    merge_enabled: bool,
 }
 
 impl InsightPlatform {
@@ -52,6 +55,7 @@ impl InsightPlatform {
         capability_memory_tx: mpsc::Sender<String>,
         prompts_dir: Option<PathBuf>,
         storage_root: Option<PathBuf>,
+        merge_enabled: bool,
     ) -> Self {
         Self {
             insight_rx,
@@ -62,22 +66,40 @@ impl InsightPlatform {
             capability_memory_tx,
             prompts_dir,
             storage_root,
+            merge_enabled,
         }
     }
 
     pub fn spawn(mut self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            tracing::info!("insight_platform: started, polling rx");
+            tracing::info!(
+                "insight_platform: started, polling rx (merge_enabled={})",
+                self.merge_enabled
+            );
             let heartbeat =
                 AgentPool::spawn_core_heartbeat(&self.pool, "insight-platform", "insight-platform");
 
-            while let Some(msg) = self.insight_rx.recv().await {
-                let pending = self.insight_rx.len();
-                self.pool
-                    .update_platform_status(move |s| s.insight_pending = pending)
-                    .await;
-                match msg {
-                    AgentMessage::ExecutionDone { turn_id } => {
+            if self.merge_enabled {
+                // v0.4.7 机制式合并：批 = 连续处理组；批内逐轮 handle_insight（逐轮洞察发布、
+                // 逐轮回环时序不变）；飞行缓冲消除队列空隙。
+                let mut queue = crate::agent::batch_queue::PendingBatchQueue::<AgentMessage>::new();
+                loop {
+                    let Some(batch) = queue.next_batch(&mut self.insight_rx).await else {
+                        break;
+                    };
+                    queue.absorb_channel(&mut self.insight_rx);
+                    let batch_len = batch.len();
+                    for (i, msg) in batch.into_iter().enumerate() {
+                        let turn_id = match msg {
+                            AgentMessage::ExecutionDone { turn_id } => turn_id,
+                            AgentMessage::Cancel { .. } | AgentMessage::MessageDeliver { .. } => {
+                                continue;
+                            }
+                            other => {
+                                tracing::warn!("insight_platform: unexpected message: {other:?}");
+                                continue;
+                            }
+                        };
                         self.pool
                             .update_platform_status(|s| s.insight_active = Some(turn_id.clone()))
                             .await;
@@ -91,14 +113,50 @@ impl InsightPlatform {
                         self.pool
                             .update_platform_status(|s| s.insight_active = None)
                             .await;
+
+                        // 待处理消息数口径 = 飞行缓冲 + 本批剩余。
+                        queue.absorb_channel(&mut self.insight_rx);
+                        let pending = queue.len() + (batch_len - 1 - i);
+                        self.pool
+                            .update_platform_status(move |s| s.insight_pending = pending)
+                            .await;
                     }
-                    AgentMessage::Cancel { .. } => {}
-                    AgentMessage::MessageDeliver { .. } => {}
-                    other => {
-                        tracing::warn!("insight_platform: unexpected message: {other:?}");
-                    }
+                    queue.on_batch_finished();
+                    self.pool.snapshot_detailed().await;
                 }
-                self.pool.snapshot_detailed().await;
+            } else {
+                // 完全回退逐条现状（v0.4.6 及以前行为）。
+                while let Some(msg) = self.insight_rx.recv().await {
+                    let pending = self.insight_rx.len();
+                    self.pool
+                        .update_platform_status(move |s| s.insight_pending = pending)
+                        .await;
+                    match msg {
+                        AgentMessage::ExecutionDone { turn_id } => {
+                            self.pool
+                                .update_platform_status(|s| {
+                                    s.insight_active = Some(turn_id.clone())
+                                })
+                                .await;
+                            self.pool
+                                .set_core_agent_status("insight-platform", AgentStatus::Running)
+                                .await;
+                            self.handle_insight(&turn_id).await;
+                            self.pool
+                                .set_core_agent_status("insight-platform", AgentStatus::Idle)
+                                .await;
+                            self.pool
+                                .update_platform_status(|s| s.insight_active = None)
+                                .await;
+                        }
+                        AgentMessage::Cancel { .. } => {}
+                        AgentMessage::MessageDeliver { .. } => {}
+                        other => {
+                            tracing::warn!("insight_platform: unexpected message: {other:?}");
+                        }
+                    }
+                    self.pool.snapshot_detailed().await;
+                }
             }
 
             heartbeat.abort();
@@ -578,6 +636,7 @@ pub async fn run(
     capability_memory_tx: mpsc::Sender<String>,
     prompts_dir: Option<PathBuf>,
     storage_root: Option<PathBuf>,
+    merge_enabled: bool,
 ) {
     let platform = InsightPlatform::new(
         rx,
@@ -588,6 +647,7 @@ pub async fn run(
         capability_memory_tx,
         prompts_dir,
         storage_root,
+        merge_enabled,
     );
     let handle = platform.spawn();
     match handle.await {
@@ -874,5 +934,151 @@ mod tests {
         let out = finalize_insight_text(&long);
         assert!(out.chars().count() <= MAX_INSIGHT_BODY_CHARS);
         assert!(out.ends_with('方'));
+    }
+
+    struct NoopProvider;
+    #[async_trait::async_trait]
+    impl crate::logic::model::provider::LlmProvider for NoopProvider {
+        fn id(&self) -> &'static str {
+            "noop"
+        }
+        fn name(&self) -> &'static str {
+            "Noop"
+        }
+        async fn call(
+            &self,
+            _req: &crate::logic::model::provider::LlmRequest,
+        ) -> crate::common::Result<crate::logic::model::provider::LlmResponse> {
+            Ok(crate::logic::model::provider::LlmResponse {
+                content: String::new(),
+                usage: None,
+            })
+        }
+        async fn call_stream(
+            &self,
+            _req: &crate::logic::model::provider::LlmRequest,
+            _on_chunk: &mut (dyn FnMut(crate::logic::model::stream::StreamChunk) + Send),
+        ) -> crate::common::Result<crate::logic::model::provider::LlmResponse> {
+            self.call(_req).await
+        }
+    }
+
+    fn noop_model_row() -> crate::data::ModelRow {
+        crate::data::ModelRow {
+            id: "m1".into(),
+            name: "test".into(),
+            provider: "p".into(),
+            api_url: "u".into(),
+            api_type: "openai".into(),
+            api_protocol: "openai-v1".into(),
+            api_key: None,
+            model_id: "model-x".into(),
+            config: None,
+        }
+    }
+
+    fn insight_turn_context(id: &str) -> crate::agent::communication::TurnContext {
+        crate::agent::communication::TurnContext {
+            turn_id: id.into(),
+            thinking: crate::agent::communication::ThinkingOutput {
+                decision: crate::agent::communication::ThinkDecision::Execute,
+                think_message: "think 全文".into(),
+                constraints: vec![],
+            },
+            execution: None,
+            insight: None,
+            memory: None,
+            status: crate::agent::communication::TurnStatus::Executing,
+            user_message: "用户输入".into(),
+            input_kind: "user".into(),
+            has_subagent_result: false,
+        }
+    }
+
+    fn insight_platform_with(
+        rx: mpsc::Receiver<AgentMessage>,
+        pool: Arc<AgentPool>,
+        capability_memory_tx: mpsc::Sender<String>,
+    ) -> InsightPlatform {
+        InsightPlatform::new(
+            rx,
+            pool,
+            Arc::new(NoopProvider),
+            noop_model_row(),
+            SecretString::from("x".to_string()),
+            capability_memory_tx,
+            None,
+            None,
+            true,
+        )
+    }
+
+    #[tokio::test]
+    async fn merged_loop_processes_each_turn_in_order_and_publishes() {
+        // v0.4.7 机制式合并（洞察中台）：批 = 连续处理组，逐轮洞察发布（回环时序不变）。
+        // NoopProvider 空响应 → 每轮发布「（洞察中台无输出）」占位产物。
+        let (pool, _receivers) = AgentPool::new();
+        let pool = Arc::new(pool);
+        for t in ["t1", "t2", "t3", "t4"] {
+            pool.create_turn_context(insight_turn_context(t)).await;
+        }
+        let (cap_tx, _cap_rx) = mpsc::channel::<String>(16);
+        let (tx, rx) = mpsc::channel(8);
+        let platform = insight_platform_with(rx, pool.clone(), cap_tx);
+        let handle = platform.spawn();
+
+        for t in ["t1", "t2", "t3"] {
+            tx.send(AgentMessage::ExecutionDone { turn_id: t.into() })
+                .await
+                .unwrap();
+        }
+        // 处理中补发 t4（飞行缓冲路径）。
+        tx.send(AgentMessage::ExecutionDone {
+            turn_id: "t4".into(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("platform task 应在 rx 关闭后退出")
+            .expect("platform task 不得 panic");
+
+        for t in ["t1", "t2", "t3", "t4"] {
+            let ctx = pool.get_turn_context(t).await.expect("turn context 存在");
+            let insight = ctx.insight.as_ref().expect("每轮都有洞察产物");
+            assert_eq!(
+                insight.insight.insight, "（洞察中台无输出）",
+                "NoopProvider 空响应 → 占位洞察（合并不得吞轮）: {t}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn merged_loop_single_turn_degradation_identical() {
+        // 单条到达：批=[1 条]=单条处理，无额外延迟；行为与逐条现状一致。
+        let (pool, _receivers) = AgentPool::new();
+        let pool = Arc::new(pool);
+        pool.create_turn_context(insight_turn_context("t1")).await;
+        let (cap_tx, _cap_rx) = mpsc::channel::<String>(16);
+        let (tx, rx) = mpsc::channel(8);
+        let platform = insight_platform_with(rx, pool.clone(), cap_tx);
+        let handle = platform.spawn();
+
+        tx.send(AgentMessage::ExecutionDone {
+            turn_id: "t1".into(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("platform task 应退出")
+            .expect("platform task 不得 panic");
+
+        let ctx = pool.get_turn_context("t1").await.unwrap();
+        assert!(ctx.insight.is_some(), "单条退化行为与逐条现状一致");
     }
 }
