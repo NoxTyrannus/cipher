@@ -8,7 +8,7 @@ use crate::data::workspace_store::{WorkspaceRow, WorkspaceStore};
 use dialoguer::{Input, Password, Select};
 use secrecy::SecretString;
 
-use super::config::Config;
+use super::config::{Config, UnniStyle};
 
 const PRESET_TEMPLATES: &[(&str, &str, &str, &str)] = &[(
     "OpenAI 官方",
@@ -53,13 +53,22 @@ fn manage_mode_styles() -> Result<(), AgentError> {
     };
     loop {
         let keep = config.mode_styles.keep;
+        let unni_show = match config.mode_styles.unni.as_ref().and_then(|u| u.show_think) {
+            None => "跟随全局".to_string(),
+            Some(true) => "开".to_string(),
+            Some(false) => "关".to_string(),
+        };
         let items = vec![
             format!("KEEP Token 预算 (当前: {}K)", keep.token_budget / 1000),
             format!("KEEP 时间预算 (当前: {}min)", keep.time_budget_secs / 60),
+            format!(
+                "UI 思考显示 (全局: {}, UNNI: {unni_show})",
+                if config.ui.show_think { "开" } else { "关" }
+            ),
             "返回 /config 主菜单".to_string(),
         ];
         let sel = Select::new()
-            .with_prompt("协作设置 — 选择管理项 (KEEP 预算)")
+            .with_prompt("协作设置 — 选择管理项 (KEEP 预算 / UI 思考显示)")
             .items(&items)
             .default(0)
             .interact()
@@ -67,6 +76,7 @@ fn manage_mode_styles() -> Result<(), AgentError> {
         match sel {
             0 => manage_keep_token(&mut config, &config_path)?,
             1 => manage_keep_time(&mut config, &config_path)?,
+            2 => manage_ui_show_think(&mut config, &config_path)?,
             _ => return Ok(()),
         }
     }
@@ -107,6 +117,63 @@ fn manage_keep_token(config: &mut Config, config_path: &std::path::Path) -> Resu
         } else {
             format!("{}K", budget / 1000)
         }
+    );
+    Ok(())
+}
+
+/// UI 思考显示设置：全局 `[ui] show_think` + UNNI per-mode 覆盖（跟随全局/强制开/强制关）。
+fn manage_ui_show_think(
+    config: &mut Config,
+    config_path: &std::path::Path,
+) -> Result<(), AgentError> {
+    let global_items = ["开（显示思考面板）", "关（隐藏思考面板）"];
+    let global = Select::new()
+        .with_prompt(format!(
+            "全局思考显示 (当前: {})",
+            if config.ui.show_think { "开" } else { "关" }
+        ))
+        .items(&global_items)
+        .default(if config.ui.show_think { 0 } else { 1 })
+        .interact()
+        .map_err(|e| AgentError::Parse(format!("ui show_think select: {e}")))?;
+    let new_global = global == 0;
+    config.ui.show_think = new_global;
+
+    let unni_items = ["跟随全局", "强制开", "强制关"];
+    let current = config.mode_styles.unni.as_ref().and_then(|u| u.show_think);
+    let default_idx = match current {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    let sel = Select::new()
+        .with_prompt(format!(
+            "UNNI 模式思考显示覆盖 (当前: {})",
+            match current {
+                None => "跟随全局".to_string(),
+                Some(true) => "开".to_string(),
+                Some(false) => "关".to_string(),
+            }
+        ))
+        .items(&unni_items)
+        .default(default_idx)
+        .interact()
+        .map_err(|e| AgentError::Parse(format!("unni show_think select: {e}")))?;
+    config
+        .mode_styles
+        .unni
+        .get_or_insert_with(UnniStyle::default)
+        .show_think = match sel {
+        0 => None,
+        1 => Some(true),
+        _ => Some(false),
+    };
+
+    config.save(config_path)?;
+    println!(
+        "UI 思考显示已保存 (config.toml): 全局={}, UNNI 覆盖={:?}",
+        config.ui.show_think,
+        config.mode_styles.unni.as_ref().and_then(|u| u.show_think)
     );
     Ok(())
 }
