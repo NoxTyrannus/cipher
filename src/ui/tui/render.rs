@@ -58,6 +58,25 @@ fn is_think_display(msg: &TuiMessage) -> bool {
         )
 }
 
+/// v0.4.8 空气泡清理：以下消息不渲染（高度 0、跳过绘制）：
+/// - `Think { text }` 且 `text` 为空；
+/// - `Streaming { finished: true, content: 空, error: None }`。
+///
+/// **保留**：`finished=false` 的空 Streaming（「思考中」进度占位）、`error=Some` 的错误气泡、
+/// `content` 非空的正常气泡。
+fn is_empty_bubble(msg: &TuiMessage) -> bool {
+    match msg {
+        TuiMessage::Think { text, .. } => text.is_empty(),
+        TuiMessage::Streaming {
+            content,
+            finished,
+            error,
+            ..
+        } => *finished && content.is_empty() && error.is_none(),
+        _ => false,
+    }
+}
+
 fn render_messages(state: &TuiState, frame: &mut Frame, area: Rect) {
     if state.messages.is_empty() {
         return;
@@ -135,6 +154,9 @@ fn render_messages(state: &TuiState, frame: &mut Frame, area: Rect) {
 }
 
 fn msg_height(msg: &TuiMessage, user_w: usize, inner_w: usize) -> u16 {
+    if is_empty_bubble(msg) {
+        return 0;
+    }
     match msg {
         TuiMessage::User(t) => wrapped_lines(t, user_w) + 1,
         TuiMessage::Assistant(t) => wrapped_lines(t, inner_w) + 2,
@@ -160,6 +182,9 @@ fn wrapped_lines(text: &str, width: usize) -> u16 {
 }
 
 fn render_one_message(msg: &TuiMessage, rect: Rect, frame: &mut Frame, agent_name: &str) {
+    if is_empty_bubble(msg) {
+        return;
+    }
     match msg {
         TuiMessage::User(text) => {
             let para = Paragraph::new(vec![
@@ -590,6 +615,83 @@ mod tests {
         let text = render_to_text(&s);
 
         assert!(text.contains("msg 19"), "latest message should be visible");
+    }
+
+    #[test]
+    fn render_skips_empty_think_bubble() {
+        // v0.4.8 空气泡清理：`Think { text: 空 }` 不渲染（高度 0、跳过绘制）。
+        let mut s = TuiState::new();
+        s.messages.push(TuiMessage::Think {
+            id: "inst-1".into(),
+            text: String::new(),
+        });
+
+        assert_eq!(msg_height(&s.messages[0], 40, 38), 0, "空 Think 高度应为 0");
+
+        let text = render_to_text(&s);
+        assert!(
+            !text.contains('思') && !text.contains('考'),
+            "空 Think 气泡不应渲染标题/内容, got: {text}"
+        );
+    }
+
+    #[test]
+    fn render_skips_empty_finished_streaming_bubble() {
+        // v0.4.8 空气泡清理：`Streaming { finished: true, content: 空, error: None }` 不渲染。
+        let mut s = TuiState::new();
+        s.messages.push(TuiMessage::Streaming {
+            id: "inst-1".into(),
+            content: String::new(),
+            finished: true,
+            error: None,
+        });
+
+        assert_eq!(
+            msg_height(&s.messages[0], 40, 38),
+            0,
+            "空 finished Streaming 高度应为 0"
+        );
+
+        let text = render_to_text(&s);
+        assert!(
+            !text.contains("消息"),
+            "空 finished Streaming 气泡不应渲染标题, got: {text}"
+        );
+    }
+
+    #[test]
+    fn scroll_with_empty_placeholders_reaches_oldest_and_tail() {
+        // 长历史 + 空占位混合：空气泡不占滚动空间，滚动语义不回归。
+        let mut s = TuiState::new();
+        for i in 0..30 {
+            s.push_user(format!("msg {i}"));
+            s.messages.push(TuiMessage::Think {
+                id: format!("t{i}"),
+                text: String::new(),
+            });
+            s.messages.push(TuiMessage::Streaming {
+                id: format!("s{i}"),
+                content: String::new(),
+                finished: true,
+                error: None,
+            });
+        }
+
+        // 滚到顶：空占位不占滚动空间，最老历史应可见。
+        s.scroll_up(100_000);
+        let text = render_to_text(&s);
+        assert!(
+            text.contains("msg 0"),
+            "scroll 到顶应显示最老历史 msg 0, got: {text}"
+        );
+
+        // 滚回尾：
+        s.scroll_to_tail();
+        let text = render_to_text(&s);
+        assert!(
+            text.contains("msg 29"),
+            "滚回尾部应显示最新历史 msg 29, got: {text}"
+        );
     }
 
     #[test]
