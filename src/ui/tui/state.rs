@@ -50,6 +50,12 @@ pub struct TuiState {
     pub status_line: StatusLineState,
 
     pub scroll_offset: usize,
+
+    /// 全局思考面板显示开关（来自 `[ui] show_think`，缺省 true=显示）。
+    pub ui_show_think: bool,
+
+    /// UNNI per-mode 思考显示覆盖（来自 `[mode_styles.unni] show_think`，None=跟随全局）。
+    pub unni_show_think: Option<bool>,
 }
 
 impl TuiState {
@@ -64,6 +70,8 @@ impl TuiState {
             config_panel: ConfigPanel::new(),
             status_line: StatusLineState::new(),
             scroll_offset: 0,
+            ui_show_think: true,
+            unni_show_think: None,
         }
     }
 

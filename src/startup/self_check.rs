@@ -1,6 +1,6 @@
 use super::config::Config;
 #[cfg(test)]
-use super::config::{ContextSection, ModeStyles};
+use super::config::{ContextSection, ModeStyles, UiSection, WebSection};
 use crate::common::AgentError;
 use crate::data::ModelRow;
 use crate::mode_runtime::ModeKind;
@@ -231,6 +231,8 @@ mod tests {
             mode_styles: ModeStyles::default(),
             default_model: None,
             context: ContextSection::default(),
+            ui: UiSection::default(),
+            web: WebSection::default(),
         }
     }
 

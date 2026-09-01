@@ -725,6 +725,10 @@ pub async fn run_streaming_loop(
 
     let mut state = TuiState::new();
     state.current_mode = mode_manager.current_kind();
+    // v0.4.6 think 显示开关：全局 [ui] show_think + UNNI per-mode 覆盖（经 RuntimeStyles 快照）。
+    let styles = *mode_styles_shared.lock().unwrap();
+    state.ui_show_think = styles.ui_show_think;
+    state.unni_show_think = styles.unni_show_think;
     if let Some(name) = load_default_agent_display_name(&app.duckdb) {
         state.agent_name = name;
     }

@@ -39,6 +39,8 @@ mod tests {
             mode_styles: ModeStyles::default(),
             default_model: None,
             context: ContextSection::default(),
+            ui: crate::startup::config::UiSection::default(),
+            web: crate::startup::config::WebSection::default(),
         };
         saved.save(&path).unwrap();
 

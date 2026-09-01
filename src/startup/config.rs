@@ -24,7 +24,8 @@ pub struct Config {
     pub default_mode: String,
 
     /// 模式附加配置。旧 `[mode_styles.unni]` / `[mode_styles.loop]` 字段在读取时忽略+warn，
-    /// 不迁移落盘（放弃项 3）。
+    /// 不迁移落盘（放弃项 3）；v0.4.6 起 `[mode_styles.unni] show_think` 恢复为受支持字段
+    /// （UNNI per-mode 思考显示覆盖，缺省 None=跟随全局）。
     #[serde(default)]
     pub mode_styles: ModeStyles,
 
@@ -33,6 +34,47 @@ pub struct Config {
 
     #[serde(default)]
     pub context: ContextSection,
+
+    /// UI 显示设置（v0.4.6）。思考面板显示开关：
+    /// - 缺省 `show_think = true`（保持 v0.4.5 及以前行为——思考面板恒显示）；
+    /// - UNNI 单独关闭思考显示：`[mode_styles.unni] show_think = false`（跟随/覆盖全局）。
+    #[serde(default)]
+    pub ui: UiSection,
+
+    /// 网络能力设置（v0.4.6）。`web.fetch.public` 域名白名单：
+    /// - 缺省空列表 = 拒绝全部域名（安全默认）；
+    /// - 需用时手写，如 `allowed_domains = ["kaggle.com", "www.kaggle.com"]`；
+    /// - 匹配规则：host 精确匹配或为其子域（`www.kaggle.com` 匹配 `kaggle.com`），端口忽略。
+    #[serde(default)]
+    pub web: WebSection,
+}
+
+/// `[ui]` 段：UI 显示开关（v0.4.6）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiSection {
+    /// 全局思考面板显示开关（缺省 true=显示；UNNI per-mode 覆盖见 [`UnniStyle`]）。
+    #[serde(default = "default_true")]
+    pub show_think: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for UiSection {
+    fn default() -> Self {
+        Self {
+            show_think: default_true(),
+        }
+    }
+}
+
+/// `[web]` 段：网络能力配置（v0.4.6）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSection {
+    /// `web.fetch.public` 允许抓取的域名白名单（缺省空=拒绝全部）。
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -73,11 +115,23 @@ impl Default for KeepStyle {
     }
 }
 
-/// 模式附加配置；旧 unni/r#loop 字段由 serde 忽略（读取不报错），仅 KEEP 预算生效。
+/// 模式附加配置；旧 unni/r#loop 字段由 serde 忽略（读取不报错），仅 KEEP 预算生效；
+/// v0.4.6 起 `[mode_styles.unni] show_think` 恢复为受支持字段（UNNI per-mode 思考显示覆盖）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModeStyles {
     #[serde(default = "default_keep_style")]
     pub keep: KeepStyle,
+    /// UNNI per-mode 覆盖（缺省 None=跟随全局 `[ui] show_think`）。
+    #[serde(default)]
+    pub unni: Option<UnniStyle>,
+}
+
+/// UNNI 模式附加设置（v0.4.6）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct UnniStyle {
+    /// UNNI 思考面板显示覆盖（缺省 None=跟随全局；`false`=UNNI 下关闭思考显示）。
+    #[serde(default)]
+    pub show_think: Option<bool>,
 }
 
 fn default_keep_style() -> KeepStyle {
@@ -88,20 +142,38 @@ impl Default for ModeStyles {
     fn default() -> Self {
         Self {
             keep: default_keep_style(),
+            unni: None,
         }
     }
 }
 
-/// 运行期共享的协作配置快照（协同节点固定洞察 + mix 机制已删除，仅剩 KEEP 预算）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// 运行期共享的协作配置快照（协同节点固定洞察 + mix 机制已删除；KEEP 预算 + v0.4.6
+/// 思考显示开关——全局 `ui.show_think` 与 UNNI per-mode 覆盖）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeStyles {
     pub keep: KeepStyle,
+    /// 全局思考显示开关（来自 `[ui] show_think`）。
+    pub ui_show_think: bool,
+    /// UNNI per-mode 思考显示覆盖（来自 `[mode_styles.unni] show_think`）。
+    pub unni_show_think: Option<bool>,
 }
 
 impl RuntimeStyles {
     pub fn from_config(config: &Config) -> Self {
         Self {
             keep: config.mode_styles.keep,
+            ui_show_think: config.ui.show_think,
+            unni_show_think: config.mode_styles.unni.and_then(|style| style.show_think),
+        }
+    }
+}
+
+impl Default for RuntimeStyles {
+    fn default() -> Self {
+        Self {
+            keep: KeepStyle::default(),
+            ui_show_think: true,
+            unni_show_think: None,
         }
     }
 }
@@ -187,6 +259,8 @@ impl Config {
             mode_styles: ModeStyles::default(),
             default_model: None,
             context: ContextSection::default(),
+            ui: UiSection::default(),
+            web: WebSection::default(),
         }
     }
 
@@ -294,6 +368,9 @@ impl Config {
 /// - `[collaboration] node`（三选一）→ 协同节点固定洞察；
 /// - `[collaboration] mix_thinking` → mix 机制整体删除（LOOP 无 mix）；
 /// - `[mode_styles.unni] node` / `[mode_styles.loop] mix_thinking` → 旧字段迁移已删除。
+///
+/// v0.4.6 注意：`[mode_styles.unni]` 段本身不再是「旧键」——`show_think` 已是受支持字段
+/// （UNNI per-mode 思考显示覆盖）；只有段内旧字段 `node`/`mix_thinking` 仍触发忽略+warn。
 fn warn_legacy_collaboration_keys(content: &str) {
     let Ok(value) = content.parse::<toml::Value>() else {
         return; // 解析失败交给 Config 反序列化报错处理
@@ -312,17 +389,21 @@ fn warn_legacy_collaboration_keys(content: &str) {
         }
     }
     if let Some(styles) = value.get("mode_styles") {
-        if styles.get("unni").is_some() {
-            tracing::warn!(
-                "config: 旧键 [mode_styles.unni] 已忽略（旧字段迁移已删除，不迁移落盘）"
-            );
-            legacy_found = true;
+        if let Some(unni) = styles.get("unni") {
+            if unni.get("node").is_some() || unni.get("mix_thinking").is_some() {
+                tracing::warn!(
+                    "config: 旧键 [mode_styles.unni] node/mix_thinking 已忽略（旧字段迁移已删除，不迁移落盘）"
+                );
+                legacy_found = true;
+            }
         }
-        if styles.get("loop").is_some() {
-            tracing::warn!(
-                "config: 旧键 [mode_styles.loop] 已忽略（旧字段迁移已删除，不迁移落盘）"
-            );
-            legacy_found = true;
+        if let Some(loop_style) = styles.get("loop") {
+            if loop_style.get("mix_thinking").is_some() {
+                tracing::warn!(
+                    "config: 旧键 [mode_styles.loop] mix_thinking 已忽略（旧字段迁移已删除，不迁移落盘）"
+                );
+                legacy_found = true;
+            }
         }
     }
     if legacy_found {
@@ -439,15 +520,111 @@ mod tests {
         let m = ModeStyles::default();
         assert_eq!(m.keep.token_budget, 0);
         assert_eq!(m.keep.time_budget_secs, 0);
+        assert_eq!(m.unni, None, "缺省无 UNNI per-mode 覆盖（跟随全局）");
     }
 
     #[test]
-    fn runtime_styles_carries_keep_budget_only() {
-        // 放弃项 1/2/10：协同节点固定洞察 + mix 删除后，RuntimeStyles 仅剩 KEEP 预算。
+    fn runtime_styles_carries_keep_budget_and_ui_show_think() {
+        // 放弃项 1/2/10：协同节点固定洞察 + mix 删除后，RuntimeStyles 承载 KEEP 预算
+        // + v0.4.6 思考显示开关（全局 + UNNI per-mode 覆盖）。
         let c = Config::default_config();
         let styles = RuntimeStyles::from_config(&c);
         assert_eq!(styles.keep.token_budget, 0);
         assert_eq!(styles.keep.time_budget_secs, 0);
+        assert!(styles.ui_show_think, "缺省显示思考面板（保持既有行为）");
+        assert_eq!(styles.unni_show_think, None, "缺省 UNNI 跟随全局");
+
+        let mut cfg = Config::default_config();
+        cfg.ui.show_think = false;
+        cfg.mode_styles.unni = Some(UnniStyle {
+            show_think: Some(false),
+        });
+        let styles = RuntimeStyles::from_config(&cfg);
+        assert!(!styles.ui_show_think);
+        assert_eq!(styles.unni_show_think, Some(false));
+    }
+
+    #[test]
+    fn ui_section_defaults_to_show_think_true() {
+        let ui = UiSection::default();
+        assert!(ui.show_think, "缺省 show_think=true（思考面板显示）");
+        let parsed: Config = toml::from_str("").unwrap();
+        assert!(
+            parsed.ui.show_think,
+            "空配置反序列化后 show_think 缺省 true"
+        );
+    }
+
+    #[test]
+    fn ui_section_explicit_and_unni_override_parse() {
+        // 缺省：无 [ui] 段 → show_think=true、无 UNNI 覆盖。
+        let parsed: Config = toml::from_str("").unwrap();
+        assert!(parsed.ui.show_think);
+        assert_eq!(parsed.mode_styles.unni, None);
+
+        // 显式：[ui] show_think=false + [mode_styles.unni] show_think=false。
+        let explicit = r#"
+            [ui]
+            show_think = false
+
+            [mode_styles.unni]
+            show_think = false
+        "#;
+        let parsed: Config = toml::from_str(explicit).unwrap();
+        assert!(!parsed.ui.show_think);
+        assert_eq!(
+            parsed.mode_styles.unni,
+            Some(UnniStyle {
+                show_think: Some(false)
+            })
+        );
+
+        // 覆盖：全局 false、UNNI Some(true)（UNNI 下反而显示）。
+        let override_true = r#"
+            [ui]
+            show_think = false
+
+            [mode_styles.unni]
+            show_think = true
+        "#;
+        let parsed: Config = toml::from_str(override_true).unwrap();
+        assert!(!parsed.ui.show_think);
+        assert_eq!(
+            parsed.mode_styles.unni,
+            Some(UnniStyle {
+                show_think: Some(true)
+            })
+        );
+    }
+
+    #[test]
+    fn unni_style_show_think_defaults_none() {
+        // [mode_styles.unni] 段存在但无 show_think → None（跟随全局）。
+        let parsed: Config = toml::from_str("[mode_styles.unni]").unwrap();
+        assert_eq!(
+            parsed.mode_styles.unni,
+            Some(UnniStyle { show_think: None })
+        );
+        assert!(parsed.ui.show_think);
+    }
+
+    #[test]
+    fn web_section_allowed_domains_default_empty_and_parse() {
+        let parsed: Config = toml::from_str("").unwrap();
+        assert!(
+            parsed.web.allowed_domains.is_empty(),
+            "缺省白名单为空 = 拒绝全部域名（安全默认）"
+        );
+
+        let explicit = r#"
+            [web]
+            allowed_domains = ["kaggle.com", "www.kaggle.com"]
+        "#;
+        let parsed: Config = toml::from_str(explicit).unwrap();
+        assert_eq!(
+            parsed.web.allowed_domains,
+            vec!["kaggle.com".to_string(), "www.kaggle.com".to_string()]
+        );
     }
 
     #[test]
@@ -550,6 +727,8 @@ mod tests {
             mode_styles: ModeStyles::default(),
             default_model: None,
             context: ContextSection::default(),
+            ui: UiSection::default(),
+            web: WebSection::default(),
         };
         cfg.save(&p).expect("save ok");
         let loaded = Config::load(&p).expect("load ok").expect("exists");
@@ -584,6 +763,8 @@ mod tests {
             mode_styles: ModeStyles::default(),
             default_model: None,
             context: ContextSection::default(),
+            ui: UiSection::default(),
+            web: WebSection::default(),
         };
         cfg.save(&p).expect("save ok");
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;

@@ -33,17 +33,53 @@ pub fn render(state: &TuiState, frame: &mut Frame) {
     render_input(state, frame, chunks[3]);
 }
 
+/// v0.4.6 think 显示开关纯函数：某模式是否渲染思考面板。
+///
+/// - `mode == "unni"` → `unni_override.unwrap_or(ui_show_think)`（UNNI per-mode 覆盖全局）；
+/// - 其他模式 → 跟随全局 `ui_show_think`（KEEP/LOOP 不受 `[mode_styles.unni]` 覆盖影响）。
+pub fn show_think_for_mode(ui_show_think: bool, unni_override: Option<bool>, mode: &str) -> bool {
+    if mode.eq_ignore_ascii_case("unni") {
+        unni_override.unwrap_or(ui_show_think)
+    } else {
+        ui_show_think
+    }
+}
+
+/// 思考面板相关消息：`Think` 块（「思考」标题+边框），以及未完成的 `Streaming`
+/// 气泡（「思考中」标题+边框）。show_think=false 时两者整体不渲染（含标题与边框）。
+fn is_think_display(msg: &TuiMessage) -> bool {
+    matches!(msg, TuiMessage::Think { .. })
+        || matches!(
+            msg,
+            TuiMessage::Streaming {
+                finished: false,
+                ..
+            }
+        )
+}
+
 fn render_messages(state: &TuiState, frame: &mut Frame, area: Rect) {
     if state.messages.is_empty() {
         return;
     }
+    let show_think = show_think_for_mode(
+        state.ui_show_think,
+        state.unni_show_think,
+        state.current_mode.as_str(),
+    );
     let user_w = area.width as usize;
     let inner_w = area.width.saturating_sub(2) as usize;
     let agent_name = &state.agent_name;
     let heights: Vec<u16> = state
         .messages
         .iter()
-        .map(|m| msg_height(m, user_w, inner_w))
+        .map(|m| {
+            if !show_think && is_think_display(m) {
+                0
+            } else {
+                msg_height(m, user_w, inner_w)
+            }
+        })
         .collect();
     let total_h: u16 = heights.iter().sum();
     let visible_h = area.height;
@@ -52,6 +88,9 @@ fn render_messages(state: &TuiState, frame: &mut Frame, area: Rect) {
         let constraints: Vec<Constraint> = heights.iter().map(|&h| Constraint::Length(h)).collect();
         let rects = Layout::vertical(constraints).split(area);
         for (msg, rect) in state.messages.iter().zip(rects.iter()) {
+            if !show_think && is_think_display(msg) {
+                continue;
+            }
             render_one_message(msg, *rect, frame, agent_name);
         }
     } else {
@@ -86,7 +125,11 @@ fn render_messages(state: &TuiState, frame: &mut Frame, area: Rect) {
             .collect();
         let rects = Layout::vertical(visible_heights).split(area);
         for (i, rect) in rects.iter().enumerate() {
-            render_one_message(&state.messages[render_from + i], *rect, frame, agent_name);
+            let msg = &state.messages[render_from + i];
+            if !show_think && is_think_display(msg) {
+                continue;
+            }
+            render_one_message(msg, *rect, frame, agent_name);
         }
     }
 }
@@ -352,6 +395,86 @@ mod tests {
         s.current_mode = ModeKind::Keep;
         let text = render_to_text(&s);
         assert!(text.contains("KEEP"), "输入栏应显示当前 mode");
+    }
+
+    #[test]
+    fn show_think_for_mode_unni_follows_global_or_override() {
+        // 全局 true / UNNI None → 显示。
+        assert!(show_think_for_mode(true, None, "unni"));
+        // 全局 true / UNNI Some(false) → 隐藏。
+        assert!(!show_think_for_mode(true, Some(false), "unni"));
+        // 全局 false / UNNI None → 隐藏。
+        assert!(!show_think_for_mode(false, None, "unni"));
+        // 全局 false / UNNI Some(true) → UNNI 下反而显示（覆盖优先级最高）。
+        assert!(show_think_for_mode(false, Some(true), "unni"));
+    }
+
+    #[test]
+    fn show_think_for_mode_keep_loop_follow_global_only() {
+        // KEEP/LOOP 跟随全局，不受 [mode_styles.unni] 覆盖影响。
+        assert!(show_think_for_mode(true, Some(false), "keep"));
+        assert!(show_think_for_mode(true, Some(false), "loop"));
+        assert!(!show_think_for_mode(false, Some(true), "keep"));
+        assert!(!show_think_for_mode(false, Some(true), "loop"));
+        // 大小写不敏感。
+        assert!(!show_think_for_mode(true, Some(false), "UNNI"));
+        assert!(show_think_for_mode(true, None, "UNNI"));
+    }
+
+    #[test]
+    fn render_hides_think_panel_when_show_think_false() {
+        // 全局关闭思考显示：Think 块与未完成 Streaming（「思考中」）整体不渲染。
+        let mut s = TuiState::new();
+        s.ui_show_think = false;
+        s.push_streaming("inst-1".into());
+        s.push_think("inst-1", "internal plan text");
+        s.append_delta("inst-1", "visible answer text");
+        let text = render_to_text(&s);
+        assert!(
+            !text.contains("internal plan text"),
+            "think 文本不得上屏, got: {text}"
+        );
+        assert!(
+            !text.contains('思') && !text.contains('考'),
+            "思考面板标题不得出现, got: {text}"
+        );
+        assert!(
+            !text.contains("visible answer text"),
+            "未完成 Streaming 气泡（思考中）也不得渲染, got: {text}"
+        );
+    }
+
+    #[test]
+    fn render_unni_override_false_hides_think_but_keep_shows() {
+        // UNNI per-mode 覆盖 false：UNNI 下思考面板隐藏。
+        let mut unni = TuiState::new();
+        unni.current_mode = ModeKind::Unni;
+        unni.ui_show_think = true;
+        unni.unni_show_think = Some(false);
+        unni.push_streaming("inst-1".into());
+        unni.push_think("inst-1", "hidden in unni");
+        let text = render_to_text(&unni);
+        assert!(!text.contains("hidden in unni"), "got: {text}");
+
+        // 同一覆盖不作用于 KEEP：KEEP 仍显示思考面板。
+        let mut keep = TuiState::new();
+        keep.current_mode = ModeKind::Keep;
+        keep.ui_show_think = true;
+        keep.unni_show_think = Some(false);
+        keep.push_streaming("inst-1".into());
+        keep.push_think("inst-1", "visible in keep");
+        let text = render_to_text(&keep);
+        assert!(text.contains("visible in keep"), "got: {text}");
+    }
+
+    #[test]
+    fn render_think_blocks_show_by_default() {
+        // 缺省（ui_show_think=true）：既有行为不变——think 面板照常显示。
+        let mut s = TuiState::new();
+        s.push_streaming("inst-1".into());
+        s.push_think("inst-1", "default visible");
+        let text = render_to_text(&s);
+        assert!(text.contains("default visible"), "got: {text}");
     }
 
     #[test]
