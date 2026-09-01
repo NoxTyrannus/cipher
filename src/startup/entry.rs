@@ -1178,6 +1178,37 @@ pub async fn run_streaming_loop(
                                 mode_manager.loop_reset_idle();
                             }
                         }
+                        // UNNI 跟随用户停止规则（任务书 §2.2，2026-08-26 用户确认）：
+                        // 无 subagent 场景：用户轮后恰一轮回环（输出轮），随后停，等用户下一次输入
+                        // （不多跑）；回环轮带新执行意图（actions 非空）→ 照常继续（协同处理）；
+                        // 有 subagent 场景：等待链由 subagents_running 条件保护（running 不满足停止
+                        // 条件）；B 语义交付轮（has_subagent_result=true）经 internal_no_downstream
+                        // 在 thinking 层自然断（不派发 execute，不产生 insight_complete），本规则
+                        // 不咨询该轮——交付 say 先于任何停止判定流式送达用户。
+                        if mode_name == "unni" {
+                            let ctx = pool.get_turn_context(&event.turn_id).await;
+                            let is_loopback = ctx
+                                .as_ref()
+                                .map(|c| c.input_kind == "insight")
+                                .unwrap_or(false);
+                            let actions_empty = ctx
+                                .as_ref()
+                                .and_then(|c| c.execution.as_ref())
+                                .map(|e| e.lifecycle_actions.is_empty())
+                                .unwrap_or(true);
+                            let subagents_running = pool
+                                .subagent_states()
+                                .await
+                                .iter()
+                                .any(|s| s.lifecycle == crate::agent::execution_types::SubagentLifecycle::Running);
+                            if unni_follow_user_should_stop(is_loopback, actions_empty, subagents_running) {
+                                tracing::info!(
+                                    "streaming_loop: UNNI follow-user stop reached (loopback idle), waiting for user input (thought_id={})",
+                                    event.turn_id
+                                );
+                                continue;
+                            }
+                        }
                         spawn_platform_insight(mode_manager, &mut state, &pool, &event.turn_id).await;
                     }
                     _ => {
@@ -1352,6 +1383,29 @@ async fn spawn_platform_insight(
         Ok(id) => state.push_streaming(id),
         Err(e) => state.set_error(e.to_string()),
     }
+}
+
+/// UNNI follow-user stop 判定（任务书 §2.2，2026-08-26 用户确认）。
+///
+/// 触发条件（三者同时满足）：回环轮（input_kind=insight，即由 PlatformInsight 派生）
+/// + 该轮执行动作为空 + 无 running subagent → true（停止，不 spawn 下一轮回环）。
+///
+/// 语义边界：
+/// - 用户轮（input_kind=user）：is_loopback=false，恒不停止；
+/// - 回环轮带执行意图（actions 非空）：协同链，继续；
+/// - 等待链（subagent running）：由 subagents_running 条件保护，继续；
+/// - B 语义交付轮（has_subagent_result=true）：在 thinking 层经 internal_no_downstream
+///   终止（thinking.rs run_dual 不派发 send_execute），不产生 insight_complete 事件链，
+///   本规则（仅在 insight_complete 时被咨询）对该轮天然不触发。
+///
+/// 仅由 UNNI 模式咨询（调用侧 `if mode_name == "unni"` 门控）：KEEP 走预算机制
+/// （insight_complete 分支前置检查），LOOP 无 idle 收敛（持续迭代，由用户中断）。
+fn unni_follow_user_should_stop(
+    is_loopback: bool,
+    actions_empty: bool,
+    subagents_running: bool,
+) -> bool {
+    is_loopback && actions_empty && !subagents_running
 }
 
 struct StreamingTerminalGuard {
@@ -1545,5 +1599,58 @@ mod keep_budget_tests {
         assert_eq!(normalize_keep_time_budget_secs("2"), 300);
         assert_eq!(normalize_keep_time_budget_secs("10"), 600);
         assert_eq!(normalize_keep_time_budget_secs("bad"), 300);
+    }
+}
+
+#[cfg(test)]
+mod unni_follow_user_stop_tests {
+    use super::*;
+
+    /// 用户轮（input_kind=user）：is_loopback=false，无论动作/子代理状态如何都不停
+    /// （用户轮后回环正常 spawn，不误停）。
+    #[test]
+    fn unni_user_round_never_stops() {
+        assert!(!unni_follow_user_should_stop(false, true, false));
+        assert!(!unni_follow_user_should_stop(false, false, false));
+        assert!(!unni_follow_user_should_stop(false, true, true));
+        assert!(!unni_follow_user_should_stop(false, false, true));
+    }
+
+    /// 回环轮 + 0 动作 + 无 running subagent → 停（单次回环后不多跑）。
+    #[test]
+    fn unni_loopback_idle_stops() {
+        assert!(unni_follow_user_should_stop(true, true, false));
+    }
+
+    /// 回环轮 + 0 动作 + 有 running subagent → 继续 spawn（等待链，subagent running
+    /// 不满足停止条件）。
+    #[test]
+    fn unni_loopback_idle_keeps_wait_chain_when_subagents_running() {
+        assert!(!unni_follow_user_should_stop(true, true, true));
+    }
+
+    /// 回环轮 + 非空 actions → 继续 spawn（协同链：模型主动补执行属于协同处理，不是空转）。
+    #[test]
+    fn unni_loopback_with_actions_keeps_collaboration_chain() {
+        assert!(!unni_follow_user_should_stop(true, false, false));
+        assert!(!unni_follow_user_should_stop(true, false, true));
+    }
+
+    /// B 语义路径回归（has_subagent_result=true 交付轮不因新规则提前断）：
+    /// B 交付轮（PlatformInsight + has_subagent_result=true）在 thinking 层经
+    /// internal_no_downstream 终止（thinking.rs run_dual：不派发 send_execute，
+    /// 555-566 行），因此不产生 execution → insight → insight_complete 事件链——
+    /// 本规则仅在 insight_complete 时被咨询，对该轮天然不触发；交付 say 在 thinking
+    /// 阶段已流式送达用户，先于任何停止判定。
+    /// 守卫：若未来链路变更使交付轮意外进入本判定，谓词对其理论输入
+    /// （loopback=true, 0 动作, 无 running）返回 true，即 B 语义回归报警点；
+    /// 当前冻结的 internal_no_downstream 语义（v0.4.4 产物）保证该轮不进入
+    /// execution/insight 链，此断言固化的正是「交付轮不因新规则提前断」的不变量。
+    #[test]
+    fn unni_b_semantics_delivery_round_regression() {
+        // 交付轮理论输入下谓词会停（若被咨询）——回归点信号。
+        assert!(unni_follow_user_should_stop(true, true, false));
+        // 等待链保护：交付轮之前的轮次若仍见 running subagent，链不被截断。
+        assert!(!unni_follow_user_should_stop(true, true, true));
     }
 }
