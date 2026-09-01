@@ -153,6 +153,10 @@ impl TuiState {
     }
 
     pub fn push_think(&mut self, id: &str, text: &str) {
+        // v0.4.8 空气泡清理：空文本 Think 不插入（避免产生空「思考」占位）。
+        if text.is_empty() {
+            return;
+        }
         self.scroll_offset = 0;
         if let Some(existing) = self
             .messages
@@ -179,21 +183,21 @@ impl TuiState {
     }
 
     pub fn finalize_stream(&mut self, id: &str) {
-        let Some(index) = self.messages.iter().rposition(
+        if let Some(index) = self.messages.iter().rposition(
             |message| matches!(message, TuiMessage::Streaming { id: mid, .. } if mid == id),
-        ) else {
-            return;
-        };
-
-        let text = match &mut self.messages[index] {
-            TuiMessage::Streaming { content, .. } => std::mem::take(content),
-            _ => unreachable!("streaming index must reference a streaming message"),
-        };
-        if text.is_empty() {
-            self.messages.remove(index);
-        } else {
-            self.messages[index] = TuiMessage::Assistant(text);
+        ) {
+            let text = match &mut self.messages[index] {
+                TuiMessage::Streaming { content, .. } => std::mem::take(content),
+                _ => unreachable!("streaming index must reference a streaming message"),
+            };
+            if text.is_empty() {
+                self.messages.remove(index);
+            } else {
+                self.messages[index] = TuiMessage::Assistant(text);
+            }
         }
+        // v0.4.8 空气泡清理：同 id 的空文本 Think 占位随收尾一并移除。
+        self.remove_empty_think_for_id(id);
     }
 
     pub fn mark_cancelled(&mut self, id: &str) {
@@ -205,6 +209,8 @@ impl TuiState {
             content.clear();
             content.push_str("[已中断]");
         }
+        // v0.4.8 空气泡清理：同 id 的空文本 Think 占位一并移除。
+        self.remove_empty_think_for_id(id);
     }
 
     pub fn mark_error(&mut self, id: &str, err: &str) {
@@ -219,6 +225,16 @@ impl TuiState {
             *error = Some(err.to_string());
             *finished = true;
         }
+        // v0.4.8 空气泡清理：同 id 的空文本 Think 占位一并移除。
+        self.remove_empty_think_for_id(id);
+    }
+
+    /// 移除指定 id 的空文本 Think 占位（v0.4.8 空气泡清理）。
+    /// 仅移除 `text` 为空的 Think；非空思考内容不受影响。
+    fn remove_empty_think_for_id(&mut self, id: &str) {
+        self.messages.retain(
+            |m| !matches!(m, TuiMessage::Think { id: mid, text } if mid == id && text.is_empty()),
+        );
     }
 
     pub fn input_push(&mut self, c: char) {
@@ -439,6 +455,72 @@ mod tests {
             TuiMessage::Assistant(text) => assert_eq!(text, "answer"),
             other => panic!("expected Assistant after Think, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn push_think_empty_text_is_not_inserted() {
+        // v0.4.8 空气泡清理：空文本 Think 不插入。
+        let mut s = TuiState::new();
+        s.push_think("inst-1", "");
+        assert!(s.messages.is_empty(), "空文本 Think 不应插入");
+    }
+
+    #[test]
+    fn finalize_stream_removes_empty_think_placeholder() {
+        // v0.4.8 空气泡清理：同 id 空文本 Think 占位随 finalize 一并移除，非空 Think 保留。
+        let mut s = TuiState::new();
+        s.push_streaming("inst-1".into());
+        // push_think 已拒绝空文本，故注入占位模拟历史状态。
+        s.messages.push(TuiMessage::Think {
+            id: "inst-1".into(),
+            text: String::new(),
+        });
+        s.finalize_stream("inst-1");
+        assert!(s.messages.is_empty(), "空 Think 占位应随 finalize 移除");
+
+        // 对照：非空 Think 在 finalize 后保留。
+        let mut s2 = TuiState::new();
+        s2.push_streaming("inst-1".into());
+        s2.push_think("inst-1", "real plan");
+        s2.finalize_stream("inst-1");
+        assert_eq!(s2.messages.len(), 1);
+        assert!(matches!(&s2.messages[0], TuiMessage::Think { .. }));
+    }
+
+    #[test]
+    fn mark_cancelled_removes_empty_think_placeholder() {
+        let mut s = TuiState::new();
+        s.push_streaming("inst-1".into());
+        s.messages.push(TuiMessage::Think {
+            id: "inst-1".into(),
+            text: String::new(),
+        });
+        s.mark_cancelled("inst-1");
+        assert!(
+            !s.messages.iter().any(|m| matches!(
+                m,
+                TuiMessage::Think { text, .. } if text.is_empty()
+            )),
+            "mark_cancelled 应移除空 Think 占位"
+        );
+    }
+
+    #[test]
+    fn mark_error_removes_empty_think_placeholder() {
+        let mut s = TuiState::new();
+        s.push_streaming("inst-1".into());
+        s.messages.push(TuiMessage::Think {
+            id: "inst-1".into(),
+            text: String::new(),
+        });
+        s.mark_error("inst-1", "timeout");
+        assert!(
+            !s.messages.iter().any(|m| matches!(
+                m,
+                TuiMessage::Think { text, .. } if text.is_empty()
+            )),
+            "mark_error 应移除空 Think 占位"
+        );
     }
 
     #[test]
