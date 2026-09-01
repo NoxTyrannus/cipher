@@ -224,6 +224,8 @@ pub fn import_factory_defaults(conn: &duckdb::Connection, data_dir: &Path) -> Re
     // 主 agent 上下文排除内部管理分子：subagent.* 由执行中台专属平台 agent 使用，
     // usage_method.observe 由洞察平台专属 agent 使用，permission.* 由执行中台（或
     // 获递归授权的 subagent）使用——三者都不进入主 agent 上下文。
+    // v0.4.6 追加：web.* 网络能力（web.fetch.public）同样不默认授权（安全默认——
+    // 白名单 + permission.grant 双重把关后才可调用）。
     let agent_capability_allowlist: Vec<String> = capability_ids
         .iter()
         .filter(|id| {
@@ -231,6 +233,7 @@ pub fn import_factory_defaults(conn: &duckdb::Connection, data_dir: &Path) -> Re
                 && !id.starts_with("db.")
                 && !id.starts_with("subagent.")
                 && !id.starts_with("permission.")
+                && !id.starts_with("web.")
                 && *id != "usage_method.observe"
         })
         .cloned()
@@ -973,8 +976,53 @@ mod tests {
             .collect();
         assert!(!ids.iter().any(|id| id.starts_with("subagent.")));
         assert!(!ids.iter().any(|id| id.starts_with("permission.")));
+        assert!(!ids.iter().any(|id| id.starts_with("web.")));
         assert!(!ids.contains(&"usage_method.observe"));
         assert!(ids.contains(&"file.read"));
+    }
+
+    #[test]
+    fn web_fetch_public_registered_but_not_in_any_allowlist() {
+        // v0.4.6：web.fetch.public 注册为 enabled base capability（permission.grant 可授），
+        // 但不得 seed 进任何 allowlist（主 agent / 平台 / 模板 / 记忆 agent 均不加）。
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        crate::data::duckdb::schema::create_all_tables(&conn).unwrap();
+        let dir = tempdir().unwrap();
+        ensure_default_capabilities(dir.path()).unwrap();
+        import_factory_defaults(&conn, dir.path()).unwrap();
+
+        let (count, enabled): (i64, bool) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(enabled), false) FROM base_capability \
+                 WHERE id = 'web.fetch.public'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "web.fetch.public 应注册为 base capability");
+        assert!(enabled, "enabled=true 才能被 permission.grant 授予");
+
+        let mut stmt = conn
+            .prepare("SELECT CAST(capability_allowlist AS VARCHAR) FROM agent")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>();
+        for text in rows {
+            let allowlist: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let ids: Vec<&str> = allowlist
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|value| value.as_str())
+                .collect();
+            assert!(
+                !ids.contains(&"web.fetch.public"),
+                "任何 agent allowlist 都不得默认含 web.fetch.public"
+            );
+        }
     }
 
     #[test]

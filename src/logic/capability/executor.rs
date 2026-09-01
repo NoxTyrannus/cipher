@@ -54,6 +54,8 @@ pub struct CapabilityExecutor {
     ///
     /// 使用读写锁共享引用：TC 在把 executor 包装为 Arc 之后仍可安装 runtime hook。
     subagent_spawn_hook: std::sync::RwLock<Option<Arc<dyn SubagentSpawnHook>>>,
+    /// `web.fetch.public` 域名白名单（来自 `[web] allowed_domains`，缺省空=拒绝全部）。
+    web_allowed_domains: Vec<String>,
 }
 
 const ALLOWED_TABLES: &[&str] = &[
@@ -116,6 +118,7 @@ impl CapabilityExecutor {
             "permission.grant" | "permission.revoke" => {
                 return self.execute_permission(actor_id, builtin_name, input)
             }
+            "web.fetch.public" => return self.execute_web_fetch(actor_id, input),
             _ => {
                 return Err(AgentError::NotFound(format!(
                     "builtin executor: {builtin_name}"
@@ -135,7 +138,13 @@ impl CapabilityExecutor {
             reload_tx: None,
             storage_root: None,
             subagent_spawn_hook: std::sync::RwLock::new(None),
+            web_allowed_domains: Vec::new(),
         }
+    }
+
+    /// 设置 `web.fetch.public` 域名白名单（`[web] allowed_domains`）。
+    pub fn set_web_allowed_domains(&mut self, domains: Vec<String>) {
+        self.web_allowed_domains = domains;
     }
 
     pub fn set_duckdb(&mut self, db: Arc<std::sync::Mutex<duckdb::Connection>>) {
@@ -257,6 +266,22 @@ impl CapabilityExecutor {
             .map_err(|e| AgentError::Script(format!("permission reclaim: {e}")))?;
         self.trigger_reload("agent");
         Ok(())
+    }
+
+    /// 分发 `web.fetch.public` 到 builtin 实现（v0.4.6）。
+    ///
+    /// 执行在 workspace 无关（正文仅返回内存，不落盘）；每次调用全量审计落库
+    /// `web_fetch_audit`（纯审计表，不进 Registry）。授权由调用方
+    /// （CapabilityService 按 agent allowlist / permission.grant）把关。
+    fn execute_web_fetch(&self, actor_id: &str, input: &Schema) -> Result<Schema> {
+        let db = self.duckdb.as_ref().ok_or_else(|| {
+            AgentError::NotFound("web.fetch.public: duckdb not configured".into())
+        })?;
+        let conn = db.lock().map_err(|e| {
+            AgentError::Script(format!("builtin web.fetch.public: lock poisoned: {e}"))
+        })?;
+        crate::logic::builtin::web_fetch::execute(&conn, &self.web_allowed_domains, actor_id, input)
+            .map_err(|e| AgentError::Script(format!("builtin web.fetch.public: {e}")))
     }
 
     /// 分发六个 `subagent.*` 分子与 `usage_method.observe` 到 `subagent_capability` 模块。

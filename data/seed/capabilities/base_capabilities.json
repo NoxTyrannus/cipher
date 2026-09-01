@@ -1527,6 +1527,46 @@
     "version": "1.0.0",
     "enabled": true,
     "partition": "system"
+  },
+  {
+    "id": "web.fetch.public",
+    "name": "Fetch Public Web Page",
+    "type": "function",
+    "description": "抓取公开网页正文（v0.4.6）：仅 HTTPS、域名白名单（[web] allowed_domains，缺省空=拒绝全部）、拒绝重定向、响应体 ≤200KB、10s 超时；正文 UTF-8 截断 50K 字符返回（不做 HTML→Markdown 转换）；每次调用全量写 web_fetch_audit 审计表。不默认授权给任何 agent——须经 permission.grant 显式授予",
+    "schema_in": {
+      "type": "object",
+      "properties": {
+        "url": {"type": "string"}
+      },
+      "required": ["url"],
+      "additionalProperties": false
+    },
+    "schema_out": {
+      "type": "object",
+      "properties": {
+        "success": {"type": "boolean"},
+        "url": {"type": "string"},
+        "http_code": {"type": "integer"},
+        "bytes": {"type": "integer"},
+        "extracted_chars": {"type": "integer"},
+        "content": {"type": "string"},
+        "error": {
+          "type": "object",
+          "properties": {
+            "code": {"type": "string"},
+            "message": {"type": "string"}
+          },
+          "required": ["code", "message"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["success"],
+      "additionalProperties": false
+    },
+    "executor": "builtin:web.fetch.public",
+    "version": "1.0.0",
+    "enabled": true,
+    "partition": "system"
   }
 ]
 

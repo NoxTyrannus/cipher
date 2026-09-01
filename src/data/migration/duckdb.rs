@@ -22,6 +22,7 @@ const TARGET_TABLES: &[&str] = &[
     "model",
     "permission_grants",
     "usage_method",
+    "web_fetch_audit",
 ];
 const LEGACY_TABLES: &[&str] = &[
     "agent",
@@ -65,6 +66,28 @@ CREATE TABLE IF NOT EXISTS permission_grants (
     status TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"#
+    };
+}
+
+/// web.fetch.public 网络抓取审计表（v0.4.6）：每次调用全量落库（纯审计，不进 Registry）。
+///
+/// 宏在编译期展开为字符串字面量：既供 `TARGET_SCHEMA`（concat 拼接）使用，
+/// 也供 `ensure_web_fetch_audit_table`（旧数据目录幂等补建）使用，保证两处 DDL 一致。
+/// `error` 为空字符串 = 成功；非空 = 结构化错误 code。
+macro_rules! web_fetch_audit_ddl {
+    () => {
+        r#"
+CREATE TABLE IF NOT EXISTS web_fetch_audit (
+    id TEXT PRIMARY KEY,
+    called_at TEXT NOT NULL,
+    called_by TEXT NOT NULL,
+    url TEXT NOT NULL,
+    http_code INTEGER,
+    bytes INTEGER,
+    extracted_chars INTEGER,
+    error TEXT
 );
 "#
     };
@@ -138,6 +161,7 @@ CREATE TABLE usage_method (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );"#,
     permission_grants_ddl!(),
+    web_fetch_audit_ddl!(),
 );
 
 const MODEL_COLUMNS: &[&str] = &[
@@ -219,6 +243,16 @@ const PERMISSION_GRANT_COLUMNS: &[&str] = &[
     "ttl_secs",
     "updated_at",
     "used_at",
+];
+const WEB_FETCH_AUDIT_COLUMNS: &[&str] = &[
+    "bytes",
+    "called_at",
+    "called_by",
+    "error",
+    "extracted_chars",
+    "http_code",
+    "id",
+    "url",
 ];
 
 type CapabilityIds = BTreeSet<String>;
@@ -413,6 +447,7 @@ pub fn validate_current_duckdb_connection(
     require_exact_columns(connection, "composite_capability", COMPOSITE_COLUMNS)?;
     require_exact_columns(connection, "usage_method", USAGE_COLUMNS)?;
     require_exact_columns(connection, "permission_grants", PERMISSION_GRANT_COLUMNS)?;
+    require_exact_columns(connection, "web_fetch_audit", WEB_FETCH_AUDIT_COLUMNS)?;
 
     let table_counts = table_counts(connection, TARGET_TABLES)?;
     Ok(DuckdbValidationReport { table_counts })
@@ -428,6 +463,19 @@ pub fn ensure_permission_grants_table(connection: &duckdb::Connection) -> Result
     connection
         .execute_batch(permission_grants_ddl!())
         .map_err(|error| migration_error(format!("ensure permission_grants table: {error}")))?;
+    Ok(())
+}
+
+/// 打开既有（v0.4.5 及以前六表）数据目录时幂等补建 `web_fetch_audit` 审计表。
+///
+/// 全新库经 `TARGET_SCHEMA` 已建表；已部署数据目录的 `cipher.duckdb` 缺少该表，
+/// 若不在 `validate_current_duckdb_connection` 之前补齐，表集精确校验会失败导致
+/// 启动报错。本函数在 bootstrap 打开连接后调用（CREATE TABLE IF NOT EXISTS 幂等，
+/// 与 TARGET_SCHEMA 的 DDL 完全一致）。模式同 `permission_grants` 的双路径。
+pub fn ensure_web_fetch_audit_table(connection: &duckdb::Connection) -> Result<()> {
+    connection
+        .execute_batch(web_fetch_audit_ddl!())
+        .map_err(|error| migration_error(format!("ensure web_fetch_audit table: {error}")))?;
     Ok(())
 }
 
@@ -1643,11 +1691,11 @@ mod tests {
     }
 
     #[test]
-    fn fresh_candidate_has_exact_six_empty_tables() {
+    fn fresh_candidate_has_exact_seven_empty_tables() {
         let (_temporary, _source, staging) = roots();
         let report = build_duckdb_candidate(None, &staging).unwrap();
         assert!(report.fresh);
-        assert_eq!(report.target_counts.len(), 6);
+        assert_eq!(report.target_counts.len(), 7);
         assert!(report.target_counts.values().all(|count| *count == 0));
         let validation = validate_current_duckdb(&staging.join(CANDIDATE_DUCKDB_FILE)).unwrap();
         assert_eq!(validation.table_counts, report.target_counts);

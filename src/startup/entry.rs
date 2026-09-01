@@ -268,6 +268,8 @@ pub async fn run_normal(
         ex.set_thought_store(std::sync::Arc::clone(&shared_thought_store));
         ex.set_duckdb(std::sync::Arc::clone(&exec_duckdb_conn));
         ex.set_storage_root(app_state.paths.storage_root());
+        // v0.4.6 web.fetch.public 域名白名单（[web] allowed_domains，缺省空=拒绝全部）。
+        ex.set_web_allowed_domains(config.web.allowed_domains.clone());
         std::sync::Arc::new(ex)
     };
 

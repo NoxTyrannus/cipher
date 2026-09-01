@@ -19,7 +19,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn creates_exactly_six_tables() {
+    fn creates_exactly_seven_tables() {
         let connection = duckdb::Connection::open_in_memory().expect("open DuckDB");
         create_all_tables(&connection).expect("create schema");
 
@@ -44,6 +44,37 @@ mod tests {
                 "model",
                 "permission_grants",
                 "usage_method",
+                "web_fetch_audit",
+            ]
+        );
+    }
+
+    #[test]
+    fn web_fetch_audit_table_has_expected_columns() {
+        let connection = duckdb::Connection::open_in_memory().expect("open DuckDB");
+        create_all_tables(&connection).expect("create schema");
+        let mut statement = connection
+            .prepare(
+                "SELECT column_name FROM information_schema.columns \
+                 WHERE table_schema = 'main' AND table_name = 'web_fetch_audit' ORDER BY column_name",
+            )
+            .expect("prepare column query");
+        let columns: Vec<String> = statement
+            .query_map([], |row| row.get(0))
+            .expect("query columns")
+            .collect::<duckdb::Result<_>>()
+            .expect("read columns");
+        assert_eq!(
+            columns,
+            [
+                "bytes",
+                "called_at",
+                "called_by",
+                "error",
+                "extracted_chars",
+                "http_code",
+                "id",
+                "url",
             ]
         );
     }

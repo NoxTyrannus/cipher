@@ -49,6 +49,15 @@ pub fn bootstrap(data_dir: &Path) -> Result<AppState, AgentError> {
             secure_duckdb_files(&duckdb_path),
         ));
     }
+    // v0.4.6 旧数据目录升级：六表库无 web_fetch_audit 审计表，同样先幂等补建
+    // （否则表集精确校验——TARGET_TABLES 七表——会失败导致启动报错）。
+    if let Err(error) = super::migration::ensure_web_fetch_audit_table(&conn) {
+        drop(conn);
+        return Err(merge_permission_error(
+            error,
+            secure_duckdb_files(&duckdb_path),
+        ));
+    }
 
     if let Err(error) = validate_current_duckdb_connection(&conn) {
         drop(conn);
@@ -126,6 +135,7 @@ mod tests {
             "composite_capability",
             "usage_method",
             "permission_grants",
+            "web_fetch_audit",
         ] {
             let mut stmt = app
                 .duckdb

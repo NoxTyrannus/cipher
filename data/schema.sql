@@ -87,3 +87,16 @@ CREATE TABLE IF NOT EXISTS permission_grants (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- web.fetch.public 网络抓取审计表 (v0.4.6): 每次调用全量落库（纯审计，不进 Registry）。
+-- error 为空字符串 = 成功；非空 = 结构化错误 code（如 domain_not_allowed / redirect_rejected / size_limit_exceeded）。
+CREATE TABLE IF NOT EXISTS web_fetch_audit (
+    id TEXT PRIMARY KEY,
+    called_at TEXT NOT NULL,
+    called_by TEXT NOT NULL,
+    url TEXT NOT NULL,
+    http_code INTEGER,
+    bytes INTEGER,
+    extracted_chars INTEGER,
+    error TEXT
+);

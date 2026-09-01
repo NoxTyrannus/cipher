@@ -37,6 +37,7 @@ pub const BUILTIN_EXECUTORS: &[&str] = &[
     "builtin:subagent.wake",
     "builtin:subagent.delete",
     "builtin:usage_method.observe",
+    "builtin:web.fetch.public",
 ];
 
 fn fail(msg: impl Into<String>) -> Result<Value, String> {
