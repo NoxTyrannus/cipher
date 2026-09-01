@@ -1654,7 +1654,7 @@ mod tests {
                 id: "shell.exec".to_string(),
                 name: "Execute Shell".to_string(),
                 cap_type: "function".to_string(),
-                description: "Run a shell command in the sandbox".to_string(),
+                description: "Run a shell command in the workspace".to_string(),
                 schema_in: serde_json::json!({}),
                 schema_out: serde_json::json!({}),
                 executor: "builtin:shell.exec".to_string(),
@@ -1711,7 +1711,7 @@ mod tests {
         assert!(section.contains("Full Capability Registry"));
         assert!(section.contains("Reference only"));
         assert!(section.contains("`shell.exec`"));
-        assert!(section.contains("Run a shell command in the sandbox"));
+        assert!(section.contains("Run a shell command in the workspace"));
         assert!(section.contains("`composite.probe`"));
     }
 

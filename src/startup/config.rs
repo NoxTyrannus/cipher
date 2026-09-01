@@ -58,6 +58,11 @@ pub struct Config {
     pub insight: MergeSection,
     #[serde(default)]
     pub memory: MergeSection,
+
+    /// 文件系统访问配置（v0.4.8）：`[fs] read_roots` 追加文件读根（缺省空 = 仅 workspace_root）。
+    /// 写根维持 workspace_root 不变；追加根并入 `file.read` 允许根列表（HostContext）。
+    #[serde(default)]
+    pub fs: FsSection,
 }
 
 /// 三中台合并开关段（v0.4.7）：`merge_enabled` 缺省 true。
@@ -94,6 +99,15 @@ impl Default for UiSection {
             show_think: default_true(),
         }
     }
+}
+
+/// `[fs]` 段：文件系统访问根配置（v0.4.8）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsSection {
+    /// 追加的文件读根（缺省空 = 仅 workspace_root）。写根维持 workspace_root 不变。
+    /// 追加的根并入 `file.read` 的允许根列表（见 [`HostContext::for_workspace_with_roots`]）。
+    #[serde(default)]
+    pub read_roots: Vec<PathBuf>,
 }
 
 /// `[web]` 段：网络能力配置（v0.4.6）。
@@ -291,6 +305,7 @@ impl Config {
             execution: MergeSection::default(),
             insight: MergeSection::default(),
             memory: MergeSection::default(),
+            fs: FsSection::default(),
         }
     }
 
@@ -658,6 +673,32 @@ mod tests {
     }
 
     #[test]
+    fn fs_section_read_roots_default_empty_and_parse_roundtrip() {
+        // 缺省：[fs] 读根为空 = 仅 workspace_root（与现状完全一致）。
+        let parsed: Config = toml::from_str("").unwrap();
+        assert!(
+            parsed.fs.read_roots.is_empty(),
+            "缺省 read_roots 为空 = 仅 workspace_root"
+        );
+
+        // 显式：[fs] read_roots 可解析为路径列表。
+        let explicit = r#"
+            [fs]
+            read_roots = ["/srv/data", "/mnt/shared"]
+        "#;
+        let parsed: Config = toml::from_str(explicit).unwrap();
+        assert_eq!(
+            parsed.fs.read_roots,
+            vec![PathBuf::from("/srv/data"), PathBuf::from("/mnt/shared")]
+        );
+
+        // roundtrip：序列化后再反序列化保持一致。
+        let serialized = toml::to_string(&parsed.fs).unwrap();
+        let decoded: FsSection = toml::from_str(&serialized).unwrap();
+        assert_eq!(decoded, parsed.fs);
+    }
+
+    #[test]
     fn keep_style_defaults() {
         let b = KeepStyle::default();
         assert_eq!(b.token_budget, 0);
@@ -790,6 +831,7 @@ mod tests {
             execution: MergeSection::default(),
             insight: MergeSection::default(),
             memory: MergeSection::default(),
+            fs: FsSection::default(),
         };
         cfg.save(&p).expect("save ok");
         let loaded = Config::load(&p).expect("load ok").expect("exists");
@@ -829,6 +871,7 @@ mod tests {
             execution: MergeSection::default(),
             insight: MergeSection::default(),
             memory: MergeSection::default(),
+            fs: FsSection::default(),
         };
         cfg.save(&p).expect("save ok");
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
