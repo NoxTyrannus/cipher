@@ -59,7 +59,6 @@ impl Drop for TerminalGuard {
 pub struct TuiBackend {
     guard: Option<TerminalGuard>,
     state: TuiState,
-    cancel: bool,
 }
 
 impl TuiBackend {
@@ -67,7 +66,6 @@ impl TuiBackend {
         Self {
             guard: None,
             state: TuiState::new(),
-            cancel: false,
         }
     }
 
@@ -125,10 +123,7 @@ impl UiBackend for TuiBackend {
                 match key_event_to_action(key) {
                     TuiAction::ForwardTab => return Ok(TAB_STR.to_string()),
                     TuiAction::BackwardTab => return Ok(BACKTAB_SENTINEL.to_string()),
-                    TuiAction::Cancel => {
-                        self.cancel = true;
-                        return Ok(String::new());
-                    }
+                    TuiAction::Cancel => continue,
                     TuiAction::Quit => return Ok(QUIT_SENTINEL.to_string()),
                     TuiAction::Char(c) => {
                         self.state.input_push(c);
@@ -151,9 +146,5 @@ impl UiBackend for TuiBackend {
                 }
             }
         }
-    }
-
-    fn check_cancel(&self) -> bool {
-        self.cancel
     }
 }

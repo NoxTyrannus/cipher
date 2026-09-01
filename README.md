@@ -95,6 +95,21 @@ cipher
 
 ---
 
+## 快捷键
+
+| 按键 | 作用 |
+|---|---|
+| Esc | 退出 |
+| Ctrl+C / Ctrl+D | 退出 |
+| `/exit` | 退出 |
+| F4 | 取消当前实例 |
+| Tab / Shift+Tab | 切换模式（UNNI → KEEP → LOOP） |
+| Enter | 提交输入 |
+| Backspace | 删除字符 |
+| PageUp / PageDown | 上下滚动对话流（可回翻历史） |
+
+---
+
 ## 三种工作模式
 
 Cipher 提供三种工作模式，Tab 键循环切换（UNNI → KEEP → LOOP → UNNI），适应不同协作深度。

@@ -37,7 +37,8 @@ pub fn key_event_to_action(key: KeyEvent) -> TuiAction {
     match key.code {
         KeyCode::Tab => TuiAction::ForwardTab,
         KeyCode::BackTab => TuiAction::BackwardTab,
-        KeyCode::Esc => TuiAction::Cancel,
+        KeyCode::Esc => TuiAction::Quit,
+        KeyCode::F(4) => TuiAction::Cancel,
         KeyCode::Enter => TuiAction::Submit,
         KeyCode::Backspace => TuiAction::Backspace,
         KeyCode::PageUp => TuiAction::ScrollUp,
@@ -82,8 +83,13 @@ mod tests {
     }
 
     #[test]
-    fn esc_maps_to_cancel() {
-        assert_eq!(key_event_to_action(key(KeyCode::Esc)), TuiAction::Cancel);
+    fn esc_maps_to_quit() {
+        assert_eq!(key_event_to_action(key(KeyCode::Esc)), TuiAction::Quit);
+    }
+
+    #[test]
+    fn f4_maps_to_cancel() {
+        assert_eq!(key_event_to_action(key(KeyCode::F(4))), TuiAction::Cancel);
     }
 
     #[test]

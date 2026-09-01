@@ -674,9 +674,6 @@ pub async fn run_main_loop(
     .await?;
     loop {
         let input = tui.wait_for_input().await?;
-        if tui.check_cancel() {
-            break;
-        }
         if input == "\t" {
             mode_manager.cycle_mode().await?;
             tui.show_mode_status(
@@ -996,9 +993,6 @@ pub async fn run_streaming_loop(
                                     continue;
                                 }
                                 state.push_user(input.clone());
-
-                                // 用户输入最高优先级：打断后台空转/反思循环。
-                                mode_manager.cancel_all_active();
 
                                 match mode_manager.spawn(input).await {
                                     Ok(id) => {

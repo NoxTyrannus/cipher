@@ -11,6 +11,4 @@ pub trait UiBackend: Send + Sync {
     async fn show_error(&mut self, error: &str) -> Result<(), AgentError>;
 
     async fn wait_for_input(&mut self) -> Result<String, AgentError>;
-
-    fn check_cancel(&self) -> bool;
 }
