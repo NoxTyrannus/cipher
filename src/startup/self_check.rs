@@ -1,6 +1,6 @@
 use super::config::Config;
 #[cfg(test)]
-use super::config::{ContextSection, MergeSection, ModeStyles, UiSection, WebSection};
+use super::config::{ContextSection, FsSection, MergeSection, ModeStyles, UiSection, WebSection};
 use crate::common::AgentError;
 use crate::data::ModelRow;
 use crate::mode_runtime::ModeKind;
@@ -237,6 +237,7 @@ mod tests {
             execution: MergeSection::default(),
             insight: MergeSection::default(),
             memory: MergeSection::default(),
+            fs: FsSection::default(),
         }
     }
 

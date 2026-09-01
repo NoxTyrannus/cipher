@@ -463,7 +463,7 @@
       "id": "code.exec",
       "name": "Execute Code",
       "type": "function",
-      "description": "在沙箱内执行代码片段",
+      "description": "执行代码片段（受工作区权限约束）",
       "schema_in": {
         "type": "object",
         "properties": {

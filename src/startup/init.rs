@@ -44,6 +44,7 @@ mod tests {
             execution: crate::startup::config::MergeSection::default(),
             insight: crate::startup::config::MergeSection::default(),
             memory: crate::startup::config::MergeSection::default(),
+            fs: crate::startup::config::FsSection::default(),
         };
         saved.save(&path).unwrap();
 

@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn display_script_includes_prefix_and_message() {
-        let e = AgentError::Script("sandbox denied fs.write".to_string());
+        let e = AgentError::Script("write denied".to_string());
         let s = e.to_string();
         assert!(s.contains("script error:"), "got: {s}");
     }

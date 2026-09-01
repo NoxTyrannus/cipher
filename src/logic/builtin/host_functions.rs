@@ -45,7 +45,7 @@ fn resolve_sandbox_path(path_str: &str, roots: &[PathBuf]) -> std::result::Resul
         resolved.starts_with(&canonical_root)
     });
     if !is_allowed {
-        return Err("path not in sandbox roots".to_string());
+        return Err("path is not within the allowed workspace roots".to_string());
     }
     Ok(resolved)
 }
@@ -58,7 +58,7 @@ fn ensure_within(path: &Path, roots: &[PathBuf]) -> Result<(), String> {
     if ok {
         Ok(())
     } else {
-        Err("path not in sandbox roots".to_string())
+        Err("path is not within the allowed workspace roots".to_string())
     }
 }
 
@@ -829,6 +829,46 @@ mod tests {
         let ctx = ctx(&root);
         let r = host_file_read(&ctx, &serde_json::json!({"path": "../secret"})).unwrap();
         assert_eq!(r["success"], false);
+    }
+
+    #[test]
+    fn file_read_with_extra_read_roots_allows_append_root() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let extra = dir.path().join("extra");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        std::fs::write(extra.join("note.txt"), "from-extra").unwrap();
+
+        // v0.4.8：[fs] read_roots 追加后，file.read 可读追加根内文件。
+        let ctx = HostContext::for_workspace_with_roots(ws, vec![extra.clone()]);
+        let r = host_file_read(
+            &ctx,
+            &serde_json::json!({"path": extra.join("note.txt").to_string_lossy()}),
+        )
+        .unwrap();
+        assert_eq!(r["content"], "from-extra", "追加根内文件应可读，got: {r}");
+    }
+
+    #[test]
+    fn file_read_outside_all_roots_rejected_even_with_extra_roots() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        let extra = dir.path().join("extra");
+        let outsider = dir.path().join("outsider");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        std::fs::create_dir_all(&outsider).unwrap();
+        std::fs::write(outsider.join("secret.txt"), "s").unwrap();
+
+        // 配置了追加根仍拒绝所有根之外的越界读。
+        let ctx = HostContext::for_workspace_with_roots(ws, vec![extra]);
+        let r = host_file_read(
+            &ctx,
+            &serde_json::json!({"path": outsider.join("secret.txt").to_string_lossy()}),
+        )
+        .unwrap();
+        assert_eq!(r["success"], false, "根外读必须被拒绝，got: {r}");
     }
 
     #[test]
