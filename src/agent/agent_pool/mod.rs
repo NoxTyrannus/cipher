@@ -207,15 +207,44 @@ impl AgentPool {
 
     pub async fn send_trigger(&self, turn_id: &str, reason: &str) -> Result<(), String> {
         self.message_bus
-            .send_trigger_backpressure(TriggerEvent {
-                turn_id: turn_id.to_string(),
-                reason: reason.to_string(),
-            })
+            .send_trigger_backpressure(TriggerEvent::round(turn_id, reason))
             .await
     }
 
     pub fn message_bus(&self) -> MessageBus {
         self.message_bus.clone()
+    }
+
+    /// v0.4.9 P2：退出时给三中台 + trigger 任务发关断信号。
+    ///
+    /// 采用方案 a（F3：`AgentMessage::Cancel` 是中台间消息，本次不动；仅新增 `Shutdown`
+    /// 变体，只增不改成 Cancel）：向 execution/insight/memory 通道 try_send `Shutdown`，
+    /// 向 trigger 通道 try_send `TriggerEvent::Shutdown`，各平台在循环中收到后 `break`
+    /// 自然退出。try_send 失败（通道满）时仅 warn，由 entry.rs 保留的 5s 超时兜底，
+    /// 不阻塞退出。
+    pub fn shutdown_channels(&self) {
+        for (name, result) in [
+            (
+                "execution",
+                self.message_bus.send_to_execution(AgentMessage::Shutdown),
+            ),
+            (
+                "insight",
+                self.message_bus.send_to_insight(AgentMessage::Shutdown),
+            ),
+            (
+                "memory",
+                self.message_bus.send_to_memory(AgentMessage::Shutdown),
+            ),
+        ] {
+            if let Err(m) = result {
+                tracing::warn!("agent_pool: shutdown_channels: {name} send Shutdown failed: {m:?}");
+            }
+        }
+        if let Err(e) = self.message_bus.send_trigger(TriggerEvent::shutdown()) {
+            tracing::warn!("agent_pool: shutdown_channels: trigger send Shutdown failed: {e:?}");
+        }
+        tracing::info!("agent_pool: shutdown_channels — 三中台 + trigger 关断信号已发出");
     }
 
     /// 注册核心平台身份（思考引擎实例 / 执行 / 洞察 / 记忆中台），仅启动装配使用。

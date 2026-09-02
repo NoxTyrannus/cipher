@@ -5,6 +5,26 @@ use tokio::sync::mpsc;
 pub struct TriggerEvent {
     pub turn_id: String,
     pub reason: String,
+    /// v0.4.9 P2 退出关断：true = 关断信号（trigger 任务收到后 `break` 自然退出）。
+    pub shutdown: bool,
+}
+
+impl TriggerEvent {
+    pub fn round(turn_id: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            turn_id: turn_id.into(),
+            reason: reason.into(),
+            shutdown: false,
+        }
+    }
+
+    pub fn shutdown() -> Self {
+        Self {
+            turn_id: String::new(),
+            reason: "shutdown".to_string(),
+            shutdown: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

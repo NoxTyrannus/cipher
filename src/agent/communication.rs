@@ -9,15 +9,30 @@ pub use crate::agent::execution_types::{
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AgentMessage {
-    Execute { turn_id: String },
+    Execute {
+        turn_id: String,
+    },
 
-    MessageDeliver { turn_id: String, message: String },
+    MessageDeliver {
+        turn_id: String,
+        message: String,
+    },
 
-    ExecutionDone { turn_id: String },
+    ExecutionDone {
+        turn_id: String,
+    },
 
-    InsightDone { turn_id: String },
+    InsightDone {
+        turn_id: String,
+    },
 
-    Cancel { turn_id: String },
+    Cancel {
+        turn_id: String,
+    },
+
+    /// v0.4.9 P2 退出关断信号：三中台收到后 `break` 自然退出。
+    /// 仅新增不改动 `Cancel`（F3：Cancel 是中台间消息，本次不动）。
+    Shutdown,
 }
 
 #[derive(Debug, Clone)]
