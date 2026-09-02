@@ -962,9 +962,6 @@ pub async fn run_streaming_loop(
                             mode_manager.cycle_mode_back().await?;
                             state.current_mode = mode_manager.current_kind();
                         }
-                        TuiAction::Cancel => {
-                            mode_manager.cancel_latest_active();
-                        }
                         TuiAction::Char(c) => {
                             state.input_push(c);
                         }

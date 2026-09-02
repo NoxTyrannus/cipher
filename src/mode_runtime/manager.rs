@@ -313,21 +313,6 @@ impl ModeManager {
         Ok(id)
     }
 
-    pub fn cancel_all_active(&mut self) {
-        for (_, (cancel, _handle)) in self.active.iter() {
-            cancel.notify_one();
-        }
-    }
-
-    pub fn cancel_latest_active(&mut self) {
-        for inst in self.pending_instances.iter().rev() {
-            if let Some((cancel, _handle)) = self.active.get(&inst.id) {
-                cancel.notify_one();
-                return;
-            }
-        }
-    }
-
     pub fn active_is_empty(&self) -> bool {
         self.active.is_empty()
     }
@@ -465,6 +450,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     struct PendingStreamProvider;
 
     #[async_trait::async_trait]
@@ -663,6 +649,7 @@ mod tests {
         contents
     }
 
+    #[allow(dead_code)]
     fn find_named_file(root: &Path, filename: &str) -> Option<std::path::PathBuf> {
         for entry in fs::read_dir(root).ok()? {
             let path = entry.ok()?.path();
@@ -826,69 +813,5 @@ mod tests {
             output.terminal_state,
             ThinkingTerminalState::Failed { .. }
         ));
-    }
-
-    #[tokio::test]
-    async fn streaming_cancel_persists_before_cancelled_signal() {
-        let temporary = tempfile::tempdir().unwrap();
-        let mut providers = ProviderRegistry::new();
-        providers.register(Arc::new(PendingStreamProvider));
-        let mut manager = make_mgr_at(temporary.path(), providers);
-        let (mut stream_rx, _outcome_rx) = manager.take_channels();
-
-        let thought_id = manager
-            .spawn("cancel this stream".to_string())
-            .await
-            .unwrap();
-        manager.cancel_latest_active();
-        let (signal_id, signal) =
-            tokio::time::timeout(std::time::Duration::from_secs(1), stream_rx.recv())
-                .await
-                .expect("cancel signal should arrive")
-                .expect("stream channel should remain open");
-        assert_eq!(signal_id, thought_id);
-        assert_eq!(signal, StreamChunk::Cancelled);
-
-        let timeline = manager.thought_store().recover().unwrap();
-        let output = timeline.groups[0].contexts[0].output.as_ref().unwrap();
-        assert!(matches!(
-            output.terminal_state,
-            ThinkingTerminalState::Cancelled { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn streaming_cancel_persistence_failure_reports_outcome_for_cleanup() {
-        let temporary = tempfile::tempdir().unwrap();
-        let mut providers = ProviderRegistry::new();
-        providers.register(Arc::new(PendingStreamProvider));
-        let mut manager = make_mgr_at(temporary.path(), providers);
-        let (mut stream_rx, mut outcome_rx) = manager.take_channels();
-
-        let thought_id = manager
-            .spawn("cancel after storage disappears".to_string())
-            .await
-            .unwrap();
-        let input_path = find_named_file(manager.thought_store().root(), "input.json")
-            .expect("spawn should persist its input before returning");
-        fs::remove_dir_all(input_path.parent().unwrap()).unwrap();
-
-        manager.cancel_latest_active();
-        let (signal_id, signal) =
-            tokio::time::timeout(std::time::Duration::from_secs(1), stream_rx.recv())
-                .await
-                .expect("persistence error signal should arrive")
-                .expect("stream channel should remain open");
-        assert_eq!(signal_id, thought_id);
-        assert!(matches!(signal, StreamChunk::Error(_)));
-
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), outcome_rx.recv())
-            .await
-            .expect("persistence error outcome should arrive")
-            .expect("outcome channel should remain open");
-        assert_eq!(outcome.id, thought_id);
-        assert!(outcome.result.is_err());
-        manager.bookkeep(outcome, "");
-        assert!(!manager.active.contains_key(&thought_id));
     }
 }

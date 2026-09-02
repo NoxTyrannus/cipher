@@ -102,7 +102,6 @@ cipher
 | Esc | 退出 |
 | Ctrl+C / Ctrl+D | 退出 |
 | `/exit` | 退出 |
-| F4 | 取消当前实例 |
 | Tab / Shift+Tab | 切换模式（UNNI → KEEP → LOOP） |
 | Enter | 提交输入 |
 | Backspace | 删除字符 |
