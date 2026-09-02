@@ -17,7 +17,7 @@ const CAPABILITY_SEED_DIR: &str = "seed/capabilities";
 /// 版本判定只作用于 `base_capabilities.json`（唯一版本化的种子文件）：
 /// - 新格式：`{"seed_version": N, "capabilities": [...]}`；
 /// - 旧格式（v0.4.6 及以前）：纯数组，视为 version 1 → 触发重写。
-pub const CAPABILITY_SEED_VERSION: u32 = 2;
+pub const CAPABILITY_SEED_VERSION: u32 = 3;
 
 pub const COGNITIVE_SEED_MANIFEST: &str = include_str!("../../data/seed/cognitive/manifest.json");
 pub const COGNITIVE_SEED_NODES: &str = include_str!("../../data/seed/cognitive/nodes.json");
@@ -1352,16 +1352,16 @@ mod tests {
         assert_eq!(count, 1, "旧目录升级后注册表补齐 web.fetch.public");
     }
 
-    /// 最新目录（version 2 文件）：不重写——文件保持原样（用户/历史内容不被覆盖）。
+    /// 最新目录（version 3 文件）：不重写——文件保持原样（用户/历史内容不被覆盖）。
     #[test]
-    fn version2_dir_not_rewritten() {
+    fn latest_version_dir_not_rewritten() {
         let dir = tempdir().unwrap();
         ensure_default_capabilities(dir.path()).unwrap();
         let base_path = dir.path().join("seed/capabilities/base_capabilities.json");
 
-        // 篡改为另一个 version 2 内容（不含 web.fetch.public）——模拟已升级目录的本地状态。
+        // 篡改为另一个 version 3 内容（不含 web.fetch.public）——模拟已升级目录的本地状态。
         let custom = serde_json::json!({
-            "seed_version": 2,
+            "seed_version": 3,
             "capabilities": [
                 {"id": "file.read", "name": "Read File", "type": "function",
                  "description": "custom", "schema_in": {}, "schema_out": {},
@@ -1378,11 +1378,75 @@ mod tests {
         assert_eq!(
             value["seed_version"].as_u64(),
             Some(CAPABILITY_SEED_VERSION as u64),
-            "version 2 文件保持原版本号"
+            "最新版本文件保持原版本号"
+        );
+        assert!(!text.contains("web.fetch.public"), "最新版本文件不得被重写");
+    }
+
+    /// v2 → v3 升级（v0.4.8 种子版本迭代）：version 2 文件（旧 code.exec 描述、
+    /// 无最新描述变更）应被重写为 version 3 官方内容（含新描述），新描述在
+    /// import_factory_defaults 中以 INSERT OR REPLACE 落库（种子权威语义，不保留
+    /// 用户改过的描述——用户已确认基础建设更新无条件覆盖）。
+    #[test]
+    fn version2_dir_rewritten_to_latest_with_new_description() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        crate::data::duckdb::schema::create_all_tables(&conn).unwrap();
+        let dir = tempdir().unwrap();
+        let seed_root = dir.path().join("seed/capabilities");
+        std::fs::create_dir_all(&seed_root).unwrap();
+
+        // 模拟 v0.4.7 用户的 version 2 文件：旧 code.exec 描述。
+        let custom = serde_json::json!({
+            "seed_version": 2,
+            "capabilities": [
+                {"id": "code.exec", "name": "Execute Code", "type": "function",
+                 "description": "在沙箱内执行代码片段", "schema_in": {}, "schema_out": {},
+                 "executor": "builtin:code.exec", "version": "1.0.0",
+                 "enabled": true, "partition": "system"},
+                {"id": "file.read", "name": "Read File", "type": "function",
+                 "description": "读取文件内容", "schema_in": {}, "schema_out": {},
+                 "executor": "builtin:file.read", "version": "1.0.0",
+                 "enabled": true, "partition": "system"}
+            ]
+        });
+        std::fs::write(
+            seed_root.join("base_capabilities.json"),
+            serde_json::to_string(&custom).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            base_capabilities_seed_version(&seed_root.join("base_capabilities.json")),
+            2,
+            "v2 文件应判定为 version 2"
+        );
+
+        // 启动链：ensure → 重写为内置最新（version 3）。
+        ensure_default_capabilities(dir.path()).unwrap();
+
+        let rewritten = std::fs::read_to_string(seed_root.join("base_capabilities.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
+        assert_eq!(
+            value["seed_version"].as_u64(),
+            Some(CAPABILITY_SEED_VERSION as u64),
+            "v2 文件应被重写为最新版本"
         );
         assert!(
-            !text.contains("web.fetch.public"),
-            "version 2 文件不得被重写"
+            rewritten.contains("执行代码片段（受工作区权限约束）"),
+            "重写后 code.exec 描述应为新描述"
+        );
+
+        // import 落库：INSERT OR REPLACE 无条件覆盖 → code.exec 新描述进库。
+        import_factory_defaults(&conn, dir.path()).unwrap();
+        let desc: String = conn
+            .query_row(
+                "SELECT description FROM base_capability WHERE id = 'code.exec'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            desc, "执行代码片段（受工作区权限约束）",
+            "code.exec 描述应升级为新描述"
         );
     }
 

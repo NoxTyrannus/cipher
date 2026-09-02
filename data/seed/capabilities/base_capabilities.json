@@ -1,5 +1,5 @@
 {
-  "seed_version": 2,
+  "seed_version": 3,
   "capabilities": [
     {
       "id": "file.read",
