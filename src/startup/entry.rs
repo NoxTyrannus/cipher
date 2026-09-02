@@ -12,7 +12,7 @@ use crate::startup::manifest::{self, UpgradeChoice};
 use crate::ui::backend::UiBackend;
 use crate::ui::tui::config_panel::{ActionResult, ConfigView, DbRequest};
 use crate::ui::tui::event::{key_event_to_action, TuiAction, BACKTAB_SENTINEL};
-use crate::ui::tui::state::{TuiMode, TuiState};
+use crate::ui::tui::state::{TuiMessage, TuiMode, TuiState};
 use secrecy::SecretString;
 use std::fs::OpenOptions;
 use std::io::IsTerminal;
@@ -525,6 +525,11 @@ pub async fn run_normal(
         let mut trigger_rx = receivers.trigger_rx;
         tracing::info!("trigger_receiver: started, polling trigger_rx");
         while let Some(event) = trigger_rx.recv().await {
+            // v0.4.9 P2 退出关断：trigger 任务收到 Shutdown 后 break 自然退出。
+            if event.shutdown {
+                tracing::info!("trigger_receiver: received Shutdown, exiting");
+                break;
+            }
             tracing::info!(
                 "trigger_receiver: received TriggerEvent(turn_id={}, reason={})",
                 event.turn_id,
@@ -629,6 +634,11 @@ pub async fn run_normal(
         })
         .await?;
     }
+
+    // v0.4.9 P2：退出时给四平台任务发关断信号（关闭三中台 + trigger 通道），
+    // 使其 `rx.recv()` 返回 None 自然退出，消除/显著减少下面 5s 超时等待；
+    // 下方 5s 超时保留作为兜底（关断失败时不阻塞退出）。
+    mode_manager.shutdown_channels();
 
     let mut platform_handles = vec![execution_task, insight_task, memory_task, trigger_task];
     for handle in platform_handles.drain(..) {
@@ -739,6 +749,8 @@ pub async fn run_streaming_loop(
     if let Some(name) = load_default_agent_display_name(&app.duckdb) {
         state.agent_name = name;
     }
+    // v0.4.9 退出快照恢复：TuiState 初始化后、主循环前注入「上次中断」消息（失败→空启动）。
+    restore_snapshot(&mut state, app.paths.storage_root());
     let mut guard = StreamingTerminalGuard::new()?;
 
     let mut pool_state_rx = pool.subscribe_state();
@@ -1233,6 +1245,11 @@ pub async fn run_streaming_loop(
             }
         }
     }
+
+    // v0.4.9 退出冻结：should_exit break 后、平台收尾前，把未完成实例的 think/say 片段
+    // 冻结并原子写快照（失败仅日志 + 继续退出，不阻塞退出）。
+    freeze_and_save_snapshot(&state, mode_manager, app.paths.storage_root());
+
     Ok(())
 }
 
@@ -1412,6 +1429,116 @@ fn unni_follow_user_should_stop(
     subagents_running: bool,
 ) -> bool {
     is_loopback && actions_empty && !subagents_running
+}
+
+/// v0.4.9 退出快照：从 `state.messages` 提取未完成实例的 think/say 片段。
+///
+/// 依赖：`mode_manager.active_ids()`（仍在跑、output 未终态落盘的实例 id）。
+/// think/say 片段分别取自 `TuiMessage::Think.text` 与 `TuiMessage::Streaming.content`；
+/// phase 为最小信息性判断（say 有内容→"say"；仅 think→"think"；否则"executing"）。
+fn snapshot_incomplete(
+    state: &TuiState,
+    mode_manager: &ModeManager,
+) -> Vec<crate::data::session_snapshot::IncompleteInstance> {
+    let mut incomplete = Vec::new();
+    for id in mode_manager.active_ids() {
+        let think = state
+            .messages
+            .iter()
+            .find_map(|m| {
+                if let TuiMessage::Think { id: mid, text } = m {
+                    if mid == &id {
+                        Some(text.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+        let say = state
+            .messages
+            .iter()
+            .find_map(|m| {
+                if let TuiMessage::Streaming {
+                    id: mid, content, ..
+                } = m
+                {
+                    if mid == &id {
+                        Some(content.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+        let phase = if !say.is_empty() {
+            "say"
+        } else if !think.is_empty() {
+            "think"
+        } else {
+            "executing"
+        };
+        incomplete.push(crate::data::session_snapshot::IncompleteInstance::new(
+            id, phase, think, say,
+        ));
+    }
+    incomplete
+}
+
+/// v0.4.9 退出冻结 + 保存（在 `should_exit` break 后、平台收尾前调用）。
+///
+/// 无未完成实例 → 不写快照（干净退出，避免空快照噪音）；有则原子写。
+/// 保存失败仅日志 + 继续退出（降级层 1），不阻塞退出。
+fn freeze_and_save_snapshot(state: &TuiState, mode_manager: &ModeManager, storage_root: &Path) {
+    let incomplete = snapshot_incomplete(state, mode_manager);
+    if incomplete.is_empty() {
+        tracing::debug!("session_snapshot: no incomplete instances, skip save");
+        return;
+    }
+    let snapshot = crate::data::session_snapshot::SessionSnapshot::new(
+        mode_manager.current_name().to_lowercase(),
+        incomplete,
+    );
+    if let Err(e) = crate::data::session_snapshot::save_snapshot(storage_root, &snapshot) {
+        tracing::warn!("session_snapshot: save failed (降级继续退出): {e}");
+    } else {
+        tracing::info!(
+            "session_snapshot: saved {} incomplete instance(s) -> {}",
+            snapshot.incomplete.len(),
+            crate::data::session_snapshot::snapshot_path(storage_root).display()
+        );
+    }
+}
+
+/// v0.4.9 启动恢复（TuiState 初始化后、主循环前）。
+///
+/// 读快照 → 将 each incomplete 以可见形式注入消息流 → 轮转快照（防陈旧）。
+/// 失败/缺失/schema 不兼容 → 空启动（降级层 2/3，仅日志提示）。
+fn restore_snapshot(state: &mut TuiState, storage_root: &Path) {
+    let Some(snapshot) = crate::data::session_snapshot::load_snapshot(storage_root) else {
+        tracing::info!("session_snapshot: no restorable snapshot, empty start");
+        return;
+    };
+    for inst in &snapshot.incomplete {
+        // 最小呈现：用户视角「能看到上次没说完的话」即达标。
+        let text = if !inst.say_partial.is_empty() {
+            format!("[上次中断] {}", inst.say_partial)
+        } else if !inst.think_partial.is_empty() {
+            format!("[上次中断·思考阶段] {}", inst.think_partial)
+        } else {
+            "[上次中断] 上次会话在思考阶段中断。".to_string()
+        };
+        state.push_assistant(text);
+    }
+    crate::data::session_snapshot::clear_snapshot(storage_root);
+    tracing::info!(
+        "session_snapshot: restored {} interrupted instance(s), snapshot rotated",
+        snapshot.incomplete.len()
+    );
 }
 
 struct StreamingTerminalGuard {

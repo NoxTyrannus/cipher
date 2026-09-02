@@ -112,15 +112,17 @@ impl MemoryPlatform {
                 // v0.4.7 机制式合并：批 = 连续处理组；逐轮 handle_memory（每轮独立三输出
                 // 组装+沉淀+source_refs）；飞行缓冲消除队列空隙；状态改变立即发。
                 let mut queue = crate::agent::batch_queue::PendingBatchQueue::<AgentMessage>::new();
-                loop {
+                // v0.4.9 P2：退出关断——平台收到 Shutdown 后 break 'platform 自然退出。
+                'platform: loop {
                     let Some(batch) = queue.next_batch(&mut self.memory_rx).await else {
-                        break;
+                        break 'platform;
                     };
                     queue.absorb_channel(&mut self.memory_rx);
                     let batch_len = batch.len();
                     for (i, msg) in batch.into_iter().enumerate() {
                         let turn_id = match msg {
                             AgentMessage::InsightDone { turn_id } => turn_id,
+                            AgentMessage::Shutdown => break 'platform,
                             other => {
                                 tracing::warn!("memory_platform: unexpected message: {other:?}");
                                 continue;
@@ -209,6 +211,7 @@ impl MemoryPlatform {
                                 .update_platform_status(|s| s.memory_active = None)
                                 .await;
                         }
+                        AgentMessage::Shutdown => break,
                         other => {
                             tracing::warn!("memory_platform: unexpected message: {:?}", other);
                         }

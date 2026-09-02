@@ -83,9 +83,10 @@ impl InsightPlatform {
                 // v0.4.7 机制式合并：批 = 连续处理组；批内逐轮 handle_insight（逐轮洞察发布、
                 // 逐轮回环时序不变）；飞行缓冲消除队列空隙。
                 let mut queue = crate::agent::batch_queue::PendingBatchQueue::<AgentMessage>::new();
-                loop {
+                // v0.4.9 P2：退出关断——平台收到 Shutdown 后 break 'platform 自然退出。
+                'platform: loop {
                     let Some(batch) = queue.next_batch(&mut self.insight_rx).await else {
-                        break;
+                        break 'platform;
                     };
                     queue.absorb_channel(&mut self.insight_rx);
                     let batch_len = batch.len();
@@ -95,6 +96,7 @@ impl InsightPlatform {
                             AgentMessage::Cancel { .. } | AgentMessage::MessageDeliver { .. } => {
                                 continue;
                             }
+                            AgentMessage::Shutdown => break 'platform,
                             other => {
                                 tracing::warn!("insight_platform: unexpected message: {other:?}");
                                 continue;
@@ -151,6 +153,7 @@ impl InsightPlatform {
                         }
                         AgentMessage::Cancel { .. } => {}
                         AgentMessage::MessageDeliver { .. } => {}
+                        AgentMessage::Shutdown => break,
                         other => {
                             tracing::warn!("insight_platform: unexpected message: {other:?}");
                         }

@@ -344,6 +344,17 @@ impl ModeManager {
     pub fn remove_active(&mut self, id: &str) {
         self.active.remove(id);
     }
+
+    /// v0.4.9 退出快照：返回当前未完成（仍在跑、output 未终态落盘）实例的 id 列表。
+    /// `active` 映射的 key 即正在运行的思考实例 id。
+    pub fn active_ids(&self) -> Vec<String> {
+        self.active.keys().cloned().collect()
+    }
+
+    /// v0.4.9 P2：关闭三中台 + trigger 消息通道，让平台任务 `rx.recv()` 返回 None 自然退出。
+    pub fn shutdown_channels(&self) {
+        self.agent_pool.shutdown_channels();
+    }
 }
 
 #[cfg(test)]

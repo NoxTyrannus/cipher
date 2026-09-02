@@ -151,9 +151,10 @@ impl ExecutionPlatform {
                 // LLM 调用、独立 ExecutionOutput、逐轮触发 ExecutionDone/execution_complete）；
                 // 飞行缓冲消除队列空隙（处理中到达的 Execute 立即进下一批连续处理）。
                 let mut queue = crate::agent::batch_queue::PendingBatchQueue::<AgentMessage>::new();
-                loop {
+                // v0.4.9 P2：退出关断——平台收到 Shutdown 后 break 'platform 自然退出。
+                'platform: loop {
                     let Some(batch) = queue.next_batch(&mut self.execution_rx).await else {
-                        break;
+                        break 'platform;
                     };
                     queue.absorb_channel(&mut self.execution_rx);
                     let batch_len = batch.len();
@@ -161,6 +162,7 @@ impl ExecutionPlatform {
                         let turn_id = match msg {
                             AgentMessage::Execute { turn_id } => turn_id,
                             AgentMessage::Cancel { .. } => continue,
+                            AgentMessage::Shutdown => break 'platform,
                             other => {
                                 tracing::warn!("execution_platform: unexpected message: {other:?}");
                                 continue;
@@ -228,6 +230,7 @@ impl ExecutionPlatform {
                                 .await;
                         }
                         AgentMessage::Cancel { .. } => {}
+                        AgentMessage::Shutdown => break,
                         other => {
                             tracing::warn!("execution_platform: unexpected message: {other:?}");
                         }
