@@ -85,18 +85,18 @@ impl TuiState {
     }
 
     pub fn push_user(&mut self, text: String) {
-        self.scroll_offset = 0;
+        self.reset_scroll_if_at_tail();
         self.current_error = None;
         self.messages.push(TuiMessage::User(text));
     }
 
     pub fn push_assistant(&mut self, text: String) {
-        self.scroll_offset = 0;
+        self.reset_scroll_if_at_tail();
         self.messages.push(TuiMessage::Assistant(text));
     }
 
     pub fn push_streaming(&mut self, id: String) {
-        self.scroll_offset = 0;
+        self.reset_scroll_if_at_tail();
         self.messages.push(TuiMessage::Streaming {
             id,
             content: String::new(),
@@ -131,6 +131,21 @@ impl TuiState {
         self.scroll_offset = 0;
     }
 
+    /// v0.4.9 滚动保持：新消息到达时的视口跟随策略。
+    ///
+    /// - 用户当前在尾部（`scroll_offset == 0`）：维持尾部跟随（offset 保持 0，新消息出现
+    ///   时视口贴在最新内容上）；
+    /// - 用户已滚走（`scroll_offset > 0`）：保留当前 `scroll_offset`，不把视口拉回尾部。
+    ///
+    /// 修复 v0.4.9「PageUp/PageDown 滚动失效」：此前 `push_*` 无条件把 `scroll_offset`
+    /// 置 0，思考流每 chunk 的 `push_think` 一到，用户刚滚到的位置就被拉回尾部。
+    fn reset_scroll_if_at_tail(&mut self) {
+        if self.scroll_offset != 0 {
+            return;
+        }
+        self.scroll_offset = 0;
+    }
+
     pub fn push_request(&mut self, text: String) {
         self.messages.push(TuiMessage::Request(text));
     }
@@ -157,7 +172,7 @@ impl TuiState {
         if text.is_empty() {
             return;
         }
-        self.scroll_offset = 0;
+        self.reset_scroll_if_at_tail();
         if let Some(existing) = self
             .messages
             .iter_mut()
@@ -534,5 +549,55 @@ mod tests {
         let taken = s.take_input();
         assert_eq!(taken, "h");
         assert!(s.input.is_empty(), "take 后缓冲清空");
+    }
+
+    #[test]
+    fn new_message_while_scrolled_does_not_reset_offset() {
+        // v0.4.9 滚动失效根因回归：用户滚走后（scroll_offset > 0），新消息到达
+        // （尤其思考流每 chunk 的 push_think）不应把视口拉回尾部。
+        let mut s = TuiState::new();
+        for i in 0..10 {
+            s.push_user(format!("msg {i}"));
+        }
+        s.scroll_up(15);
+        let offset = s.scroll_offset;
+        assert!(offset > 0, "前置：用户必须已滚离尾部");
+
+        s.push_think("inst-1", "deep thoughts");
+        assert_eq!(
+            s.scroll_offset, offset,
+            "滚动中到达 push_think 不应重置 scroll_offset（否则滚动失效）"
+        );
+
+        s.push_assistant("reply".into());
+        assert_eq!(
+            s.scroll_offset, offset,
+            "滚动中到达 push_assistant 不应重置 scroll_offset"
+        );
+
+        s.push_streaming("inst-2".into());
+        assert_eq!(
+            s.scroll_offset, offset,
+            "滚动中到达 push_streaming 不应重置 scroll_offset"
+        );
+    }
+
+    #[test]
+    fn new_message_at_tail_follows_tail() {
+        // v0.4.9：用户仍在尾部（scroll_offset == 0）时，新消息到达应保持尾部跟随（offset 仍为 0）。
+        let mut s = TuiState::new();
+        assert_eq!(s.scroll_offset, 0);
+
+        s.push_think("inst-1", "thought");
+        assert_eq!(s.scroll_offset, 0, "尾部时 push_think 应保持尾部");
+
+        s.push_assistant("reply".into());
+        assert_eq!(s.scroll_offset, 0, "尾部时 push_assistant 应保持尾部");
+
+        s.push_user("user".into());
+        assert_eq!(s.scroll_offset, 0, "尾部时 push_user 应保持尾部");
+
+        s.push_streaming("inst-2".into());
+        assert_eq!(s.scroll_offset, 0, "尾部时 push_streaming 应保持尾部");
     }
 }

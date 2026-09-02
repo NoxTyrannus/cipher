@@ -138,11 +138,21 @@ fn render_messages(state: &TuiState, frame: &mut Frame, area: Rect) {
                 break;
             }
         }
-        let visible_heights: Vec<Constraint> = heights[render_from..]
-            .iter()
-            .map(|&h| Constraint::Length(h))
-            .collect();
-        let rects = Layout::vertical(visible_heights).split(area);
+        // v0.4.9 滚动剪辑修复（疑点②）：从 render_from 起，只取能放进视口的消息，
+        // 最后一条按剩余高度裁剪。此前直接把 `heights[render_from..]`（总高可远超
+        // visible_h）整体喂给 `Layout::vertical`，ratatui 会对超出的 Length 约束过度
+        // 分配，导致滚动后渲染出碎片化/串行的非连续消息（用户滚动失效的另一表现）。
+        let mut to_render: Vec<Constraint> = Vec::new();
+        let mut consumed = 0u16;
+        let mut n = render_from;
+        while n < heights.len() && consumed < visible_h {
+            let h = heights[n];
+            let take = h.min(visible_h - consumed);
+            to_render.push(Constraint::Length(take));
+            consumed += take;
+            n += 1;
+        }
+        let rects = Layout::vertical(to_render).split(area);
         for (i, rect) in rects.iter().enumerate() {
             let msg = &state.messages[render_from + i];
             if !show_think && is_think_display(msg) {
@@ -691,6 +701,35 @@ mod tests {
         assert!(
             text.contains("msg 29"),
             "滚回尾部应显示最新历史 msg 29, got: {text}"
+        );
+    }
+
+    #[test]
+    fn render_new_message_while_scrolled_keeps_oldest_visible() {
+        // v0.4.9 滚动失效回归（端到端）：用户滚到历史顶部后，思考流/收尾新消息到达，
+        // 视口不应跳回尾部——最老消息仍应可见。
+        let mut s = TuiState::new();
+        for i in 0..20 {
+            s.push_user(format!("msg {i}"));
+        }
+        s.scroll_up(100_000); // 滚到顶
+        let before = render_to_text(&s);
+        assert!(
+            before.contains("msg 0"),
+            "前置：滚到顶应显示最老历史 msg 0, got: {before}"
+        );
+
+        // 新消息到达：每 chunk 的 push_think（思考流）+ 收尾 push_assistant。
+        s.push_think("inst-1", "deep thoughts");
+        s.push_assistant("reply here".into());
+        let text = render_to_text(&s);
+        assert!(
+            text.contains("msg 0"),
+            "滚动中到达新消息应保持视口位置（msg 0 仍可见）, got: {text}"
+        );
+        assert!(
+            !text.contains("reply here"),
+            "滚动中到达新消息不应跳回尾部显示最新消息, got: {text}"
         );
     }
 
