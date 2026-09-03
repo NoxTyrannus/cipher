@@ -134,6 +134,30 @@ pub async fn run_setup(
     Ok(())
 }
 
+/// v0.4.9 自愈：在 `bootstrap()` 校验注册表之前，把能力/agent 种子导入活动 DuckDB。
+///
+/// 背景：`bootstrap()` 打开 DuckDB 后立刻 `load_all_into_memory → registry.validate()`。若旧
+/// 数据目录（v1 纯数组种子时代）的 `base_capability` 缺 v0.4.4+（permission.grant/revoke）与
+/// v0.4.6（web.fetch.public）新增能力，而 `agent.execution-platform` 的 allowlist 已引用
+/// `permission.grant`，则校验先于种子导入失败 → `cipher run` 启动即挂。`cipher setup` 能救
+/// （setup 顺序种子在前），但用户日常走 `cipher run`。
+///
+/// 本辅助复刻 bootstrap 的入口（`prepare_data_dir` 幂等，bootstrap 内部同款）拿到活动
+/// generation 的 DuckDB 路径，然后：先写能力种子文件（无需 DB，v0.4.7 版本化覆盖旧纯数组），
+/// 再打开 DuckDB 确保表存在（种子导入只插行不建表，缺表会失败），最后 `import_factory_defaults`
+/// 与 `upgrade_seed_deltas`（均幂等）。全新目录在此仅提前种入能力/agent，不改变后续
+/// 「未配置模型 → 提示 setup」行为。
+fn ensure_capability_seed_before_bootstrap(data_dir: &Path) -> Result<(), AgentError> {
+    let paths = crate::data::migration::prepare_data_dir(data_dir)?;
+    crate::data::cognitive_seed::ensure_default_capabilities(data_dir)?;
+    let conn = duckdb::Connection::open(paths.duckdb())
+        .map_err(|e| AgentError::Bootstrap(format!("open DuckDB for pre-bootstrap seed: {e}")))?;
+    crate::data::duckdb::create_all_tables(&conn)?;
+    crate::data::cognitive_seed::import_factory_defaults(&conn, data_dir)?;
+    crate::data::cognitive_seed::upgrade_seed_deltas(&conn, data_dir)?;
+    Ok(())
+}
+
 pub async fn run_normal(
     config_path: PathBuf,
     data_dir_override: Option<PathBuf>,
@@ -142,6 +166,8 @@ pub async fn run_normal(
 
     super::config::migrate_data_dir()?;
     let config = load_config(&config_path, data_dir_override)?;
+    // v0.4.9 自愈：旧数据目录先种入能力/agent 种子（幂等），bootstrap 内的注册表校验才能通过。
+    ensure_capability_seed_before_bootstrap(&config.data_dir)?;
     let mut app_state = crate::data::bootstrap(&config.data_dir)?;
     let unified_root = crate::startup::manifest::unified_root();
     ensure_default_prompts_interactive(&unified_root)?;
