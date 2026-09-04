@@ -901,9 +901,52 @@ fn method_invoke(
     } else {
         format!("\n\n## 方法经验\n{}", observations.join("\n"))
     };
+    let hard_steps: Vec<String> = metadata
+        .get("hard_steps")
+        .and_then(|value| value.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let hard_steps_text = if hard_steps.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\n## 硬性执行步骤（MUST DO，按顺序执行）\n{}",
+            hard_steps
+                .iter()
+                .enumerate()
+                .map(|(i, s)| format!("{}. {s}", i + 1))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    let forbidden_urls: Vec<String> = metadata
+        .get("forbidden_urls")
+        .and_then(|value| value.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let forbidden_text = if forbidden_urls.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\n## 禁止路径（FORBIDDEN，不要尝试）\n{}",
+            forbidden_urls
+                .iter()
+                .map(|s| format!("- {s}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
     let method_prompt = format!(
-        "你是“{}”方法的执行单元。请先完整阅读下方方法文档，再组织可用的原子/分子能力完成任务。\n\n## 方法文档\n{}{}\n\n## 本次任务\n{}",
-        method_id, full_document, method_experience, task_input
+        "你是“{}”方法的执行单元。请先完整阅读下方方法文档，再严格按照硬性步骤组织可用的原子/分子能力完成任务。\n\n## 方法文档\n{}{}{}{}\n\n## 本次任务\n{}",
+        method_id, full_document, method_experience, hard_steps_text, forbidden_text, task_input
     );
 
     // 3. 创建方法执行子代理；allowlist 先为空，所需能力随后自动授予。

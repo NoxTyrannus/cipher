@@ -103,7 +103,33 @@
           "source_ref": "R1_EXEC"
         }
       ],
-      "allow_observe_append": true
+      "allow_observe_append": true,
+      "hard_steps": [
+        "必须先调用 https://www.kaggle.com/api/i/competitions.CompetitionService/GetCompetition?competitionId=147734 获取基础信息。",
+        "必须调用 https://www.kaggle.com/api/i/competitions.PageService/ListPages?competitionId=147734 获取全部页面。",
+        "ListPages 原始响应约108KB，超过 web.fetch.public 的50K字符截断；必须用 shell.exec + curl 保存完整 JSON 到 /tmp/pages.json，再用 file.read / text.grep 解析。",
+        "必须从 pages 中提取 name 为 Description / Evaluation / Timeline / Prizes / How to Play / Getting Started / Quick Start Agent / data-description / FAQ / rules 的完整 content。",
+        "最终报告必须包含：比赛名称、简介、评价指标、数据文件说明、时间线、奖励、规则、如何玩、快速开始、FAQ、提交限制。"
+      ],
+      "forbidden_urls": [
+        "https://www.kaggle.com/api/v1/competitions/kaggriculture",
+        "https://www.kaggle.com/competitions/kaggriculture/json",
+        "https://m.kaggle.com/",
+        "https://web.archive.org/",
+        "https://github.com/Kaggle/kaggriculture"
+      ],
+      "required_sections": [
+        "Description",
+        "Evaluation",
+        "Timeline",
+        "Prizes",
+        "How to Play",
+        "Getting Started",
+        "Quick Start Agent",
+        "data-description",
+        "FAQ",
+        "rules"
+      ]
     }
   }
 ]
