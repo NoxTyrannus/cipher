@@ -387,7 +387,7 @@ impl ExecutionPlatform {
         };
 
         let mut lines = vec!["## Full Capability Registry".to_string()];
-        lines.push("(Reference only: these are NOT directly callable by you. Choose them for subagent.capability_allowlist.)".to_string());
+        lines.push("(Reference only: these are NOT directly callable by you unless listed in your authorized capability group. Choose base/composite capabilities for subagent.capability_allowlist; usage methods are invoked via method.invoke, not added to subagent allowlists.)".to_string());
         lines.push("".to_string());
 
         let mut base: Vec<_> = registry.base_capabilities.values().collect();
@@ -417,6 +417,7 @@ impl ExecutionPlatform {
         }
         lines.push("".to_string());
         lines.push("### Usage Methods / 方法库".to_string());
+        lines.push("(Run a method with method.invoke(method_id=...). Usage methods are not subagent capabilities.)".to_string());
         if methods.is_empty() {
             lines.push("- (none)".to_string());
         }
