@@ -2612,8 +2612,10 @@ mod tests {
     #[test]
     fn workspace_add_relative_path_is_rejected() {
         let mut p = ConfigPanel::new();
-        let mut form = AddWorkspaceForm::default();
-        form.path = "relative/path".into();
+        let form = AddWorkspaceForm {
+            path: "relative/path".into(),
+            submitted: false,
+        };
         p.view = ConfigView::AddWorkspace(form);
         p.handle_key(KeyCode::Enter);
         assert!(
@@ -2634,8 +2636,10 @@ mod tests {
     fn workspace_add_existing_path_submits_directly() {
         let dir = tempfile::tempdir().unwrap();
         let mut p = ConfigPanel::new();
-        let mut form = AddWorkspaceForm::default();
-        form.path = dir.path().to_string_lossy().to_string();
+        let form = AddWorkspaceForm {
+            path: dir.path().to_string_lossy().to_string(),
+            submitted: false,
+        };
         p.view = ConfigView::AddWorkspace(form);
         p.handle_key(KeyCode::Enter);
         assert_eq!(
@@ -2652,8 +2656,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("not-yet-created");
         let mut p = ConfigPanel::new();
-        let mut form = AddWorkspaceForm::default();
-        form.path = missing.to_string_lossy().to_string();
+        let form = AddWorkspaceForm {
+            path: missing.to_string_lossy().to_string(),
+            submitted: false,
+        };
         p.view = ConfigView::AddWorkspace(form);
         p.handle_key(KeyCode::Enter);
         assert_eq!(p.pending_db_request(), DbRequest::None, "确认前不提交");
