@@ -56,6 +56,18 @@ impl WorkspaceStore {
         Ok(self.load_document()?.workspaces)
     }
 
+    /// 当前默认工作区（`is_default = true` 的那一行）。
+    ///
+    /// 空库或无默认标记（旧数据异常）返回 `None`；需要兜底默认时调用方再回退
+    /// 到 `list()` 首行（见 entry 层 `store_default_or_first`）。
+    pub fn default(&self) -> Result<Option<WorkspaceRow>> {
+        Ok(self
+            .load_document()?
+            .workspaces
+            .into_iter()
+            .find(|row| row.is_default))
+    }
+
     pub fn initialize(&self) -> Result<()> {
         if self.file_path.exists() {
             self.load_document()?;
@@ -99,6 +111,72 @@ impl WorkspaceStore {
         }
         normalize_and_validate(&mut document.workspaces)?;
         self.persist(&document)
+    }
+
+    pub fn add_from_path(&self, path: &str) -> Result<WorkspaceRow> {
+        let path = path.trim();
+        if path.is_empty() {
+            return Err(workspace_error("workspace path cannot be empty"));
+        }
+        let p = Path::new(path);
+        if !p.is_absolute() {
+            return Err(workspace_error("workspace path must be absolute"));
+        }
+        let mut doc = self.load_document()?;
+        for existing in &doc.workspaces {
+            if workspace_paths_overlap(&existing.path, path) {
+                return Err(workspace_error(format!(
+                    "workspace path overlaps existing '{}' ({})",
+                    existing.id, existing.path
+                )));
+            }
+        }
+        let name = p
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| "workspace".to_string());
+        let base_id = name.to_lowercase().replace(' ', "-");
+        let mut id = base_id.clone();
+        let mut suffix = 2;
+        while doc.workspaces.iter().any(|row| row.id == id) {
+            id = format!("{base_id}-{suffix}");
+            suffix += 1;
+        }
+        let row = WorkspaceRow {
+            id,
+            name,
+            path: path.to_string(),
+            is_default: doc.workspaces.is_empty(),
+        };
+        doc.workspaces.push(row.clone());
+        normalize_and_validate(&mut doc.workspaces)?;
+        self.persist(&doc)?;
+        Ok(row)
+    }
+
+    pub fn delete(&self, id: &str) -> Result<Option<WorkspaceRow>> {
+        let mut doc = self.load_document()?;
+        if doc.workspaces.len() <= 1 {
+            return Err(workspace_error(
+                "at least one workspace must be retained",
+            ));
+        }
+        let idx = doc
+            .workspaces
+            .iter()
+            .position(|row| row.id == id)
+            .ok_or_else(|| AgentError::NotFound("workspace id not found".to_string()))?;
+        let removed = doc.workspaces.remove(idx);
+        if removed.is_default {
+            if let Some(next) = doc.workspaces.first_mut() {
+                next.is_default = true;
+            }
+        }
+        normalize_and_validate(&mut doc.workspaces)?;
+        self.persist(&doc)?;
+        Ok(Some(removed))
     }
 
     pub fn seed_if_empty(&self, row: WorkspaceRow) -> Result<bool> {
@@ -225,6 +303,13 @@ impl WorkspaceStore {
     }
 }
 
+
+fn workspace_paths_overlap(a: &str, b: &str) -> bool {
+    let a_path = Path::new(a.trim_end_matches('/'));
+    let b_path = Path::new(b.trim_end_matches('/'));
+    a_path == b_path || a_path.starts_with(b_path) || b_path.starts_with(a_path)
+}
+
 fn validate_row(row: &WorkspaceRow) -> Result<()> {
     if row.id.trim().is_empty() {
         return Err(workspace_error("workspace id cannot be empty"));
@@ -243,7 +328,7 @@ fn normalize_and_validate(rows: &mut [WorkspaceRow]) -> Result<()> {
     let mut ids = HashSet::with_capacity(rows.len());
     let mut paths = HashSet::with_capacity(rows.len());
     let mut default_count = 0_usize;
-    for row in rows {
+    for row in rows.iter() {
         validate_row(row)?;
         if !ids.insert(row.id.as_str()) {
             return Err(workspace_error("workspace ids must be unique"));
@@ -252,6 +337,16 @@ fn normalize_and_validate(rows: &mut [WorkspaceRow]) -> Result<()> {
             return Err(workspace_error("workspace paths must be unique"));
         }
         default_count += usize::from(row.is_default);
+    }
+    for i in 0..rows.len() {
+        for j in (i + 1)..rows.len() {
+            if workspace_paths_overlap(&rows[i].path, &rows[j].path) {
+                return Err(workspace_error(format!(
+                    "workspace paths must not overlap: '{}' and '{}'",
+                    rows[i].path, rows[j].path
+                )));
+            }
+        }
     }
     if default_count > 1 {
         return Err(workspace_error(
@@ -503,5 +598,70 @@ mod tests {
         fs::create_dir(&special_root).unwrap();
         let _socket = UnixListener::bind(special_root.join(WORKSPACE_FILE)).unwrap();
         assert!(WorkspaceStore::open(&special_root).is_err());
+    }
+
+    #[test]
+    fn add_from_path_derives_id_and_rejects_overlap() {
+        let (_temporary, root) = store_root();
+        let store = WorkspaceStore::open(&root).unwrap();
+        let a = store.add_from_path("/projects/alpha").unwrap();
+        assert_eq!(a.id, "alpha");
+        assert!(a.is_default, "第一个工作区应成为默认");
+        let b = store.add_from_path("/projects/beta").unwrap();
+        assert_eq!(b.id, "beta");
+        assert!(!b.is_default);
+        // 前缀重叠拒绝
+        assert!(store.add_from_path("/projects/alpha/sub").is_err());
+        // 相同路径拒绝
+        assert!(store.add_from_path("/projects/alpha").is_err());
+        // 同 basename 不同路径自动后缀
+        let c = store.add_from_path("/other/alpha").unwrap();
+        assert!(c.id.starts_with("alpha-"));
+    }
+
+    #[test]
+    fn delete_default_promotes_next_and_requires_at_least_one() {
+        let (_temporary, root) = store_root();
+        let store = WorkspaceStore::open(&root).unwrap();
+        store.add_from_path("/a").unwrap();
+        store.add_from_path("/b").unwrap();
+        store.set_default("b").unwrap();
+        let removed = store.delete("b").unwrap().unwrap();
+        assert_eq!(removed.id, "b");
+        let ws = store.list().unwrap();
+        assert_eq!(ws.len(), 1);
+        assert!(ws[0].is_default);
+
+        // 只剩一个时删除阻断
+        assert!(store.delete("a").is_err());
+    }
+
+    #[test]
+    fn normalize_rejects_prefix_overlap() {
+        let (_temporary, root) = store_root();
+        let store = WorkspaceStore::open(&root).unwrap();
+        store.add_from_path("/a").unwrap();
+        assert!(store.add_from_path("/a/b").is_err());
+        assert!(store.add_from_path("/ab").is_ok());
+    }
+
+    #[test]
+    fn default_returns_marked_row_or_none() {
+        let (_temporary, root) = store_root();
+        let store = WorkspaceStore::open(&root).unwrap();
+        assert!(store.default().unwrap().is_none(), "空库无默认");
+        store.add_from_path("/projects/alpha").unwrap();
+        store.add_from_path("/projects/beta").unwrap();
+        assert_eq!(
+            store.default().unwrap().unwrap().id,
+            "alpha",
+            "首个工作区成为默认"
+        );
+        store.set_default("beta").unwrap();
+        assert_eq!(
+            store.default().unwrap().unwrap().id,
+            "beta",
+            "set_default 后 default() 返回新默认"
+        );
     }
 }

@@ -5,6 +5,7 @@ use crate::common::{AgentError, Result};
 use crate::data::duckdb::loader::{
     BaseCapabilityRow, CompositeCapabilityRow, Registry, UsageMethodRow,
 };
+use crate::logic::builtin::host_context::HostContext;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
@@ -40,6 +41,12 @@ pub struct CapabilityDefinition {
 pub struct CapabilityService<'a> {
     registry: &'a Registry,
     executor: &'a CapabilityExecutor,
+    /// 构造时固化的执行权限根快照（v0.5.0 轮/run 级工作区快照）。
+    ///
+    /// `new`（缺省）取构造时刻 executor 的当前默认工作区；调用方若在轮/run
+    /// 开始时先固化一次 host 再用 `new_with_host` 构造（或复用同一实例），
+    /// 则切换默认工作区后运行中任务继续使用旧快照、仅新任务落到新根。
+    host: HostContext,
 }
 
 enum CapabilityContract<'a> {
@@ -59,7 +66,28 @@ enum GrantConsumption {
 impl<'a> CapabilityService<'a> {
     pub fn new(registry: &'a Registry, executor: &'a CapabilityExecutor) -> Result<Self> {
         registry.validate()?;
-        Ok(Self { registry, executor })
+        Ok(Self {
+            registry,
+            executor,
+            host: executor.current_host_context(),
+        })
+    }
+
+    /// 以调用方在轮/run 开始时固化的 host 快照构造服务（v0.5.0 热切换语义）。
+    ///
+    /// `host` 由 `executor.current_host_context()` 取得一次后贯穿整个任务；
+    /// 见 [`CapabilityService::host`] 字段注释。
+    pub fn new_with_host(
+        registry: &'a Registry,
+        executor: &'a CapabilityExecutor,
+        host: &HostContext,
+    ) -> Result<Self> {
+        registry.validate()?;
+        Ok(Self {
+            registry,
+            executor,
+            host: host.clone(),
+        })
     }
 
     pub fn definitions_for_agent(&self, agent_id: &str) -> Result<Vec<CapabilityDefinition>> {
@@ -283,9 +311,13 @@ impl<'a> CapabilityService<'a> {
     ) -> Result<Value> {
         validate_base_authority(row)?;
         validate_schema(&row.schema_in, arguments, &row.id, "input")?;
-        let output = self
-            .executor
-            .execute(actor_id, &row.id, self.registry, arguments)?;
+        let output = self.executor.execute_with_host(
+            actor_id,
+            &row.id,
+            self.registry,
+            arguments,
+            &self.host,
+        )?;
         evaluate_capability_output(&row.id, &output)?;
         validate_schema(&row.schema_out, &output, &row.id, "output")?;
         Ok(output)
@@ -1284,5 +1316,67 @@ mod tests {
         assert_eq!(result.capability_id, BASE_ID);
         // 无 one-shot 消耗 → 不回收
         assert_eq!(db_actor_allowlist(&db), r#"["base.echo.v1"]"#);
+    }
+
+    /// v0.5.0 轮/run 级快照：service 构造时固化默认工作区；热切换后已构造的
+    /// service（运行中任务）仍读旧根，新构造的 service（新任务）落到新根。
+    #[test]
+    fn service_freezes_workspace_snapshot_across_hot_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_a = dir.path().join("ws-a");
+        let root_b = dir.path().join("ws-b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        std::fs::write(root_a.join("note.txt"), "from-a").unwrap();
+        std::fs::write(root_b.join("note.txt"), "from-b").unwrap();
+
+        let mut registry = Registry::new();
+        registry.base_capabilities.insert(
+            "file.read".into(),
+            base_row("file.read", "read file", "builtin:file.read"),
+        );
+        registry
+            .agents
+            .insert("actor".to_string(), agent("actor", &["file.read"]));
+        let ex = CapabilityExecutor::new();
+        ex.set_workspace_root(&root_a);
+
+        let call = CapabilityCall {
+            capability_id: "file.read".to_string(),
+            capability_name: "read file".to_string(),
+            arguments: serde_json::json!({"path": "note.txt"}),
+        };
+
+        // 任务开始：固化旧工作区快照。
+        let running = CapabilityService::new(&registry, &ex).unwrap();
+        let before = running
+            .execute_for_agent("actor", &call)
+            .expect("a-root read should succeed");
+        assert_eq!(
+            before.output.get("content").and_then(|v| v.as_str()),
+            Some("from-a")
+        );
+
+        // 热切换默认工作区 A → B。
+        ex.set_workspace_root(&root_b);
+        let during = running
+            .execute_for_agent("actor", &call)
+            .expect("old-snapshot read should stay within old root");
+        assert_eq!(
+            during.output.get("content").and_then(|v| v.as_str()),
+            Some("from-a"),
+            "运行中任务保持旧工作区快照"
+        );
+
+        // 新任务：新构造 service 落到新根。
+        let fresh = CapabilityService::new(&registry, &ex).unwrap();
+        let after = fresh
+            .execute_for_agent("actor", &call)
+            .expect("new-snapshot read should succeed");
+        assert_eq!(
+            after.output.get("content").and_then(|v| v.as_str()),
+            Some("from-b"),
+            "新任务使用新默认工作区"
+        );
     }
 }

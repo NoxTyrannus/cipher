@@ -8,6 +8,7 @@ use crate::data::duckdb::loader::{
 };
 use crate::logic::model::stream::StreamChunk;
 use crate::mode_runtime::ModeManager;
+use crate::startup::cli::WorkspaceCommand;
 use crate::startup::manifest::{self, UpgradeChoice};
 use crate::ui::backend::UiBackend;
 use crate::ui::tui::config_panel::{ActionResult, ConfigView, DbRequest};
@@ -290,8 +291,16 @@ pub async fn run_normal(
     let exec_duckdb = Some(std::sync::Arc::clone(&exec_duckdb_conn));
     let exec_storage_root = Some(app_state.paths.storage_root().to_path_buf());
     let exec_executor = {
+        // v0.5.0：启动时以默认工作区（workspaces.json 的 is_default，无默认标记时
+        // 回退列表首个）作为 executor 的 workspace_root；空表回退 current_dir。
+        let mut workspace_root = std::env::current_dir().unwrap_or_default();
+        let workspace_store =
+            crate::data::workspace_store::WorkspaceStore::open(app_state.paths.storage_root())?;
+        if let Some(default_ws) = store_default_or_first(&workspace_store)? {
+            workspace_root = std::path::PathBuf::from(&default_ws.path);
+        }
         let mut ex = crate::logic::capability::executor::CapabilityExecutor::new();
-        ex.set_workspace_root(&std::env::current_dir().unwrap_or_default());
+        ex.set_workspace_root(&workspace_root);
         // v0.4.8：[fs] read_roots 追加文件读根（缺省空=仅 workspace_root，行为与现状一致）。
         ex.set_extra_read_roots(&config.fs.read_roots);
         ex.set_triviumdb(std::sync::Arc::clone(&trivium_db));
@@ -376,6 +385,7 @@ pub async fn run_normal(
     }
 
     let memory_executor = std::sync::Arc::clone(&exec_executor);
+    let exec_executor_for_tui = std::sync::Arc::clone(&exec_executor);
     let execution_task = tokio::spawn(async move {
         crate::agent::execution_platform::run(
             pool_exec,
@@ -643,11 +653,14 @@ pub async fn run_normal(
             pool_for_status,
             mode_styles_shared,
             keep_budget_tracker,
+            exec_executor_for_tui,
         )
         .await?;
     } else {
         let mut tui = crate::ui::TuiBackend::new();
         tracing::info!("tui_run: non-TTY blocking loop");
+        let exec_for_config = std::sync::Arc::clone(&exec_executor_for_tui);
+        let storage_root = app_state.paths.storage_root().to_path_buf();
         run_main_loop(&mut mode_manager, &mut tui, || {
             crate::startup::config_flow::run(&app_state)?;
             if let Ok(Some(cfg)) = Config::load(&Config::default_path()) {
@@ -656,6 +669,10 @@ pub async fn run_normal(
                 tracker.set_token_budget(cfg.mode_styles.keep.token_budget);
                 tracker.set_time_budget_secs(cfg.mode_styles.keep.time_budget_secs);
             }
+            // v0.5.0 非 TTY 热切换：/config 内可能新增/删除/切默认工作区，返回后刷新
+            // executor 的当前工作区根——已固化的运行中任务继续旧快照，下一次新任务
+            // 立即使用新默认工作区（任务书 §7）。
+            refresh_executor_workspace_root(&exec_for_config, &storage_root);
             Ok(())
         })
         .await?;
@@ -679,6 +696,40 @@ pub async fn run_normal(
     Ok(())
 }
 
+/// 默认工作区：`is_default` 行优先，无默认标记（旧数据异常）时回退列表首个。
+fn store_default_or_first(
+    store: &crate::data::workspace_store::WorkspaceStore,
+) -> Result<Option<crate::data::workspace_store::WorkspaceRow>, AgentError> {
+    if let Some(row) = store.default()? {
+        return Ok(Some(row));
+    }
+    Ok(store.list()?.into_iter().next())
+}
+
+/// 热切换刷新：把 executor 的「当前默认工作区」根重设为 workspaces.json 的默认行
+/// （无默认标记回退首个）。幂等；失败仅日志（/config 返回路径降级为下次启动生效）。
+///
+/// 只影响之后开始执行轮/子代理 run 的新快照；运行中任务已固化的快照不受影响
+/// （任务书 v0.5.0 §7 运行时热切换）。
+fn refresh_executor_workspace_root(
+    executor: &crate::logic::capability::executor::CapabilityExecutor,
+    storage_root: &Path,
+) {
+    let Ok(store) = crate::data::workspace_store::WorkspaceStore::open(storage_root) else {
+        tracing::warn!("refresh workspace root: cannot open workspace store");
+        return;
+    };
+    let Ok(Some(default_ws)) = store_default_or_first(&store) else {
+        tracing::warn!("refresh workspace root: cannot read default workspace");
+        return;
+    };
+    executor.set_workspace_root(Path::new(&default_ws.path));
+    tracing::info!(
+        path = %default_ws.path,
+        "executor workspace root refreshed (hot switch)"
+    );
+}
+
 pub async fn run_config(
     config_path: PathBuf,
     data_dir_override: Option<PathBuf>,
@@ -697,6 +748,21 @@ pub async fn run_config(
     crate::data::cognitive_seed::upgrade_seed_deltas(&app_state.duckdb, &config.data_dir)?;
     crate::startup::config_flow::run(&app_state)?;
     tracing::info!("config: 完成");
+    Ok(())
+}
+
+pub async fn run_workspace_command(
+    command: WorkspaceCommand,
+    config_path: PathBuf,
+    data_dir_override: Option<PathBuf>,
+) -> Result<(), AgentError> {
+    init_tracing();
+
+    super::config::migrate_data_dir()?;
+    let config = load_config(&config_path, data_dir_override)?;
+    let app_state = crate::data::bootstrap(&config.data_dir)?;
+    crate::startup::config_flow::run_workspace_command(&app_state, &command)?;
+    tracing::info!("workspace command: 完成");
     Ok(())
 }
 
@@ -759,6 +825,7 @@ pub async fn run_streaming_loop(
     pool: std::sync::Arc<crate::agent::agent_pool::AgentPool>,
     mode_styles_shared: std::sync::Arc<std::sync::Mutex<RuntimeStyles>>,
     keep_budget_tracker: std::sync::Arc<std::sync::Mutex<KeepBudgetTracker>>,
+    exec_executor: std::sync::Arc<crate::logic::capability::executor::CapabilityExecutor>,
 ) -> Result<(), AgentError> {
     use crossterm::event::{Event, EventStream};
     use futures::StreamExt;
@@ -977,6 +1044,107 @@ pub async fn run_streaming_loop(
                                         ));
                                     }
                                 }
+                                state.config_panel.clear_db_request();
+                            }
+                            DbRequest::LoadWorkspaces => {
+                                let store = crate::data::workspace_store::WorkspaceStore::open(
+                                    app.paths.storage_root(),
+                                )?;
+                                let workspaces = store.list()?;
+                                state.config_panel.reload_workspaces(workspaces);
+                                state.config_panel.clear_db_request();
+                            }
+                            DbRequest::SubmitAddWorkspace { path } => {
+                                let path = path.trim().to_string();
+                                let p = std::path::Path::new(&path);
+                                if !p.is_absolute() {
+                                    state.config_panel.message = Some((
+                                        "路径必须是绝对路径".to_string(),
+                                        true,
+                                    ));
+                                } else {
+                                    let store = crate::data::workspace_store::WorkspaceStore::open(
+                                        app.paths.storage_root(),
+                                    )?;
+                                    match store.add_from_path(&path) {
+                                        Ok(row) => {
+                                            state.config_panel.message = Some((
+                                                format!("已新增工作区: {} -> {}", row.id, row.path),
+                                                false,
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            state.config_panel.message = Some((
+                                                format!("新增失败: {e}"),
+                                                true,
+                                            ));
+                                        }
+                                    }
+                                    let workspaces = store.list()?;
+                                    state.config_panel.reload_workspaces(workspaces);
+                                }
+                                state.config_panel.view = ConfigView::WorkspaceList;
+                                state.config_panel.clear_db_request();
+                            }
+                            DbRequest::SubmitDeleteWorkspace { id } => {
+                                let store = crate::data::workspace_store::WorkspaceStore::open(
+                                    app.paths.storage_root(),
+                                )?;
+                                match store.delete(&id) {
+                                    Ok(Some(removed)) => {
+                                        state.config_panel.message = Some((
+                                            format!("已删除工作区: {}", removed.id),
+                                            false,
+                                        ));
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        state.config_panel.message = Some((
+                                            format!("删除失败: {e}"),
+                                            true,
+                                        ));
+                                    }
+                                }
+                                let workspaces = store.list()?;
+                                let default_path = workspaces
+                                    .iter()
+                                    .find(|w| w.is_default)
+                                    .map(|w| w.path.clone());
+                                state.config_panel.reload_workspaces(workspaces);
+                                if let Some(path) = default_path {
+                                    exec_executor.set_workspace_root(std::path::Path::new(&path));
+                                }
+                                state.config_panel.view = ConfigView::WorkspaceList;
+                                state.config_panel.clear_db_request();
+                            }
+                            DbRequest::SubmitSetDefaultWorkspace { id } => {
+                                let store = crate::data::workspace_store::WorkspaceStore::open(
+                                    app.paths.storage_root(),
+                                )?;
+                                match store.set_default(&id) {
+                                    Ok(()) => {
+                                        state.config_panel.message = Some((
+                                            format!("已设置默认工作区 -> {}", id),
+                                            false,
+                                        ));
+                                        let workspaces = store.list()?;
+                                        if let Some(default_ws) =
+                                            workspaces.iter().find(|w| w.id == id)
+                                        {
+                                            exec_executor.set_workspace_root(
+                                                std::path::Path::new(&default_ws.path),
+                                            );
+                                        }
+                                        state.config_panel.reload_workspaces(workspaces);
+                                    }
+                                    Err(e) => {
+                                        state.config_panel.message = Some((
+                                            format!("设置默认失败: {e}"),
+                                            true,
+                                        ));
+                                    }
+                                }
+                                state.config_panel.view = ConfigView::WorkspaceList;
                                 state.config_panel.clear_db_request();
                             }
                             DbRequest::None => {}

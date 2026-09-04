@@ -1,4 +1,5 @@
 use crate::data::duckdb::loader::ModelRow;
+use crate::data::workspace_store::WorkspaceRow;
 use crossterm::event::KeyCode;
 use ratatui::layout::Rect;
 use ratatui::Frame;
@@ -12,7 +13,7 @@ pub const PRESET_TEMPLATES: &[(&str, &str, &str, &str)] = &[(
 
 const MENU_ITEMS: &[(&str, bool)] = &[
     ("Model + Provider", true),
-    ("工作区管理", false),
+    ("工作区管理", true),
     ("Agent 改名", true),
     ("模式设置", true),
 ];
@@ -69,6 +70,33 @@ pub struct RenameAgentForm {
     pub name: String,
     pub submitted: bool,
 }
+#[derive(Debug, Clone, Default)]
+pub struct AddWorkspaceForm {
+    pub path: String,
+    pub submitted: bool,
+}
+
+/// v0.5.0：新增工作区路径不存在时的确认步（任务书 §3.2「该目录当前不存在，是否继续？」）。
+#[derive(Debug, Clone)]
+pub struct AddWorkspaceConfirm {
+    pub path: String,
+    pub submitted: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteWorkspaceConfirm {
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub submitted: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SetDefaultWorkspaceSelect {
+    pub candidates: Vec<WorkspaceRow>,
+    pub cursor: usize,
+    pub submitted: bool,
+}
+
 
 #[derive(Debug, Clone)]
 pub struct KeepBudgetInput {
@@ -123,6 +151,16 @@ pub enum ConfigView {
     KeepBudgetInput(KeepBudgetInput),
 
     RenameAgent(RenameAgentForm),
+
+    WorkspaceList,
+
+    AddWorkspace(AddWorkspaceForm),
+
+    AddWorkspaceConfirm(AddWorkspaceConfirm),
+
+    DeleteWorkspaceConfirm(DeleteWorkspaceConfirm),
+
+    SetDefaultWorkspace(SetDefaultWorkspaceSelect),
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +174,7 @@ pub struct ConfigPanel {
     pub expanded: Option<usize>,
 
     pub models: Vec<ModelRow>,
+    pub workspaces: Vec<WorkspaceRow>,
 
     pub message: Option<(String, bool)>,
 }
@@ -178,6 +217,20 @@ pub enum DbRequest {
         display_name: String,
     },
 
+    LoadWorkspaces,
+
+    SubmitAddWorkspace {
+        path: String,
+    },
+
+    SubmitDeleteWorkspace {
+        id: String,
+    },
+
+    SubmitSetDefaultWorkspace {
+        id: String,
+    },
+
     None,
 }
 
@@ -189,7 +242,15 @@ impl ConfigPanel {
             list_cursor: 0,
             expanded: None,
             models: Vec::new(),
+            workspaces: Vec::new(),
             message: None,
+        }
+    }
+
+    pub fn reload_workspaces(&mut self, workspaces: Vec<WorkspaceRow>) {
+        self.workspaces = workspaces;
+        if self.list_cursor >= self.workspaces.len() && !self.workspaces.is_empty() {
+            self.list_cursor = self.workspaces.len() - 1;
         }
     }
 
@@ -206,6 +267,7 @@ impl ConfigPanel {
             ConfigView::SetDefault(sel) if sel.candidates.is_empty() => {
                 DbRequest::LoadDefaultCandidates
             }
+            ConfigView::WorkspaceList if self.workspaces.is_empty() => DbRequest::LoadWorkspaces,
             _ => self.check_form_submit(),
         }
     }
@@ -241,6 +303,25 @@ impl ConfigPanel {
             ConfigView::RenameAgent(form) if form.submitted => DbRequest::SubmitRenameAgent {
                 display_name: form.name.clone(),
             },
+            ConfigView::AddWorkspace(form) if form.submitted => DbRequest::SubmitAddWorkspace {
+                path: form.path.trim().to_string(),
+            },
+            ConfigView::AddWorkspaceConfirm(form) if form.submitted => {
+                DbRequest::SubmitAddWorkspace {
+                    path: form.path.trim().to_string(),
+                }
+            }
+            ConfigView::DeleteWorkspaceConfirm(form) if form.submitted => {
+                DbRequest::SubmitDeleteWorkspace { id: form.workspace_id.clone() }
+            }
+            ConfigView::SetDefaultWorkspace(sel) if sel.submitted => {
+                let id = sel
+                    .candidates
+                    .get(sel.cursor)
+                    .map(|w| w.id.clone())
+                    .unwrap_or_default();
+                DbRequest::SubmitSetDefaultWorkspace { id }
+            }
             _ => DbRequest::None,
         }
     }
@@ -253,6 +334,10 @@ impl ConfigPanel {
             ConfigView::KeepBudgetInput(form) => form.submitted = false,
             ConfigView::ShowThinkSelect(sel) => sel.submitted = false,
             ConfigView::RenameAgent(f) => f.submitted = false,
+            ConfigView::AddWorkspace(f) => f.submitted = false,
+            ConfigView::AddWorkspaceConfirm(f) => f.submitted = false,
+            ConfigView::DeleteWorkspaceConfirm(f) => f.submitted = false,
+            ConfigView::SetDefaultWorkspace(s) => s.submitted = false,
             _ => {}
         }
     }
@@ -341,6 +426,35 @@ impl ConfigPanel {
                 }
                 r
             }
+            ConfigView::WorkspaceList => self.handle_workspace_list_key(key),
+            ConfigView::AddWorkspace(mut form) => {
+                let r = self.handle_workspace_form_key(key, &mut form);
+                if matches!(self.view, ConfigView::Menu) {
+                    self.view = ConfigView::AddWorkspace(form);
+                }
+                r
+            }
+            ConfigView::AddWorkspaceConfirm(mut form) => {
+                let r = self.handle_add_workspace_confirm_key(key, &mut form);
+                if matches!(self.view, ConfigView::Menu) {
+                    self.view = ConfigView::AddWorkspaceConfirm(form);
+                }
+                r
+            }
+            ConfigView::DeleteWorkspaceConfirm(mut form) => {
+                let r = self.handle_delete_workspace_confirm_key(key, &mut form);
+                if matches!(self.view, ConfigView::Menu) {
+                    self.view = ConfigView::DeleteWorkspaceConfirm(form);
+                }
+                r
+            }
+            ConfigView::SetDefaultWorkspace(mut sel) => {
+                let r = self.handle_set_default_workspace_key(key, &mut sel);
+                if matches!(self.view, ConfigView::Menu) {
+                    self.view = ConfigView::SetDefaultWorkspace(sel);
+                }
+                r
+            }
         }
     }
 
@@ -367,6 +481,8 @@ impl ConfigPanel {
                         self.view = ConfigView::ModeStyleSubMenu { cursor: 0 };
                     } else if idx == 2 {
                         self.view = ConfigView::RenameAgent(RenameAgentForm::default());
+                    } else if idx == 1 {
+                        self.view = ConfigView::WorkspaceList;
                     } else {
                         self.view = ConfigView::ModelList;
                     }
@@ -434,6 +550,181 @@ impl ConfigPanel {
                     cursor: 0,
                     submitted: false,
                 });
+                ActionResult::Navigate
+            }
+            _ => ActionResult::Navigate,
+        }
+    }
+
+    fn handle_workspace_list_key(&mut self, key: KeyCode) -> ActionResult {
+        match key {
+            KeyCode::Up => {
+                if self.list_cursor > 0 {
+                    self.list_cursor -= 1;
+                }
+                ActionResult::Navigate
+            }
+            KeyCode::Down => {
+                if !self.workspaces.is_empty() && self.list_cursor < self.workspaces.len() - 1 {
+                    self.list_cursor += 1;
+                }
+                ActionResult::Navigate
+            }
+            KeyCode::Left => {
+                self.view = ConfigView::Menu;
+                self.expanded = None;
+                ActionResult::Navigate
+            }
+            KeyCode::Esc => ActionResult::Exit,
+            KeyCode::Char('a') => {
+                self.view = ConfigView::AddWorkspace(AddWorkspaceForm::default());
+                ActionResult::Navigate
+            }
+            KeyCode::Char('x') => {
+                if self.workspaces.len() <= 1 {
+                    self.message = Some((
+                        "至少需要保留一个工作区，不能删除".to_string(),
+                        true,
+                    ));
+                    self.view = ConfigView::WorkspaceList;
+                    return ActionResult::Navigate;
+                }
+                let ws = self.workspaces.get(self.list_cursor).cloned();
+                match ws {
+                    Some(ws) => {
+                        self.view = ConfigView::DeleteWorkspaceConfirm(DeleteWorkspaceConfirm {
+                            workspace_id: ws.id,
+                            workspace_name: ws.name,
+                            submitted: false,
+                        });
+                    }
+                    None => {
+                        self.message = Some(("没有可删除的工作区".to_string(), true));
+                        self.view = ConfigView::WorkspaceList;
+                    }
+                }
+                ActionResult::Navigate
+            }
+            KeyCode::Char('d') => {
+                self.view = ConfigView::SetDefaultWorkspace(SetDefaultWorkspaceSelect {
+                    candidates: self.workspaces.clone(),
+                    cursor: self.list_cursor.min(self.workspaces.len().saturating_sub(1)),
+                    submitted: false,
+                });
+                ActionResult::Navigate
+            }
+            _ => ActionResult::Navigate,
+        }
+    }
+
+    fn handle_workspace_form_key(
+        &mut self,
+        key: KeyCode,
+        form: &mut AddWorkspaceForm,
+    ) -> ActionResult {
+        match key {
+            KeyCode::Left => {
+                self.view = ConfigView::WorkspaceList;
+                ActionResult::Navigate
+            }
+            KeyCode::Esc => ActionResult::Exit,
+            KeyCode::Enter => {
+                let path = form.path.trim();
+                if path.is_empty() {
+                    self.message = Some(("路径不能为空".to_string(), true));
+                } else if !std::path::Path::new(path).is_absolute() {
+                    // v0.5.0 §6.1：路径必须是绝对路径。
+                    self.message = Some(("路径必须是绝对路径".to_string(), true));
+                } else if !std::path::Path::new(path).exists() {
+                    // v0.5.0 §3.2/§6.1：路径不存在 → 确认步（允许确认后继续）。
+                    self.view = ConfigView::AddWorkspaceConfirm(AddWorkspaceConfirm {
+                        path: path.to_string(),
+                        submitted: false,
+                    });
+                } else {
+                    form.submitted = true;
+                }
+                ActionResult::Navigate
+            }
+            KeyCode::Backspace => {
+                form.path.pop();
+                ActionResult::Navigate
+            }
+            KeyCode::Char(c) => {
+                form.path.push(c);
+                ActionResult::Navigate
+            }
+            _ => ActionResult::Navigate,
+        }
+    }
+
+    /// v0.5.0：目录不存在确认步 —— Enter/y 继续（允许保存），←/n 返回修改路径。
+    fn handle_add_workspace_confirm_key(
+        &mut self,
+        key: KeyCode,
+        form: &mut AddWorkspaceConfirm,
+    ) -> ActionResult {
+        match key {
+            KeyCode::Left | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.view = ConfigView::AddWorkspace(AddWorkspaceForm {
+                    path: form.path.clone(),
+                    submitted: false,
+                });
+                ActionResult::Navigate
+            }
+            KeyCode::Esc => ActionResult::Exit,
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                form.submitted = true;
+                ActionResult::Navigate
+            }
+            _ => ActionResult::Navigate,
+        }
+    }
+
+    fn handle_delete_workspace_confirm_key(
+        &mut self,
+        key: KeyCode,
+        form: &mut DeleteWorkspaceConfirm,
+    ) -> ActionResult {
+        match key {
+            KeyCode::Left => {
+                self.view = ConfigView::WorkspaceList;
+                ActionResult::Navigate
+            }
+            KeyCode::Esc => ActionResult::Exit,
+            KeyCode::Enter => {
+                form.submitted = true;
+                ActionResult::Navigate
+            }
+            _ => ActionResult::Navigate,
+        }
+    }
+
+    fn handle_set_default_workspace_key(
+        &mut self,
+        key: KeyCode,
+        sel: &mut SetDefaultWorkspaceSelect,
+    ) -> ActionResult {
+        match key {
+            KeyCode::Up => {
+                if sel.cursor > 0 {
+                    sel.cursor -= 1;
+                }
+                ActionResult::Navigate
+            }
+            KeyCode::Down => {
+                if !sel.candidates.is_empty() && sel.cursor < sel.candidates.len() - 1 {
+                    sel.cursor += 1;
+                }
+                ActionResult::Navigate
+            }
+            KeyCode::Left => {
+                self.view = ConfigView::WorkspaceList;
+                ActionResult::Navigate
+            }
+            KeyCode::Esc => ActionResult::Exit,
+            KeyCode::Enter => {
+                sel.submitted = true;
                 ActionResult::Navigate
             }
             _ => ActionResult::Navigate,
@@ -811,6 +1102,15 @@ impl ConfigPanel {
                 "← 返回上级    数字输入  Backspace 删除  Enter 确认  Esc 取消"
             }
             ConfigView::RenameAgent(_) => "← 取消    Enter 确认    Esc 退出设置",
+            ConfigView::WorkspaceList => {
+                "← 返回上级    ↑↓ 选择    a 新增  x 删除  d 设置默认  Esc 退出"
+            }
+            ConfigView::AddWorkspace(_) => "← 返回    输入路径  Enter 提交  Esc 退出",
+            ConfigView::AddWorkspaceConfirm(_) => {
+                "Enter / y 继续保存    n / ← 返回修改    Esc 退出"
+            }
+            ConfigView::DeleteWorkspaceConfirm(_) => "Enter 确认删除  ←/Esc 取消",
+            ConfigView::SetDefaultWorkspace(_) => "← 返回    ↑↓ 选择    Enter 确认",
         }
     }
 }
@@ -875,6 +1175,21 @@ pub fn render(panel: &ConfigPanel, frame: &mut Frame, area: Rect) {
         }
         ConfigView::RenameAgent(form) => {
             render_rename_agent(panel, frame, content_area, form);
+        }
+        ConfigView::WorkspaceList => {
+            render_workspace_list(panel, frame, content_area);
+        }
+        ConfigView::AddWorkspace(form) => {
+            render_add_workspace(panel, frame, content_area, form);
+        }
+        ConfigView::AddWorkspaceConfirm(form) => {
+            render_add_workspace_confirm(panel, frame, content_area, form);
+        }
+        ConfigView::DeleteWorkspaceConfirm(form) => {
+            render_delete_workspace_confirm(panel, frame, content_area, form);
+        }
+        ConfigView::SetDefaultWorkspace(sel) => {
+            render_set_default_workspace(panel, frame, content_area, sel);
         }
     }
 
@@ -1282,6 +1597,171 @@ fn render_keep_budget_input(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+fn render_workspace_list(panel: &ConfigPanel, frame: &mut Frame, area: Rect) {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+
+    let mut lines: Vec<Line> = vec![Line::from(vec![Span::styled(
+        "▼ 工作区管理",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )])];
+    lines.push(Line::from(""));
+    if panel.workspaces.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            "  (无工作区, 按 a 新增)",
+            Style::default().fg(Color::DarkGray),
+        )]));
+    } else {
+        for (i, w) in panel.workspaces.iter().enumerate() {
+            let mark = if w.is_default { "★" } else { " " };
+            let selected = panel.list_cursor == i;
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  [{}] {}  ", mark, w.name), style),
+                Span::styled(w.path.clone(), Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "  a 新增    x 删除    d 设置默认    ← 返回",
+        Style::default().fg(Color::DarkGray),
+    )]));
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_add_workspace(
+    _panel: &ConfigPanel,
+    frame: &mut Frame,
+    area: Rect,
+    form: &AddWorkspaceForm,
+) {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+    let lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "请输入工作区绝对路径:",
+            Style::default().fg(Color::Gray),
+        )]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  ▶ ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(form.path.clone(), Style::default().fg(Color::White)),
+            Span::styled("_", Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  Enter 提交    ← 返回",
+            Style::default().fg(Color::DarkGray),
+        )]),
+    ];
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_add_workspace_confirm(
+    panel: &ConfigPanel,
+    frame: &mut Frame,
+    area: Rect,
+    form: &AddWorkspaceConfirm,
+) {
+    use ratatui::style::{Color, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+    let _ = panel;
+    let lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "该目录当前不存在，是否继续？",
+            Style::default().fg(Color::Yellow),
+        )]),
+        Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(form.path.clone(), Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  Enter / y 继续    n / ← 返回修改    Esc 取消",
+            Style::default().fg(Color::DarkGray),
+        )]),
+    ];
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_delete_workspace_confirm(
+    _panel: &ConfigPanel,
+    frame: &mut Frame,
+    area: Rect,
+    form: &DeleteWorkspaceConfirm,
+) {
+    use ratatui::style::{Color, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+    let lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            format!("确定删除工作区: {} ?", form.workspace_name),
+            Style::default().fg(Color::Red),
+        )]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  Enter 确认    ← 取消",
+            Style::default().fg(Color::DarkGray),
+        )]),
+    ];
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_set_default_workspace(
+    _panel: &ConfigPanel,
+    frame: &mut Frame,
+    area: Rect,
+    sel: &SetDefaultWorkspaceSelect,
+) {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+    let mut lines: Vec<Line> = vec![Line::from(""), Line::from(vec![Span::styled(
+        "选择要设为默认的工作区:",
+        Style::default().fg(Color::Gray),
+    )])];
+    for (i, w) in sel.candidates.iter().enumerate() {
+        let selected = sel.cursor == i;
+        let style = if selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(if selected { "  ▶ " } else { "    " }, style),
+            Span::styled(format!("{}  {}", w.name, w.path), style),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "  Enter 确认    ↑↓ 选择    ← 返回",
+        Style::default().fg(Color::DarkGray),
+    )]));
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 fn render_rename_agent(
     _panel: &ConfigPanel,
     frame: &mut Frame,
@@ -1356,10 +1836,11 @@ mod tests {
         assert!(!text.contains("默认设置"), "default settings removed");
         assert!(!text.contains("上下文编辑"), "context editing removed");
 
+        // v0.5.0：工作区管理已启用（原为「待后续」占位），4 个菜单项全部可用 → 无 disabled 标记。
         let pending_count = text.matches('(').count();
         assert_eq!(
-            pending_count, 1,
-            "only 1 disabled item shows (待后续), got: {text}"
+            pending_count, 0,
+            "no disabled item remains after workspace management enabled, got: {text}"
         );
     }
 
@@ -2049,5 +2530,256 @@ mod tests {
             api_key: Some("key".into()),
             config: None,
         }
+    }
+
+    fn fake_workspace(id: &str, is_default: bool) -> WorkspaceRow {
+        WorkspaceRow {
+            id: id.into(),
+            name: id.into(),
+            path: format!("/projects/{id}"),
+            is_default,
+        }
+    }
+
+    // ---- v0.5.0 工作区管理：菜单导航 / 列表 / 新增确认 / 删除 / 设置默认（任务书 §4）----
+
+    #[test]
+    fn menu_down_to_workspace_management_opens_workspace_list() {
+        let mut p = ConfigPanel::new();
+        p.handle_key(KeyCode::Down); // Model+Provider -> 工作区管理
+        assert_eq!(p.menu_cursor, 1);
+        p.handle_key(KeyCode::Right);
+        assert!(matches!(p.view, ConfigView::WorkspaceList));
+        assert_eq!(p.expanded, Some(1));
+        // 空缓存触发 LoadWorkspaces（进入列表即默认显示列表）。
+        assert_eq!(p.pending_db_request(), DbRequest::LoadWorkspaces);
+    }
+
+    #[test]
+    fn workspace_list_left_returns_to_menu() {
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::WorkspaceList;
+        p.expanded = Some(1);
+        let r = p.handle_key(KeyCode::Left);
+        assert!(matches!(p.view, ConfigView::Menu));
+        assert!(p.expanded.is_none());
+        assert!(matches!(r, ActionResult::Navigate));
+    }
+
+    #[test]
+    fn workspace_list_shows_rows_and_default_marker() {
+        let mut panel = ConfigPanel::new();
+        panel.view = ConfigView::WorkspaceList;
+        panel.workspaces = vec![
+            fake_workspace("alpha", true),
+            fake_workspace("beta", false),
+        ];
+        let text = render_to_text(&panel).replace(' ', "");
+        assert!(text.contains("alpha"), "行内容可见: {text}");
+        assert!(text.contains("beta"), "行内容可见: {text}");
+        assert!(text.contains("★"), "默认标记可见: {text}");
+        assert!(text.contains("/projects/alpha"), "路径可见: {text}");
+        assert!(text.contains('a') && text.contains('x') && text.contains('d'));
+    }
+
+    #[test]
+    fn workspace_list_empty_shows_add_hint_and_loads() {
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::WorkspaceList;
+        assert_eq!(p.pending_db_request(), DbRequest::LoadWorkspaces);
+        let text = render_to_text(&p).replace(' ', "");
+        assert!(text.contains("无工作区"), "空列表提示: {text}");
+    }
+
+    #[test]
+    fn workspace_list_a_enters_add_form() {
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::WorkspaceList;
+        p.handle_key(KeyCode::Char('a'));
+        assert!(matches!(p.view, ConfigView::AddWorkspace(_)));
+    }
+
+    #[test]
+    fn workspace_add_empty_path_shows_error_not_submitted() {
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::AddWorkspace(AddWorkspaceForm::default());
+        p.handle_key(KeyCode::Enter);
+        assert!(p.message.is_some(), "空路径应提示");
+        assert!(matches!(p.view, ConfigView::AddWorkspace(_)));
+        assert_eq!(p.pending_db_request(), DbRequest::None);
+    }
+
+    #[test]
+    fn workspace_add_relative_path_is_rejected() {
+        let mut p = ConfigPanel::new();
+        let mut form = AddWorkspaceForm::default();
+        form.path = "relative/path".into();
+        p.view = ConfigView::AddWorkspace(form);
+        p.handle_key(KeyCode::Enter);
+        assert!(matches!(p.view, ConfigView::AddWorkspace(_)), "留在表单可重输");
+        assert_eq!(p.pending_db_request(), DbRequest::None);
+        assert!(
+            p.message
+                .as_ref()
+                .is_some_and(|(msg, is_error)| *is_error && msg.contains("绝对路径")),
+            "相对路径拒绝提示: {:?}",
+            p.message
+        );
+    }
+
+    #[test]
+    fn workspace_add_existing_path_submits_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = ConfigPanel::new();
+        let mut form = AddWorkspaceForm::default();
+        form.path = dir.path().to_string_lossy().to_string();
+        p.view = ConfigView::AddWorkspace(form);
+        p.handle_key(KeyCode::Enter);
+        assert_eq!(
+            p.pending_db_request(),
+            DbRequest::SubmitAddWorkspace {
+                path: dir.path().to_string_lossy().to_string()
+            }
+        );
+        assert!(matches!(p.view, ConfigView::AddWorkspace(_)));
+    }
+
+    #[test]
+    fn workspace_add_missing_path_enters_confirm_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not-yet-created");
+        let mut p = ConfigPanel::new();
+        let mut form = AddWorkspaceForm::default();
+        form.path = missing.to_string_lossy().to_string();
+        p.view = ConfigView::AddWorkspace(form);
+        p.handle_key(KeyCode::Enter);
+        assert_eq!(p.pending_db_request(), DbRequest::None, "确认前不提交");
+        match &p.view {
+            ConfigView::AddWorkspaceConfirm(f) => {
+                assert_eq!(f.path, missing.to_string_lossy());
+                assert!(!f.submitted);
+            }
+            other => panic!("应进入确认步, got {other:?}"),
+        }
+        let text = render_to_text(&p).replace(' ', "");
+        assert!(
+            text.contains("该目录当前不存在，是否继续？"),
+            "确认文案渲染: {text}"
+        );
+    }
+
+    #[test]
+    fn workspace_add_confirm_enter_submits_request() {
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::AddWorkspaceConfirm(AddWorkspaceConfirm {
+            path: "/projects/pending".into(),
+            submitted: false,
+        });
+        p.handle_key(KeyCode::Enter);
+        assert_eq!(
+            p.pending_db_request(),
+            DbRequest::SubmitAddWorkspace {
+                path: "/projects/pending".into()
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_add_confirm_y_and_n_keys() {
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::AddWorkspaceConfirm(AddWorkspaceConfirm {
+            path: "/projects/pending".into(),
+            submitted: false,
+        });
+        p.handle_key(KeyCode::Char('n'));
+        assert!(
+            matches!(p.view, ConfigView::AddWorkspace(_)),
+            "n 返回修改路径"
+        );
+        assert_eq!(p.pending_db_request(), DbRequest::None);
+
+        p.view = ConfigView::AddWorkspaceConfirm(AddWorkspaceConfirm {
+            path: "/projects/pending".into(),
+            submitted: false,
+        });
+        p.handle_key(KeyCode::Char('y'));
+        assert_eq!(
+            p.pending_db_request(),
+            DbRequest::SubmitAddWorkspace {
+                path: "/projects/pending".into()
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_list_x_blocks_single_workspace_delete() {
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::WorkspaceList;
+        p.workspaces = vec![fake_workspace("only", true)];
+        p.handle_key(KeyCode::Char('x'));
+        assert!(matches!(p.view, ConfigView::WorkspaceList));
+        assert!(p.message.is_some());
+        assert_eq!(p.pending_db_request(), DbRequest::None);
+    }
+
+    #[test]
+    fn workspace_list_x_enters_delete_confirm_and_submits() {
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::WorkspaceList;
+        p.workspaces = vec![fake_workspace("alpha", true), fake_workspace("beta", false)];
+        p.list_cursor = 1;
+        p.handle_key(KeyCode::Char('x'));
+        assert!(matches!(
+            &p.view,
+            ConfigView::DeleteWorkspaceConfirm(form) if form.workspace_id == "beta"
+        ));
+        assert_eq!(p.pending_db_request(), DbRequest::None);
+        p.handle_key(KeyCode::Enter);
+        assert_eq!(
+            p.pending_db_request(),
+            DbRequest::SubmitDeleteWorkspace { id: "beta".into() }
+        );
+    }
+
+    #[test]
+    fn workspace_delete_confirm_left_returns_to_list() {
+        let mut p = ConfigPanel::new();
+        p.workspaces = vec![fake_workspace("alpha", true)];
+        p.view = ConfigView::DeleteWorkspaceConfirm(DeleteWorkspaceConfirm {
+            workspace_id: "alpha".into(),
+            workspace_name: "alpha".into(),
+            submitted: false,
+        });
+        p.handle_key(KeyCode::Left);
+        assert!(matches!(p.view, ConfigView::WorkspaceList));
+        assert_eq!(p.pending_db_request(), DbRequest::None);
+    }
+
+    #[test]
+    fn workspace_list_d_enters_set_default_and_submits_selection() {
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::WorkspaceList;
+        p.workspaces = vec![fake_workspace("alpha", true), fake_workspace("beta", false)];
+        p.handle_key(KeyCode::Char('d'));
+        p.handle_key(KeyCode::Down); // alpha -> beta
+        p.handle_key(KeyCode::Enter);
+        assert_eq!(
+            p.pending_db_request(),
+            DbRequest::SubmitSetDefaultWorkspace { id: "beta".into() }
+        );
+        p.clear_db_request();
+        assert_eq!(p.pending_db_request(), DbRequest::None);
+    }
+
+    #[test]
+    fn workspace_set_default_left_returns_to_list() {
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::SetDefaultWorkspace(SetDefaultWorkspaceSelect {
+            candidates: vec![fake_workspace("alpha", true)],
+            cursor: 0,
+            submitted: false,
+        });
+        p.handle_key(KeyCode::Left);
+        assert!(matches!(p.view, ConfigView::WorkspaceList));
     }
 }

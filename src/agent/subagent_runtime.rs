@@ -444,6 +444,10 @@ async fn run_once(params: &SubagentRunParams) -> std::result::Result<CompletedOu
 
     let max_turns = params.max_turns.unwrap_or(DEFAULT_MAX_TURNS).max(1);
     let attempt_timeout = attempt_timeout_duration(&params.definition.budget);
+    // v0.5.0 run 级工作区快照：本次 run 开始（读记忆/拼 prompt 之后、能力循环之前）
+    // 固化一次默认工作区，整个 run 的每轮能力调用复用同一快照——切换默认工作区
+    // 只影响之后开始的新 run，运行中的 subagent 保持旧工作区快照（任务书 §7）。
+    let frozen_host = params.executor.current_host_context();
     let mut calls: Vec<CapabilityCallRecord> = Vec::new();
     let mut logs: Vec<String> = Vec::new();
 
@@ -544,7 +548,9 @@ async fn run_once(params: &SubagentRunParams) -> std::result::Result<CompletedOu
                     .into_calls()
                     .expect("CapabilityCall/CapabilityCalls 才能展开为调用列表");
                 for invocation in invocations {
-                    let record = execute_one(params, &invocation, &mut logs, &mut messages).await;
+                    let record =
+                        execute_one(params, &invocation, &frozen_host, &mut logs, &mut messages)
+                            .await;
                     calls.push(record);
                 }
             }
@@ -563,6 +569,7 @@ async fn run_once(params: &SubagentRunParams) -> std::result::Result<CompletedOu
 async fn execute_one(
     params: &SubagentRunParams,
     invocation: &CapabilityInvocation,
+    frozen_host: &crate::logic::builtin::host_context::HostContext,
     logs: &mut Vec<String>,
     messages: &mut Vec<ChatMessage>,
 ) -> CapabilityCallRecord {
@@ -595,7 +602,7 @@ async fn execute_one(
         arguments: invocation.arguments.clone(),
     };
 
-    let outcome = CapabilityService::new(&params.registry, &params.executor)
+    let outcome = CapabilityService::new_with_host(&params.registry, &params.executor, frozen_host)
         .and_then(|service| service.execute_for_agent(actor_id, &call))
         .map(|result| result.output);
 

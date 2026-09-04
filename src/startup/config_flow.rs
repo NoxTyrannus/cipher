@@ -4,7 +4,8 @@ use crate::data::duckdb::loader::{
     find_provider_sample, insert_model, load_all_into_memory, rename_agent, set_default_agent,
     update_model_api_key_by_provider, ModelRow,
 };
-use crate::data::workspace_store::{WorkspaceRow, WorkspaceStore};
+use crate::data::workspace_store::WorkspaceStore;
+use crate::startup::cli::WorkspaceCommand;
 use dialoguer::{Input, Password, Select};
 use secrecy::SecretString;
 
@@ -16,6 +17,74 @@ const PRESET_TEMPLATES: &[(&str, &str, &str, &str)] = &[(
     "https://api.openai.com/v1",
     "OpenAI",
 )];
+
+pub fn run_workspace_command(
+    app: &AppState,
+    command: &WorkspaceCommand,
+) -> Result<(), AgentError> {
+    let store = WorkspaceStore::open(app.paths.storage_root())?;
+    match command {
+        WorkspaceCommand::List => {
+            let ws = store.list()?;
+            if ws.is_empty() {
+                println!("(无工作区)");
+                return Ok(());
+            }
+            for w in &ws {
+                let mark = if w.is_default { "★" } else { " " };
+                println!("[{}] {} | {} | {}", mark, w.id, w.name, w.path);
+            }
+            Ok(())
+        }
+        WorkspaceCommand::Add { path } => {
+            let path = path.to_string_lossy().to_string();
+            let p = std::path::Path::new(&path);
+            if !p.is_absolute() {
+                println!("错误: 工作区路径必须是绝对路径。");
+                return Ok(());
+            }
+            match store.add_from_path(&path) {
+                Ok(row) => {
+                    // v0.5.0 §6.1：路径不存在允许保存，但需给出提示（非交互 CLI 不做确认流）。
+                    if !p.exists() {
+                        println!(
+                            "提示: 该目录当前不存在，将按确认继续保存（新任务写入时会按需创建目录）。"
+                        );
+                    }
+                    println!("已新增工作区: {} -> {} ({})", row.id, row.name, row.path);
+                    Ok(())
+                }
+                Err(e) => {
+                    println!("新增失败: {e}");
+                    Ok(())
+                }
+            }
+        }
+        WorkspaceCommand::Delete { id } => match store.delete(id) {
+            Ok(Some(removed)) => {
+                println!("已删除工作区: {}", removed.id);
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(e) => {
+                println!("删除失败: {e}");
+                Ok(())
+            }
+        },
+        WorkspaceCommand::Use { id } | WorkspaceCommand::SetDefault { id } => {
+            match store.set_default(id) {
+                Ok(()) => {
+                    println!("已设置默认工作区 -> {}", id);
+                    Ok(())
+                }
+                Err(e) => {
+                    println!("设置默认失败: {e}");
+                    Ok(())
+                }
+            }
+        }
+    }
+}
 
 pub fn run(app: &AppState) -> Result<(), AgentError> {
     loop {
@@ -453,15 +522,17 @@ fn change_provider_key(app: &AppState) -> Result<(), AgentError> {
 fn manage_workspaces(app: &AppState) -> Result<(), AgentError> {
     loop {
         list_workspaces(app)?;
-        let items = vec!["新增 workspace", "返回 /config 主菜单"];
+        let items = vec!["新增工作区", "删除工作区", "设置默认工作区", "返回 /config 主菜单"];
         let sel = Select::new()
-            .with_prompt("workspace 管理")
+            .with_prompt("工作区管理")
             .items(&items)
             .default(0)
             .interact()
             .map_err(|e| AgentError::Parse(format!("ws mgmt select: {}", e)))?;
         match sel {
             0 => add_workspace(app)?,
+            1 => delete_workspace(app)?,
+            2 => set_default_workspace(app)?,
             _ => return Ok(()),
         }
     }
@@ -482,22 +553,89 @@ fn list_workspaces(app: &AppState) -> Result<(), AgentError> {
 }
 
 fn add_workspace(app: &AppState) -> Result<(), AgentError> {
-    let name = Input::<String>::new()
-        .with_prompt("workspace 名称")
-        .interact_text()
-        .map_err(|e| AgentError::Parse(format!("ws name: {}", e)))?;
     let path = Input::<String>::new()
-        .with_prompt("workspace path (绝对路径)")
+        .with_prompt("请输入工作区绝对路径")
         .interact_text()
         .map_err(|e| AgentError::Parse(format!("ws path: {}", e)))?;
-    let id = name.to_lowercase().replace(' ', "-");
-    WorkspaceStore::open(app.paths.storage_root())?.upsert(WorkspaceRow {
-        id,
-        name,
-        path,
-        is_default: false,
-    })?;
-    println!("已新增 workspace (切默认见主菜单族 4)");
+    let path = path.trim().to_string();
+    let p = std::path::Path::new(&path);
+    if !p.is_absolute() {
+        println!("路径必须是绝对路径，请重新输入。");
+        return Ok(());
+    }
+    if !p.exists() {
+        let items = vec!["继续（允许保存不存在路径）", "重新输入"];
+        let sel = Select::new()
+            .with_prompt("该目录当前不存在，是否继续？")
+            .items(&items)
+            .default(0)
+            .interact()
+            .map_err(|e| AgentError::Parse(format!("ws not exists confirm: {}", e)))?;
+        if sel == 1 {
+            return Ok(());
+        }
+    }
+    let store = WorkspaceStore::open(app.paths.storage_root())?;
+    match store.add_from_path(&path) {
+        Ok(row) => println!("已新增工作区: {} -> {} ({})", row.id, row.name, row.path),
+        Err(e) => println!("新增失败: {e}"),
+    }
+    Ok(())
+}
+
+fn delete_workspace(app: &AppState) -> Result<(), AgentError> {
+    let store = WorkspaceStore::open(app.paths.storage_root())?;
+    let ws = store.list()?;
+    if ws.len() <= 1 {
+        println!("至少需要保留一个工作区，无法删除。");
+        return Ok(());
+    }
+    let items: Vec<String> = ws
+        .iter()
+        .map(|w| {
+            format!(
+                "{} {} ({})",
+                if w.is_default { "★" } else { " " },
+                w.name,
+                w.path
+            )
+        })
+        .collect();
+    let sel = Select::new()
+        .with_prompt("选择要删除的工作区")
+        .items(&items)
+        .default(0)
+        .interact()
+        .map_err(|e| AgentError::Parse(format!("ws delete select: {}", e)))?;
+    let id = ws[sel].id.clone();
+    match store.delete(&id) {
+        Ok(Some(removed)) => println!("已删除工作区: {}", removed.id),
+        Ok(None) => println!("未删除任何工作区。"),
+        Err(e) => println!("删除失败: {e}"),
+    }
+    Ok(())
+}
+
+fn set_default_workspace(app: &AppState) -> Result<(), AgentError> {
+    let store = WorkspaceStore::open(app.paths.storage_root())?;
+    let ws = store.list()?;
+    if ws.is_empty() {
+        println!("无工作区，请先新增。");
+        return Ok(());
+    }
+    let items: Vec<String> = ws
+        .iter()
+        .map(|w| format!("{} ({})", w.name, w.path))
+        .collect();
+    let sel = Select::new()
+        .with_prompt("选择要设为默认的工作区")
+        .items(&items)
+        .default(0)
+        .interact()
+        .map_err(|e| AgentError::Parse(format!("ws set default select: {}", e)))?;
+    let id = ws[sel].id.clone();
+    store.set_default(&id)?;
+    println!("已设置默认工作区 -> {}", id);
     Ok(())
 }
 

@@ -515,6 +515,19 @@ impl ExecutionPlatform {
     }
 
     async fn execute_capability_calls(&self, raw: ExecutionPlatformRawOutput) -> ExecutionOutput {
+        // v0.5.0 轮级工作区快照：本批（一次执行中台轮）开始时固化一次默认工作区，
+        // 批内全部能力调用复用同一快照——切换默认工作区只影响之后开始的新批，
+        // 本批（运行中任务）保持旧工作区快照（任务书 §7）。
+        let frozen_host = self.executor.as_ref().map(|e| e.current_host_context());
+        self.execute_capability_calls_with_host(raw, frozen_host.as_ref())
+            .await
+    }
+
+    async fn execute_capability_calls_with_host(
+        &self,
+        raw: ExecutionPlatformRawOutput,
+        frozen_host: Option<&crate::logic::builtin::host_context::HostContext>,
+    ) -> ExecutionOutput {
         let mut actions = Vec::new();
         let mut created_real_id: Option<String> = None;
         let mut created_task_input: Option<String> = None;
@@ -565,7 +578,7 @@ impl ExecutionPlatform {
                     }
                 }
             }
-            let (record, output) = self.execute_one_call(call).await;
+            let (record, output) = self.execute_one_call(call, frozen_host).await;
             if record.capability_id == "subagent.create" {
                 if let Some(output) = output {
                     if let Some(id) = output
@@ -601,6 +614,7 @@ impl ExecutionPlatform {
     async fn execute_one_call(
         &self,
         call: RawCapabilityCall,
+        frozen_host: Option<&crate::logic::builtin::host_context::HostContext>,
     ) -> (CapabilityLifecycleRecord, Option<serde_json::Value>) {
         let capability_id = call.capability_id.clone();
         let arguments_summary = crate::common::json_util::truncate_head_tail(
@@ -626,7 +640,13 @@ impl ExecutionPlatform {
             );
         };
 
-        let service = match CapabilityService::new(registry, executor) {
+        // v0.5.0：轮级快照 host 存在时以其构造（同一批所有调用共享同一固化快照）；
+        // 无快照（测试直连路径）退化为构造时刻快照（等效现状）。
+        let service = match frozen_host {
+            Some(host) => CapabilityService::new_with_host(registry, executor, host),
+            None => CapabilityService::new(registry, executor),
+        };
+        let service = match service {
             Ok(service) => service,
             Err(e) => {
                 logs.push(format!("FAIL {capability_id}: {e}"));

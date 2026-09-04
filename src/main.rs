@@ -14,6 +14,7 @@ async fn main() {
         Commands::Setup => startup::entry::run_setup(config_path, data_dir).await,
         Commands::Run => startup::entry::run_normal(config_path, data_dir).await,
         Commands::Config => startup::entry::run_config(config_path, data_dir).await,
+        Commands::Workspace(cmd) => startup::entry::run_workspace_command(cmd, config_path, data_dir).await,
     };
 
     if let Err(e) = result {

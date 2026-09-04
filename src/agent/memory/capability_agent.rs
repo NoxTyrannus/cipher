@@ -82,6 +82,9 @@ pub async fn run_capability_loop(
     let mut calls = Vec::new();
     let mut logs = Vec::new();
     let mut summary = String::new();
+    // v0.5.0 批级工作区快照：本能力循环（记忆 agent 一次处理批）开始时固化默认
+    // 工作区，批内全部调用复用同一快照（任务书 §7 运行中任务保持旧快照）。
+    let frozen_host = executor.current_host_context();
 
     for turn in 0..max_turns {
         let request = LlmRequest::from_model_row(model_row, messages.clone(), api_key.clone())
@@ -147,7 +150,7 @@ pub async fn run_capability_loop(
                             .unwrap_or_else(|| capability_name.clone()),
                         arguments: invocation.arguments.clone(),
                     };
-                    let outcome = CapabilityService::new(registry, executor)
+                    let outcome = CapabilityService::new_with_host(registry, executor, &frozen_host)
                         .and_then(|service| service.execute_for_agent(&req.actor_id, &call))
                         .map(|result| result.output);
                     let record = match outcome {

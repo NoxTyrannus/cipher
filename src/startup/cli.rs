@@ -21,6 +21,18 @@ pub enum Commands {
     Run,
 
     Config,
+
+    #[command(name = "workspace", subcommand)]
+    Workspace(WorkspaceCommand),
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceCommand {
+    List,
+    Add { path: PathBuf },
+    Delete { id: String },
+    Use { id: String },
+    SetDefault { id: String },
 }
 
 pub fn parse() -> Cli {
@@ -88,5 +100,66 @@ mod tests {
     fn parse_command_defaults_run() {
         let cli = Cli::try_parse_from(["cipher"]).unwrap();
         assert_eq!(cli.command.unwrap_or(Commands::Run), Commands::Run);
+    }
+
+    // ---- v0.5.0 workspace 子命令族（任务书 §5）----
+
+    #[test]
+    fn workspace_list_subcommand() {
+        let cli = Cli::try_parse_from(["cipher", "workspace", "list"]).unwrap();
+        assert_eq!(cli.command, Some(Commands::Workspace(WorkspaceCommand::List)));
+    }
+
+    #[test]
+    fn workspace_add_subcommand_takes_path() {
+        let cli =
+            Cli::try_parse_from(["cipher", "workspace", "add", "/tmp/project-a"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Commands::Workspace(WorkspaceCommand::Add {
+                path: PathBuf::from("/tmp/project-a")
+            }))
+        );
+    }
+
+    #[test]
+    fn workspace_delete_subcommand_takes_id() {
+        let cli = Cli::try_parse_from(["cipher", "workspace", "delete", "project-a"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Commands::Workspace(WorkspaceCommand::Delete {
+                id: "project-a".to_string()
+            }))
+        );
+    }
+
+    #[test]
+    fn workspace_use_subcommand_takes_id() {
+        let cli = Cli::try_parse_from(["cipher", "workspace", "use", "project-a"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Commands::Workspace(WorkspaceCommand::Use {
+                id: "project-a".to_string()
+            }))
+        );
+    }
+
+    #[test]
+    fn workspace_set_default_subcommand_takes_id() {
+        let cli =
+            Cli::try_parse_from(["cipher", "workspace", "set-default", "project-a"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Commands::Workspace(WorkspaceCommand::SetDefault {
+                id: "project-a".to_string()
+            }))
+        );
+    }
+
+    #[test]
+    fn workspace_missing_subcommand_errors() {
+        assert!(Cli::try_parse_from(["cipher", "workspace"]).is_err());
+        assert!(Cli::try_parse_from(["cipher", "workspace", "list", "extra"]).is_err());
+        assert!(Cli::try_parse_from(["cipher", "workspace", "add"]).is_err());
     }
 }

@@ -9,7 +9,7 @@ use crate::logic::builtin::host_context::HostContext;
 #[cfg(test)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
@@ -43,7 +43,8 @@ pub enum SubagentSpawnEvent {
 pub struct CapabilityExecutor {
     #[cfg(test)]
     registry: HashMap<String, Arc<dyn BaseCapability>>,
-    host_context: HostContext,
+    workspace_root: Arc<RwLock<PathBuf>>,
+    extra_read_roots: Arc<RwLock<Vec<PathBuf>>>,
     duckdb: Option<Arc<std::sync::Mutex<duckdb::Connection>>>,
     triviumdb: Option<Arc<std::sync::Mutex<TriviumDb>>>,
     thought_store: Option<Arc<ThoughtStore>>,
@@ -66,24 +67,44 @@ const ALLOWED_TABLES: &[&str] = &[
 ];
 
 impl CapabilityExecutor {
-    pub fn set_workspace_root(&mut self, workspace_root: &Path) {
-        self.host_context = HostContext::for_workspace(workspace_root.to_path_buf());
+    pub fn set_workspace_root(&self, workspace_root: &Path) {
+        if let Ok(mut root) = self.workspace_root.write() {
+            *root = workspace_root.to_path_buf();
+        }
     }
 
     /// v0.4.8：把 `[fs] read_roots` 追加为额外文件读根（不改写根）。
-    /// 需在 `set_workspace_root` 之后调用；extra 为空时无操作（行为与现状一致）。
-    pub fn set_extra_read_roots(&mut self, extra: &[PathBuf]) {
-        self.host_context.add_read_roots(extra);
+    /// 需在 `set_workspace_root` 之后调用；extra 为空时行为与现状一致。
+    pub fn set_extra_read_roots(&self, extra: &[PathBuf]) {
+        if let Ok(mut roots) = self.extra_read_roots.write() {
+            *roots = extra.to_vec();
+        }
     }
 
-    fn execute_builtin(
+    /// 当前执行权限根快照（运行时热切换的「当前默认工作区」状态）。
+    ///
+    /// 单次调用时由 [`Self::execute`] 读取；执行轮/subagent run 的调用方（如
+    /// `CapabilityService` 构造）应在轮/run 开始时快照一次并把同一快照贯穿整轮，
+    /// 使切换默认工作区只影响之后开始的新任务（任务书 §7）。
+    pub fn current_host_context(&self) -> HostContext {
+        let root = self.workspace_root.read().map(|r| r.clone()).unwrap_or_default();
+        let extra = self
+            .extra_read_roots
+            .read()
+            .map(|r| r.clone())
+            .unwrap_or_default();
+        HostContext::for_workspace_with_roots(root, extra)
+    }
+
+    /// 以调用方提供的 host 快照执行内置能力（轮/run 级快照的落点）。
+    fn execute_builtin_with(
         &self,
         actor_id: &str,
         _id: &str,
         builtin_name: &str,
         input: &Schema,
+        host: &HostContext,
     ) -> Result<Schema> {
-        let host = &self.host_context;
         let result: std::result::Result<Schema, String> = match builtin_name {
             "path.exists" => crate::logic::builtin::host_functions::host_path_exists(host, input),
             "file.glob" => crate::logic::builtin::host_functions::host_file_glob(host, input),
@@ -140,7 +161,8 @@ impl CapabilityExecutor {
         Self {
             #[cfg(test)]
             registry: HashMap::new(),
-            host_context: HostContext::deny_all(),
+            workspace_root: Arc::new(RwLock::new(PathBuf::new())),
+            extra_read_roots: Arc::new(RwLock::new(Vec::new())),
             duckdb: None,
             triviumdb: None,
             thought_store: None,
@@ -201,6 +223,9 @@ impl CapabilityExecutor {
     /// `actor_id` 是调用方 agent（授权审计的 granter/执行者身份）；`id` 为
     /// registry 契约 id；`registry` 为只读注册表快照；`input` 为已通过
     /// schema_in 校验的参数。
+    ///
+    /// host 权限根取「调用时刻」的当前默认工作区快照（无轮/run 固化）。
+    /// 需要整轮固化的调用方请用 [`Self::execute_with_host`]。
     pub fn execute(
         &self,
         actor_id: &str,
@@ -208,9 +233,27 @@ impl CapabilityExecutor {
         registry: &Registry,
         input: &Schema,
     ) -> Result<Schema> {
+        let host = self.current_host_context();
+        self.execute_with_host(actor_id, id, registry, input, &host)
+    }
+
+    /// 以调用方提供的 host 快照执行一个 base capability（轮/run 级快照入口）。
+    ///
+    /// 调用方（执行中台每轮、subagent runtime 每次 run）在任务开始时从
+    /// `current_host_context()` 固化一次 host，并把同一快照贯穿该任务的所有
+    /// 能力调用——运行时切换默认工作区后，已存在的任务继续使用旧快照，
+    /// 只有新任务使用新默认工作区（任务书 v0.5.0 §7）。
+    pub fn execute_with_host(
+        &self,
+        actor_id: &str,
+        id: &str,
+        registry: &Registry,
+        input: &Schema,
+        host: &HostContext,
+    ) -> Result<Schema> {
         if let Some(row) = registry.base_capabilities.get(id) {
             if let Some(builtin_name) = row.executor.strip_prefix("builtin:") {
-                return self.execute_builtin(actor_id, id, builtin_name, input);
+                return self.execute_builtin_with(actor_id, id, builtin_name, input, host);
             }
 
             #[cfg(test)]
@@ -574,7 +617,7 @@ mod tests {
                 metadata: None,
             },
         );
-        let mut ex = CapabilityExecutor::new();
+        let ex = CapabilityExecutor::new();
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
         ex.set_workspace_root(repo_root);
         let out = ex.execute(
@@ -632,7 +675,7 @@ mod tests {
             },
         );
 
-        let mut ex = CapabilityExecutor::new();
+        let ex = CapabilityExecutor::new();
         ex.set_workspace_root(&ws);
 
         // 未配置额外读根：追加根内文件不可读（行为与现状一致，返回结构化错误）。
@@ -659,6 +702,150 @@ mod tests {
         assert_eq!(
             ok.get("content").and_then(|v| v.as_str()),
             Some("from-extra")
+        );
+    }
+
+    /// v0.5.0 热切换：`set_workspace_root` 后，不经固化的下一次 `execute` 立即用新根
+    /// （相对路径以新根为基准解析）。
+    #[test]
+    fn builtin_file_read_follows_hot_switched_root_on_next_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_a = dir.path().join("ws-a");
+        let root_b = dir.path().join("ws-b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        std::fs::write(root_a.join("note.txt"), "from-a").unwrap();
+        std::fs::write(root_b.join("note.txt"), "from-b").unwrap();
+
+        let mut reg = Registry::new();
+        reg.base_capabilities.insert(
+            "file.read".into(),
+            BaseCapabilityRow {
+                id: "file.read".into(),
+                name: "Read File".into(),
+                cap_type: "function".into(),
+                description: "read".into(),
+                schema_in: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+                schema_out: serde_json::json!({}),
+                executor: "builtin:file.read".into(),
+                version: "1.0.0".into(),
+                enabled: true,
+                tombstoned_at: None,
+                metadata: None,
+            },
+        );
+
+        let ex = CapabilityExecutor::new();
+        ex.set_workspace_root(&root_a);
+        let before = ex
+            .execute(
+                "actor",
+                "file.read",
+                &reg,
+                &serde_json::json!({"path": "note.txt"}),
+            )
+            .expect("a-root read should be a structured result");
+        assert_eq!(
+            before.get("content").and_then(|v| v.as_str()),
+            Some("from-a")
+        );
+
+        ex.set_workspace_root(&root_b);
+        let after = ex
+            .execute(
+                "actor",
+                "file.read",
+                &reg,
+                &serde_json::json!({"path": "note.txt"}),
+            )
+            .expect("b-root read should be a structured result");
+        assert_eq!(
+            after.get("content").and_then(|v| v.as_str()),
+            Some("from-b"),
+            "热切换后下一次调用应使用新工作区根"
+        );
+    }
+
+    /// v0.5.0 轮/run 级快照：`execute_with_host` 用调用方固化快照执行；
+    /// 固化后热切换不影响已固化调用，新快照才落到新根。
+    #[test]
+    fn execute_with_host_freezes_old_snapshot_across_hot_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root_a = dir.path().join("ws-a");
+        let root_b = dir.path().join("ws-b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        std::fs::write(root_a.join("note.txt"), "from-a").unwrap();
+        std::fs::write(root_b.join("note.txt"), "from-b").unwrap();
+
+        let mut reg = Registry::new();
+        reg.base_capabilities.insert(
+            "file.read".into(),
+            BaseCapabilityRow {
+                id: "file.read".into(),
+                name: "Read File".into(),
+                cap_type: "function".into(),
+                description: "read".into(),
+                schema_in: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+                schema_out: serde_json::json!({}),
+                executor: "builtin:file.read".into(),
+                version: "1.0.0".into(),
+                enabled: true,
+                tombstoned_at: None,
+                metadata: None,
+            },
+        );
+
+        let ex = CapabilityExecutor::new();
+        ex.set_workspace_root(&root_a);
+        // 轮开始：固化 host（旧工作区快照）。
+        let frozen = ex.current_host_context();
+        let frozen_read = ex
+            .execute_with_host(
+                "actor",
+                "file.read",
+                &reg,
+                &serde_json::json!({"path": "note.txt"}),
+                &frozen,
+            )
+            .expect("frozen read should be structured");
+        assert_eq!(
+            frozen_read.get("content").and_then(|v| v.as_str()),
+            Some("from-a")
+        );
+
+        // 热切换到 B：运行中任务（固化快照）仍读 A。
+        ex.set_workspace_root(&root_b);
+        let old_task = ex
+            .execute_with_host(
+                "actor",
+                "file.read",
+                &reg,
+                &serde_json::json!({"path": "note.txt"}),
+                &frozen,
+            )
+            .expect("old snapshot read should stay structured");
+        assert_eq!(
+            old_task.get("content").and_then(|v| v.as_str()),
+            Some("from-a"),
+            "运行中任务保持旧工作区快照"
+        );
+
+        // 新任务（新固化）落到新根 B。
+        let fresh = ex.current_host_context();
+        let new_task = ex
+            .execute_with_host(
+                "actor",
+                "file.read",
+                &reg,
+                &serde_json::json!({"path": "note.txt"}),
+                &fresh,
+            )
+            .expect("new snapshot read should be structured");
+        assert_eq!(
+            new_task.get("content").and_then(|v| v.as_str()),
+            Some("from-b"),
+            "新任务使用新默认工作区"
         );
     }
 }
