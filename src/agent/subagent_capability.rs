@@ -887,9 +887,23 @@ fn method_invoke(
         })
         .unwrap_or_default();
 
+    let observations: Vec<String> = metadata
+        .get("observations")
+        .and_then(|value| value.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let method_experience = if observations.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n## 方法经验\n{}", observations.join("\n"))
+    };
     let method_prompt = format!(
-        "你是“{}”方法的执行单元。请先完整阅读下方方法文档，再组织可用的原子/分子能力完成任务。\n\n## 方法文档\n{}\n\n## 本次任务\n{}",
-        method_id, full_document, task_input
+        "你是“{}”方法的执行单元。请先完整阅读下方方法文档，再组织可用的原子/分子能力完成任务。\n\n## 方法文档\n{}{}\n\n## 本次任务\n{}",
+        method_id, full_document, method_experience, task_input
     );
 
     // 3. 创建方法执行子代理；allowlist 先为空，所需能力随后自动授予。

@@ -89,13 +89,20 @@
         "web.fetch.public",
         "file.write",
         "file.read",
-        "text.grep"
+        "text.grep",
+        "shell.exec"
       ],
       "optional_capabilities": [
         "shell.exec"
       ],
       "state_machine": "source_select -> fetch -> classify -> parse_or_fallback -> report",
-      "observations": [],
+      "observations": [
+        {
+          "observation": "Kaggle 比赛页是 SPA，但公开内部 RPC 接口可拿到完整数据：GetCompetition?competitionId=<id> 和 PageService/ListPages?competitionId=<id>。ListPages 返回约 108KB，web.fetch.public 50K 截断会丢失 Evaluation/Prizes/How to Play 等页；应使用 shell.exec + curl 保存完整 JSON 到本地，再用 file.read/text.grep 解析。",
+          "suggestion": "当目标为 Kaggle 比赛时，先调用 GetCompetition 和 PageService/ListPages，且大响应用 curl 落盘而非仅靠 web.fetch.public。",
+          "source_ref": "R1_EXEC"
+        }
+      ],
       "allow_observe_append": true
     }
   }
