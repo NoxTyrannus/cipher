@@ -19,6 +19,7 @@ const TARGET_TABLES: &[&str] = &[
     "agent",
     "base_capability",
     "composite_capability",
+    "method_call_audit",
     "model",
     "permission_grants",
     "usage_method",
@@ -84,10 +85,34 @@ CREATE TABLE IF NOT EXISTS web_fetch_audit (
     called_at TEXT NOT NULL,
     called_by TEXT NOT NULL,
     url TEXT NOT NULL,
+    execut TEXT NOT NULL DEFAULT 'done',
     http_code INTEGER,
     bytes INTEGER,
     extracted_chars INTEGER,
     error TEXT
+);
+"#
+    };
+}
+
+
+/// v0.5.0 方法调用审计表：方法级调用记录。
+macro_rules! method_call_audit_ddl {
+    () => {
+        r#"
+CREATE TABLE IF NOT EXISTS method_call_audit (
+    id TEXT PRIMARY KEY,
+    method_id TEXT NOT NULL,
+    called_at TEXT NOT NULL,
+    called_by TEXT NOT NULL,
+    granted_capabilities JSON,
+    executed_atoms JSON,
+    state_machine_state TEXT,
+    result JSON,
+    status TEXT NOT NULL,
+    error TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 "#
     };
@@ -162,6 +187,7 @@ CREATE TABLE usage_method (
 );"#,
     permission_grants_ddl!(),
     web_fetch_audit_ddl!(),
+    method_call_audit_ddl!(),
 );
 
 const MODEL_COLUMNS: &[&str] = &[
@@ -249,10 +275,25 @@ const WEB_FETCH_AUDIT_COLUMNS: &[&str] = &[
     "called_at",
     "called_by",
     "error",
+    "execut",
     "extracted_chars",
     "http_code",
     "id",
     "url",
+];
+const METHOD_CALL_AUDIT_COLUMNS: &[&str] = &[
+    "called_at",
+    "called_by",
+    "created_at",
+    "error",
+    "executed_atoms",
+    "granted_capabilities",
+    "id",
+    "method_id",
+    "result",
+    "state_machine_state",
+    "status",
+    "updated_at",
 ];
 
 type CapabilityIds = BTreeSet<String>;
@@ -448,6 +489,7 @@ pub fn validate_current_duckdb_connection(
     require_exact_columns(connection, "usage_method", USAGE_COLUMNS)?;
     require_exact_columns(connection, "permission_grants", PERMISSION_GRANT_COLUMNS)?;
     require_exact_columns(connection, "web_fetch_audit", WEB_FETCH_AUDIT_COLUMNS)?;
+    require_exact_columns(connection, "method_call_audit", METHOD_CALL_AUDIT_COLUMNS)?;
 
     let table_counts = table_counts(connection, TARGET_TABLES)?;
     Ok(DuckdbValidationReport { table_counts })
@@ -476,6 +518,21 @@ pub fn ensure_web_fetch_audit_table(connection: &duckdb::Connection) -> Result<(
     connection
         .execute_batch(web_fetch_audit_ddl!())
         .map_err(|error| migration_error(format!("ensure web_fetch_audit table: {error}")))?;
+    // v0.5.0：补齐 execut 完成态列（旧表幂等升级）。
+    connection
+        .execute_batch("ALTER TABLE web_fetch_audit ADD COLUMN IF NOT EXISTS execut TEXT")
+        .map_err(|error| migration_error(format!("ensure web_fetch_audit.execut column: {error}")))?;
+    connection
+        .execute_batch("UPDATE web_fetch_audit SET execut = 'done' WHERE execut IS NULL")
+        .map_err(|error| migration_error(format!("backfill web_fetch_audit.execut: {error}")))?;
+    Ok(())
+}
+
+/// v0.5.0 旧数据目录补建方法调用审计表。
+pub fn ensure_method_call_audit_table(connection: &duckdb::Connection) -> Result<()> {
+    connection
+        .execute_batch(method_call_audit_ddl!())
+        .map_err(|error| migration_error(format!("ensure method_call_audit table: {error}")))?;
     Ok(())
 }
 
@@ -1691,11 +1748,11 @@ mod tests {
     }
 
     #[test]
-    fn fresh_candidate_has_exact_seven_empty_tables() {
+    fn fresh_candidate_has_exact_eight_empty_tables() {
         let (_temporary, _source, staging) = roots();
         let report = build_duckdb_candidate(None, &staging).unwrap();
         assert!(report.fresh);
-        assert_eq!(report.target_counts.len(), 7);
+        assert_eq!(report.target_counts.len(), 8);
         assert!(report.target_counts.values().all(|count| *count == 0));
         let validation = validate_current_duckdb(&staging.join(CANDIDATE_DUCKDB_FILE)).unwrap();
         assert_eq!(validation.table_counts, report.target_counts);

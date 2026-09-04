@@ -631,6 +631,7 @@ const EXECUTION_PLATFORM_CAPS: &[&str] = &[
     "subagent.delete",
     "permission.grant",
     "permission.revoke",
+    "method.invoke",
 ];
 
 /// execution-platform 平台行（v0.4.4）：六个 subagent.* + permission.grant/revoke。
@@ -1111,6 +1112,7 @@ mod tests {
             "subagent.delete",
             "permission.grant",
             "permission.revoke",
+            "method.invoke",
             "shell.exec",
         ] {
             assert!(
@@ -1131,7 +1133,7 @@ mod tests {
         let allowlist: serde_json::Value = serde_json::from_str(&text.unwrap()).unwrap();
         assert_eq!(
             allowlist.as_array().unwrap().len(),
-            9,
+            10,
             "再次 seed 不得重复追加能力"
         );
     }
@@ -1240,6 +1242,7 @@ mod tests {
             "subagent.delete",
             "permission.grant",
             "permission.revoke",
+            "method.invoke",
         ] {
             assert!(
                 exec_ids.contains(&expected),
@@ -1530,7 +1533,7 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "{id} 应被补插");
         }
-        // 补插行含内置 allowlist（execution-platform 8 能力）。
+        // 补插行含内置 allowlist（execution-platform 9 能力）。
         let exec_text: Option<String> = conn
             .query_row(
                 "SELECT CAST(capability_allowlist AS VARCHAR) FROM agent WHERE id = 'execution-platform'",
@@ -1550,6 +1553,7 @@ mod tests {
             "subagent.run",
             "permission.grant",
             "permission.revoke",
+            "method.invoke",
         ] {
             assert!(
                 exec_ids.contains(&expected),

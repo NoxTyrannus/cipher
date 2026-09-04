@@ -19,7 +19,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn creates_exactly_seven_tables() {
+    fn creates_exactly_eight_tables() {
         let connection = duckdb::Connection::open_in_memory().expect("open DuckDB");
         create_all_tables(&connection).expect("create schema");
 
@@ -41,6 +41,7 @@ mod tests {
                 "agent",
                 "base_capability",
                 "composite_capability",
+                "method_call_audit",
                 "model",
                 "permission_grants",
                 "usage_method",
@@ -71,10 +72,45 @@ mod tests {
                 "called_at",
                 "called_by",
                 "error",
+                "execut",
                 "extracted_chars",
                 "http_code",
                 "id",
                 "url",
+            ]
+        );
+    }
+
+    #[test]
+    fn method_call_audit_table_has_expected_columns() {
+        let connection = duckdb::Connection::open_in_memory().expect("open DuckDB");
+        create_all_tables(&connection).expect("create schema");
+        let mut statement = connection
+            .prepare(
+                "SELECT column_name FROM information_schema.columns \
+                 WHERE table_schema = 'main' AND table_name = 'method_call_audit' ORDER BY column_name",
+            )
+            .expect("prepare column query");
+        let columns: Vec<String> = statement
+            .query_map([], |row| row.get(0))
+            .expect("query columns")
+            .collect::<duckdb::Result<_>>()
+            .expect("read columns");
+        assert_eq!(
+            columns,
+            [
+                "called_at",
+                "called_by",
+                "created_at",
+                "error",
+                "executed_atoms",
+                "granted_capabilities",
+                "id",
+                "method_id",
+                "result",
+                "state_machine_state",
+                "status",
+                "updated_at",
             ]
         );
     }

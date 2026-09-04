@@ -59,6 +59,15 @@ pub fn bootstrap(data_dir: &Path) -> Result<AppState, AgentError> {
         ));
     }
 
+    // v0.5.0 旧数据目录补建方法调用审计表。
+    if let Err(error) = super::migration::ensure_method_call_audit_table(&conn) {
+        drop(conn);
+        return Err(merge_permission_error(
+            error,
+            secure_duckdb_files(&duckdb_path),
+        ));
+    }
+
     if let Err(error) = validate_current_duckdb_connection(&conn) {
         drop(conn);
         return Err(merge_permission_error(

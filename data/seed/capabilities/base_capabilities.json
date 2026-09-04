@@ -1826,6 +1826,71 @@
       "version": "1.0.0",
       "enabled": true,
       "partition": "system"
+    },
+    {
+      "id": "method.invoke",
+      "name": "Invoke Method",
+      "type": "function",
+      "description": "调用一个方法（方法库中的最大包裹体）：加载方法完整文档，自动授权方法内所需能力，创建/复用方法执行单元，输出方法调用信息。",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "method_id": {
+            "type": "string"
+          },
+          "task_input": {
+            "type": "string"
+          },
+          "model_id": {
+            "type": "string"
+          },
+          "called_by": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "method_id",
+          "task_input",
+          "model_id"
+        ],
+        "additionalProperties": false
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "method_id": {
+            "type": "string"
+          },
+          "method_call_id": {
+            "type": "string"
+          },
+          "subagent_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "granted_capabilities": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "success",
+          "method_id",
+          "status"
+        ],
+        "additionalProperties": false
+      },
+      "executor": "builtin:method.invoke",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
     }
   ]
 }

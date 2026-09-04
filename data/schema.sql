@@ -95,8 +95,25 @@ CREATE TABLE IF NOT EXISTS web_fetch_audit (
     called_at TEXT NOT NULL,
     called_by TEXT NOT NULL,
     url TEXT NOT NULL,
+    execut TEXT NOT NULL DEFAULT 'done',
     http_code INTEGER,
     bytes INTEGER,
     extracted_chars INTEGER,
     error TEXT
+);
+
+-- v0.5.0 方法调用审计表：方法级调用记录（原子/分子调用仍走各自审计）。
+CREATE TABLE IF NOT EXISTS method_call_audit (
+    id TEXT PRIMARY KEY,
+    method_id TEXT NOT NULL,
+    called_at TEXT NOT NULL,
+    called_by TEXT NOT NULL,
+    granted_capabilities JSON,
+    executed_atoms JSON,
+    state_machine_state TEXT,
+    result JSON,
+    status TEXT NOT NULL,
+    error TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

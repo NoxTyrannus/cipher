@@ -211,7 +211,21 @@ fn execute_with_getter(
             &format!("redirects are rejected (status {})", outcome.status),
         );
     }
-    // 6) 响应体 ≤200KB 硬限。
+    // 6) 外部语义：非 2xx 一律视为外部失败（execut 仍为 done）。
+    if !(200..300).contains(&outcome.status) {
+        return record_and_fail(
+            conn,
+            actor_id,
+            url,
+            AuditMetrics {
+                http_code: Some(status),
+                ..AuditMetrics::default()
+            },
+            "http_error",
+            &format!("HTTP {} response", outcome.status),
+        );
+    }
+    // 7) 响应体 ≤200KB 硬限。
     let bytes = outcome.body.len() as i64;
     if outcome.body.len() > MAX_BODY_BYTES {
         return record_and_fail(
@@ -242,6 +256,7 @@ fn execute_with_getter(
         "",
     )?;
     Ok(json!({
+        "execut": "done",
         "success": true,
         "url": url,
         "http_code": status,
@@ -298,11 +313,28 @@ fn record_and_fail(
         metrics.extracted_chars,
         code,
     )?;
-    Ok(fail(code, message))
+    let mut value = fail(code, message);
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("url".to_string(), serde_json::Value::String(url.to_string()));
+        if let Some(http_code) = metrics.http_code {
+            obj.insert("http_code".to_string(), serde_json::Value::Number(http_code.into()));
+        }
+        if let Some(bytes) = metrics.bytes {
+            obj.insert("bytes".to_string(), serde_json::Value::Number(bytes.into()));
+        }
+        if let Some(chars) = metrics.extracted_chars {
+            obj.insert(
+                "extracted_chars".to_string(),
+                serde_json::Value::Number(chars.into()),
+            );
+        }
+    }
+    Ok(value)
 }
 
 fn fail(code: &str, message: &str) -> Value {
     json!({
+        "execut": "done",
         "success": false,
         "error": {"code": code, "message": message},
     })
@@ -323,8 +355,8 @@ fn write_audit(
     let called_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
     conn.execute(
         "INSERT INTO web_fetch_audit \
-         (id, called_at, called_by, url, http_code, bytes, extracted_chars, error) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, called_at, called_by, url, execut, http_code, bytes, extracted_chars, error) \
+         VALUES (?, ?, ?, ?, 'done', ?, ?, ?, ?)",
         duckdb::params![
             id,
             called_at,
@@ -542,6 +574,25 @@ mod tests {
         assert_eq!(rows[0].2, 200);
         assert_eq!(rows[0].3, 60_000);
         assert_eq!(rows[0].4, 60_000);
+    }
+
+    #[test]
+    fn http_404_is_external_failure_but_execution_done() {
+        let conn = memory_db();
+        let out = execute_with_getter(
+            &conn,
+            &["kaggle.com".to_string()],
+            "sg-1",
+            &json!({"url": "https://kaggle.com/missing"}),
+            &MockGetter::ok(404, b"<html>not found</html>"),
+        )
+        .unwrap();
+        assert_eq!(out["execut"], "done");
+        assert_eq!(out["success"], false);
+        assert_eq!(out["http_code"], 404);
+        assert_eq!(out["error"]["code"], "http_error");
+        let rows = audit_rows(&conn);
+        assert_eq!(rows[0].5, "http_error");
     }
 
     #[test]

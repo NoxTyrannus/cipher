@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 pub const SUBAGENT_MOLECULE_PREFIX: &str = "subagent.";
 /// `usage_method.observe` 分子 id。
 pub const USAGE_METHOD_OBSERVE_ID: &str = "usage_method.observe";
+pub const METHOD_INVOKE_ID: &str = "method.invoke";
 
 const DEFAULT_MEMORY_WINDOW_PCT: u8 = 80;
 const DEFAULT_BRIEFING: bool = true;
@@ -302,6 +303,7 @@ pub fn execute_subagent_capability(
         "subagent.wake" => subagent_wake(duckdb, storage_root, args),
         "subagent.delete" => subagent_delete(duckdb, storage_root, args),
         USAGE_METHOD_OBSERVE_ID => usage_observe(duckdb, storage_root, args),
+        METHOD_INVOKE_ID => method_invoke(duckdb, storage_root, args, spawn_hook),
         other => Err(SubagentError::rejected(format!(
             "unknown subagent molecule: {other}"
         ))),
@@ -838,6 +840,119 @@ fn subagent_delete(
             "archived": true,
         }),
         final_state: "completed",
+        invocation_id,
+    })
+}
+
+fn method_invoke(
+    duckdb: &Arc<std::sync::Mutex<duckdb::Connection>>,
+    storage_root: &Path,
+    args: &serde_json::Value,
+    spawn_hook: Option<&dyn SubagentSpawnHook>,
+) -> std::result::Result<MoleculeOutcome, SubagentError> {
+    let method_id = required_str(args, "method_id")?;
+    let task_input = required_str(args, "task_input")?;
+    let model_id = required_str(args, "model_id")?;
+    let called_by = args
+        .get("called_by")
+        .and_then(|value| value.as_str())
+        .unwrap_or("execution-platform");
+
+    // 1. method.invoke 自身 invocation 预写。
+    let invocation_id = {
+        let guard = lock_molecule_duckdb(duckdb, "method.invoke")?;
+        prewrite_invocation(&guard, storage_root, METHOD_INVOKE_ID, args)
+            .map_err(|error| SubagentError::failed(format!("method.invoke prewrite failed: {error}")))?
+    };
+
+    // 2. 读取方法定义（注册表只读 brief，这里取完整文档）。
+    let (brief, metadata) = {
+        let guard = lock_molecule_duckdb(duckdb, "method.invoke")?;
+        read_usage_method(&guard, method_id)
+            .map_err(SubagentError::from_agent)?
+    };
+    let full_document = metadata
+        .get("full_document")
+        .and_then(|value| value.as_str())
+        .unwrap_or(&brief)
+        .to_string();
+    let required_capabilities: Vec<String> = metadata
+        .get("required_capabilities")
+        .and_then(|value| value.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let method_prompt = format!(
+        "你是“{}”方法的执行单元。请先完整阅读下方方法文档，再组织可用的原子/分子能力完成任务。\n\n## 方法文档\n{}\n\n## 本次任务\n{}",
+        method_id, full_document, task_input
+    );
+
+    // 3. 创建方法执行子代理；allowlist 先为空，所需能力随后自动授予。
+    let create_args = serde_json::json!({
+        "template_id": "subagent.template.normal",
+        "model_id": model_id,
+        "prompt": method_prompt,
+        "task_input": task_input,
+        "capability_allowlist": [],
+        "name": format!("method-{}", method_id),
+    });
+    let create_out = subagent_create(duckdb, storage_root, &create_args, spawn_hook)?;
+    let subagent_id = create_out
+        .output
+        .get("subagent_id")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| SubagentError::failed("method.invoke: create output missing subagent_id"))?
+        .to_string();
+
+    // 4. 自动授权方法内所需能力（统一由执行中台授权，one-shot 最小权限）。
+    let mut granted = Vec::new();
+    for capability_id in &required_capabilities {
+        let grant_args = serde_json::json!({
+            "target_agent_id": subagent_id,
+            "capability_id": capability_id,
+            "mode": "one_shot",
+        });
+        let guard = lock_molecule_duckdb(duckdb, "method.invoke")?;
+        crate::logic::capability::permission::grant(&guard, called_by, &grant_args)
+            .map_err(SubagentError::from_agent)?;
+        granted.push(capability_id.clone());
+    }
+
+    // 5. 运行方法执行子代理。
+    let run_args = serde_json::json!({
+        "subagent_id": subagent_id,
+        "task_input": task_input,
+    });
+    let _run_out = subagent_run(duckdb, storage_root, &run_args, spawn_hook)?;
+
+    // 6. 写入方法调用审计。
+    let method_call_id = {
+        let guard = lock_molecule_duckdb(duckdb, "method.invoke")?;
+        write_method_call_audit_row(
+            &guard,
+            method_id,
+            called_by,
+            &granted,
+            &subagent_id,
+        )
+        .map_err(SubagentError::from_agent)?
+    };
+
+    Ok(MoleculeOutcome {
+        output: serde_json::json!({
+            "success": true,
+            "method_id": method_id,
+            "method_call_id": method_call_id,
+            "subagent_id": subagent_id,
+            "status": "running",
+            "granted_capabilities": granted,
+        }),
+        final_state: "accepted",
         invocation_id,
     })
 }
@@ -1569,6 +1684,38 @@ fn contains_secret_marker(key: &str) -> bool {
 
 /// 只 UPDATE usage_method 行（observation/suggestion 写入 prompt 追加段或 metadata.observations）；
 /// 无对应 usage_method 行时按 capability_id 新建一行。禁止改 base/composite 稳定契约。
+fn write_method_call_audit_row(
+    conn: &duckdb::Connection,
+    method_id: &str,
+    called_by: &str,
+    granted: &[String],
+    subagent_id: &str,
+) -> std::result::Result<String, AgentError> {
+    let id = format!("mca_{}", uuid_simple());
+    let called_at = now_iso();
+    let granted_json = serde_json::to_string(granted)
+        .map_err(|e| AgentError::Bootstrap(format!("method_call_audit serialize grants: {e}")))?;
+    let result_json = serde_json::json!({"subagent_id": subagent_id, "status": "running"});
+    let result_text = serde_json::to_string(&result_json)
+        .map_err(|e| AgentError::Bootstrap(format!("method_call_audit serialize result: {e}")))?;
+    conn.execute(
+        "INSERT INTO method_call_audit \
+         (id, method_id, called_at, called_by, granted_capabilities, executed_atoms, \
+          state_machine_state, result, status, error) \
+         VALUES (?, ?, ?, ?, CAST(? AS JSON), NULL, NULL, CAST(? AS JSON), 'running', NULL)",
+        duckdb::params![
+            id,
+            method_id,
+            called_at,
+            called_by,
+            granted_json,
+            result_text,
+        ],
+    )
+    .map_err(|e| AgentError::Bootstrap(format!("method_call_audit insert: {e}")))?;
+    Ok(id)
+}
+
 fn write_usage_observation_row(
     conn: &duckdb::Connection,
     capability_id: &str,
@@ -1593,10 +1740,13 @@ fn write_usage_observation_row(
             }));
             let mut new_metadata = metadata;
             new_metadata["observations"] = serde_json::Value::Array(observations);
-            let new_prompt = format!(
-                "{prompt}
-[usage.observe {observed_at}] {suggestion}"
-            );
+            let is_method = new_metadata.get("full_document").is_some();
+            let new_prompt = if is_method {
+                // 方法文档：注册表简述保持简短，经验只追加到 metadata.observations。
+                prompt
+            } else {
+                format!("{prompt}\n[usage.observe {observed_at}] {suggestion}")
+            };
             conn.execute(
                 "UPDATE usage_method SET prompt = ?, metadata = CAST(? AS JSON),                  updated_at = now() WHERE id = ?",
                 duckdb::params![new_prompt, new_metadata.to_string(), id],
@@ -2726,6 +2876,77 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&leftover_result).unwrap()).unwrap();
         assert_eq!(value["final_state"], "process_unexpected_exit");
         assert!(!invocations.join("inv_closed.extra.json").exists());
+    }
+
+    #[test]
+    fn method_invoke_creates_subagent_and_audit() {
+        let db = test_conn_arc();
+        let storage_root = tempfile::tempdir().unwrap();
+
+        // 测试用方法定义：需要 web.fetch.public。
+        with_conn(&db, |conn| {
+            conn.execute(
+                "INSERT INTO base_capability (id, name, type, description, schema_in, schema_out, executor, version, enabled) \
+                 VALUES ('web.fetch.public', 'Fetch', 'function', 'fetch', '{}', '{}', 'builtin:web.fetch.public', '1.0.0', true)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO usage_method \
+                 (id, capability_id, name, prompt, examples, metadata) \
+                 VALUES (?, ?, ?, ?, NULL, CAST(? AS JSON))",
+                duckdb::params![
+                    "um_test_fetch",
+                    "web.fetch.public",
+                    "Test Fetch Method",
+                    "brief",
+                    r#"{"full_document":"full method doc","required_capabilities":["web.fetch.public"]}"#,
+                ],
+            )
+            .unwrap();
+        });
+
+        let output = call(
+            &db,
+            storage_root.path(),
+            "method.invoke",
+            serde_json::json!({
+                "method_id": "um_test_fetch",
+                "task_input": "fetch a test page",
+                "model_id": MODEL_MINI,
+            }),
+        )
+        .expect("method.invoke should succeed");
+
+        assert_eq!(output["method_id"], "um_test_fetch");
+        assert_eq!(output["status"], "running");
+        assert!(output["method_call_id"].as_str().is_some());
+        let subagent_id = output["subagent_id"].as_str().unwrap();
+
+        // 子代理应已获得方法内所需能力。
+        with_conn(&db, |conn| {
+            let allowlist: Option<String> = conn
+                .query_row(
+                    "SELECT CAST(capability_allowlist AS VARCHAR) FROM agent WHERE id = ?",
+                    duckdb::params![subagent_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let arr: serde_json::Value = serde_json::from_str(&allowlist.unwrap()).unwrap();
+            assert!(arr.as_array().unwrap().iter().any(|v| v == "web.fetch.public"));
+        });
+
+        // 方法调用审计应已写入。
+        with_conn(&db, |conn| {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM method_call_audit WHERE method_id = 'um_test_fetch'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+        });
     }
 
     #[cfg(unix)]

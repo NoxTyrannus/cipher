@@ -118,7 +118,10 @@ impl CapabilityExecutor {
             "db.delete" => return self.builtin_db_delete(input),
             "db.query" => return self.builtin_db_query(input),
             name if name.starts_with("memory.") => return self.execute_memory(name, input),
-            name if name.starts_with("subagent.") || name == "usage_method.observe" => {
+            name if name.starts_with("subagent.")
+                || name == "usage_method.observe"
+                || name == "method.invoke" =>
+            {
                 return self.execute_subagent_molecule(name, input)
             }
             "permission.grant" | "permission.revoke" => {

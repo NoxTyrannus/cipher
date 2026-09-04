@@ -394,6 +394,8 @@ impl ExecutionPlatform {
         base.sort_by_key(|row| row.id.as_str());
         let mut composite: Vec<_> = registry.composite_capabilities.values().collect();
         composite.sort_by_key(|row| row.id.as_str());
+        let mut methods: Vec<_> = registry.usage_methods.values().collect();
+        methods.sort_by_key(|row| row.id.as_str());
 
         lines.push("### Base capabilities".to_string());
         for row in base {
@@ -411,6 +413,17 @@ impl ExecutionPlatform {
             lines.push(format!(
                 "- `{}` / {}: {}",
                 row.id, row.name, row.description
+            ));
+        }
+        lines.push("".to_string());
+        lines.push("### Usage Methods / 方法库".to_string());
+        if methods.is_empty() {
+            lines.push("- (none)".to_string());
+        }
+        for row in methods {
+            lines.push(format!(
+                "- `{}` / {}: {}",
+                row.id, row.name, row.prompt
             ));
         }
         lines.join("\n")

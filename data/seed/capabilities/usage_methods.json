@@ -65,5 +65,38 @@
     "metadata": {
       "partition": "system"
     }
+  },
+  {
+    "id": "um_internet_fetch",
+    "capability_id": "web.fetch.public",
+    "name": "互联网信息抓取方法",
+    "prompt": "先选数据源，再选抓取方式；处理静态/SSR/SPA/API/反爬；输出可验证结果",
+    "examples": {
+      "source_priority": [
+        "官方API",
+        "结构化数据端点",
+        "静态HTML",
+        "SSR注入JSON",
+        "轻量SPA",
+        "重SPA",
+        "浏览器自动化"
+      ]
+    },
+    "metadata": {
+      "brief": "先选数据源，再选抓取方式；处理静态/SSR/SPA/API/反爬；输出可验证结果",
+      "full_document": "互联网信息抓取 · 实战经验\n\n核心原则：先选数据源，再选抓取方式。\n最稳的抓取不是‘抓页面’，是‘找最干净的数据出口’。\n优先级：官方 API > 结构化数据端点 > 静态 HTML > SSR 注入 JSON > 轻量 SPA > 重 SPA > Web 模拟/浏览器自动化。\n\n判断页面：\n- HTML 有正文 → 静态或 SSR，直接抓。\n- HTML 空壳，正文靠 XHR/fetch → 找 XHR URL（可能是 JSON）。\n- 全靠 JS 渲染 → 浏览器自动化。\n\n工具栈：\n- 轻量：curl -sL -A ...\n- HTML 解析：BeautifulSoup/lxml、cheerio、select.rs/goquery。\n- 浏览器：Playwright 优先，Puppeteer 次之，Selenium 最后。\n\n常见场景：\n- SPA 拿不到正文：找 /api、.json、GraphQL、__NEXT_DATA__、window.__NUXT__。\n- 登录：cookie/session；Playwright storage state。\n- 反爬：UA、Referer、降速、代理、浏览器。\n- 分页/无限滚动：?page=2、?cursor=xxx。\n\n陷阱：\n- HTML 不要用正则解析。\n- 注意编码、时区、大文件流式读取、失败重试退避。\n- 不要硬编码 CSS class/URL。",
+      "required_capabilities": [
+        "web.fetch.public",
+        "file.write",
+        "file.read",
+        "text.grep"
+      ],
+      "optional_capabilities": [
+        "shell.exec"
+      ],
+      "state_machine": "source_select -> fetch -> classify -> parse_or_fallback -> report",
+      "observations": [],
+      "allow_observe_append": true
+    }
   }
 ]
