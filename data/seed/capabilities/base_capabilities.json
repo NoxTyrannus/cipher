@@ -1815,6 +1815,13 @@
               "message"
             ],
             "additionalProperties": false
+          },
+          "execut": {
+            "type": "string",
+            "enum": [
+              "done",
+              "fail"
+            ]
           }
         },
         "required": [
