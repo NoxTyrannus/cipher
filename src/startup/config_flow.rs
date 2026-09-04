@@ -18,10 +18,7 @@ const PRESET_TEMPLATES: &[(&str, &str, &str, &str)] = &[(
     "OpenAI",
 )];
 
-pub fn run_workspace_command(
-    app: &AppState,
-    command: &WorkspaceCommand,
-) -> Result<(), AgentError> {
+pub fn run_workspace_command(app: &AppState, command: &WorkspaceCommand) -> Result<(), AgentError> {
     let store = WorkspaceStore::open(app.paths.storage_root())?;
     match command {
         WorkspaceCommand::List => {
@@ -522,7 +519,12 @@ fn change_provider_key(app: &AppState) -> Result<(), AgentError> {
 fn manage_workspaces(app: &AppState) -> Result<(), AgentError> {
     loop {
         list_workspaces(app)?;
-        let items = vec!["新增工作区", "删除工作区", "设置默认工作区", "返回 /config 主菜单"];
+        let items = vec![
+            "新增工作区",
+            "删除工作区",
+            "设置默认工作区",
+            "返回 /config 主菜单",
+        ];
         let sel = Select::new()
             .with_prompt("工作区管理")
             .items(&items)

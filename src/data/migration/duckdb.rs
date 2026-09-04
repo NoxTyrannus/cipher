@@ -95,7 +95,6 @@ CREATE TABLE IF NOT EXISTS web_fetch_audit (
     };
 }
 
-
 /// v0.5.0 方法调用审计表：方法级调用记录。
 macro_rules! method_call_audit_ddl {
     () => {
@@ -521,7 +520,9 @@ pub fn ensure_web_fetch_audit_table(connection: &duckdb::Connection) -> Result<(
     // v0.5.0：补齐 execut 完成态列（旧表幂等升级）。
     connection
         .execute_batch("ALTER TABLE web_fetch_audit ADD COLUMN IF NOT EXISTS execut TEXT")
-        .map_err(|error| migration_error(format!("ensure web_fetch_audit.execut column: {error}")))?;
+        .map_err(|error| {
+            migration_error(format!("ensure web_fetch_audit.execut column: {error}"))
+        })?;
     connection
         .execute_batch("UPDATE web_fetch_audit SET execut = 'done' WHERE execut IS NULL")
         .map_err(|error| migration_error(format!("backfill web_fetch_audit.execut: {error}")))?;

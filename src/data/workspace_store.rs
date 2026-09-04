@@ -159,9 +159,7 @@ impl WorkspaceStore {
     pub fn delete(&self, id: &str) -> Result<Option<WorkspaceRow>> {
         let mut doc = self.load_document()?;
         if doc.workspaces.len() <= 1 {
-            return Err(workspace_error(
-                "at least one workspace must be retained",
-            ));
+            return Err(workspace_error("at least one workspace must be retained"));
         }
         let idx = doc
             .workspaces
@@ -302,7 +300,6 @@ impl WorkspaceStore {
         write_result
     }
 }
-
 
 fn workspace_paths_overlap(a: &str, b: &str) -> bool {
     let a_path = Path::new(a.trim_end_matches('/'));

@@ -315,9 +315,15 @@ fn record_and_fail(
     )?;
     let mut value = fail(code, message);
     if let Some(obj) = value.as_object_mut() {
-        obj.insert("url".to_string(), serde_json::Value::String(url.to_string()));
+        obj.insert(
+            "url".to_string(),
+            serde_json::Value::String(url.to_string()),
+        );
         if let Some(http_code) = metrics.http_code {
-            obj.insert("http_code".to_string(), serde_json::Value::Number(http_code.into()));
+            obj.insert(
+                "http_code".to_string(),
+                serde_json::Value::Number(http_code.into()),
+            );
         }
         if let Some(bytes) = metrics.bytes {
             obj.insert("bytes".to_string(), serde_json::Value::Number(bytes.into()));

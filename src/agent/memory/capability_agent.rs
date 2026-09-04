@@ -150,9 +150,10 @@ pub async fn run_capability_loop(
                             .unwrap_or_else(|| capability_name.clone()),
                         arguments: invocation.arguments.clone(),
                     };
-                    let outcome = CapabilityService::new_with_host(registry, executor, &frozen_host)
-                        .and_then(|service| service.execute_for_agent(&req.actor_id, &call))
-                        .map(|result| result.output);
+                    let outcome =
+                        CapabilityService::new_with_host(registry, executor, &frozen_host)
+                            .and_then(|service| service.execute_for_agent(&req.actor_id, &call))
+                            .map(|result| result.output);
                     let record = match outcome {
                         Ok(output) => {
                             let truncated = crate::common::json_util::truncate_head_tail(

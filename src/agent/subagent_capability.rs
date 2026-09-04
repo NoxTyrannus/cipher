@@ -861,15 +861,15 @@ fn method_invoke(
     // 1. method.invoke 自身 invocation 预写。
     let invocation_id = {
         let guard = lock_molecule_duckdb(duckdb, "method.invoke")?;
-        prewrite_invocation(&guard, storage_root, METHOD_INVOKE_ID, args)
-            .map_err(|error| SubagentError::failed(format!("method.invoke prewrite failed: {error}")))?
+        prewrite_invocation(&guard, storage_root, METHOD_INVOKE_ID, args).map_err(|error| {
+            SubagentError::failed(format!("method.invoke prewrite failed: {error}"))
+        })?
     };
 
     // 2. 读取方法定义（注册表只读 brief，这里取完整文档）。
     let (brief, metadata) = {
         let guard = lock_molecule_duckdb(duckdb, "method.invoke")?;
-        read_usage_method(&guard, method_id)
-            .map_err(SubagentError::from_agent)?
+        read_usage_method(&guard, method_id).map_err(SubagentError::from_agent)?
     };
     let full_document = metadata
         .get("full_document")
@@ -990,14 +990,8 @@ fn method_invoke(
     // 6. 写入方法调用审计。
     let method_call_id = {
         let guard = lock_molecule_duckdb(duckdb, "method.invoke")?;
-        write_method_call_audit_row(
-            &guard,
-            method_id,
-            called_by,
-            &granted,
-            &subagent_id,
-        )
-        .map_err(SubagentError::from_agent)?
+        write_method_call_audit_row(&guard, method_id, called_by, &granted, &subagent_id)
+            .map_err(SubagentError::from_agent)?
     };
 
     Ok(MoleculeOutcome {
@@ -2990,7 +2984,11 @@ mod tests {
                 )
                 .unwrap();
             let arr: serde_json::Value = serde_json::from_str(&allowlist.unwrap()).unwrap();
-            assert!(arr.as_array().unwrap().iter().any(|v| v == "web.fetch.public"));
+            assert!(arr
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "web.fetch.public"));
         });
 
         // 方法调用审计应已写入。

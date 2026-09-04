@@ -97,7 +97,6 @@ pub struct SetDefaultWorkspaceSelect {
     pub submitted: bool,
 }
 
-
 #[derive(Debug, Clone)]
 pub struct KeepBudgetInput {
     pub target: usize,
@@ -312,7 +311,9 @@ impl ConfigPanel {
                 }
             }
             ConfigView::DeleteWorkspaceConfirm(form) if form.submitted => {
-                DbRequest::SubmitDeleteWorkspace { id: form.workspace_id.clone() }
+                DbRequest::SubmitDeleteWorkspace {
+                    id: form.workspace_id.clone(),
+                }
             }
             ConfigView::SetDefaultWorkspace(sel) if sel.submitted => {
                 let id = sel
@@ -582,10 +583,7 @@ impl ConfigPanel {
             }
             KeyCode::Char('x') => {
                 if self.workspaces.len() <= 1 {
-                    self.message = Some((
-                        "至少需要保留一个工作区，不能删除".to_string(),
-                        true,
-                    ));
+                    self.message = Some(("至少需要保留一个工作区，不能删除".to_string(), true));
                     self.view = ConfigView::WorkspaceList;
                     return ActionResult::Navigate;
                 }
@@ -608,7 +606,9 @@ impl ConfigPanel {
             KeyCode::Char('d') => {
                 self.view = ConfigView::SetDefaultWorkspace(SetDefaultWorkspaceSelect {
                     candidates: self.workspaces.clone(),
-                    cursor: self.list_cursor.min(self.workspaces.len().saturating_sub(1)),
+                    cursor: self
+                        .list_cursor
+                        .min(self.workspaces.len().saturating_sub(1)),
                     submitted: false,
                 });
                 ActionResult::Navigate
@@ -1736,10 +1736,13 @@ fn render_set_default_workspace(
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::Paragraph;
-    let mut lines: Vec<Line> = vec![Line::from(""), Line::from(vec![Span::styled(
-        "选择要设为默认的工作区:",
-        Style::default().fg(Color::Gray),
-    )])];
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "选择要设为默认的工作区:",
+            Style::default().fg(Color::Gray),
+        )]),
+    ];
     for (i, w) in sel.candidates.iter().enumerate() {
         let selected = sel.cursor == i;
         let style = if selected {
@@ -2570,10 +2573,7 @@ mod tests {
     fn workspace_list_shows_rows_and_default_marker() {
         let mut panel = ConfigPanel::new();
         panel.view = ConfigView::WorkspaceList;
-        panel.workspaces = vec![
-            fake_workspace("alpha", true),
-            fake_workspace("beta", false),
-        ];
+        panel.workspaces = vec![fake_workspace("alpha", true), fake_workspace("beta", false)];
         let text = render_to_text(&panel).replace(' ', "");
         assert!(text.contains("alpha"), "行内容可见: {text}");
         assert!(text.contains("beta"), "行内容可见: {text}");
@@ -2616,7 +2616,10 @@ mod tests {
         form.path = "relative/path".into();
         p.view = ConfigView::AddWorkspace(form);
         p.handle_key(KeyCode::Enter);
-        assert!(matches!(p.view, ConfigView::AddWorkspace(_)), "留在表单可重输");
+        assert!(
+            matches!(p.view, ConfigView::AddWorkspace(_)),
+            "留在表单可重输"
+        );
         assert_eq!(p.pending_db_request(), DbRequest::None);
         assert!(
             p.message

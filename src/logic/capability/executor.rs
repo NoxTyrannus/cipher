@@ -87,7 +87,11 @@ impl CapabilityExecutor {
     /// `CapabilityService` 构造）应在轮/run 开始时快照一次并把同一快照贯穿整轮，
     /// 使切换默认工作区只影响之后开始的新任务（任务书 §7）。
     pub fn current_host_context(&self) -> HostContext {
-        let root = self.workspace_root.read().map(|r| r.clone()).unwrap_or_default();
+        let root = self
+            .workspace_root
+            .read()
+            .map(|r| r.clone())
+            .unwrap_or_default();
         let extra = self
             .extra_read_roots
             .read()

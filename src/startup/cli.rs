@@ -107,13 +107,15 @@ mod tests {
     #[test]
     fn workspace_list_subcommand() {
         let cli = Cli::try_parse_from(["cipher", "workspace", "list"]).unwrap();
-        assert_eq!(cli.command, Some(Commands::Workspace(WorkspaceCommand::List)));
+        assert_eq!(
+            cli.command,
+            Some(Commands::Workspace(WorkspaceCommand::List))
+        );
     }
 
     #[test]
     fn workspace_add_subcommand_takes_path() {
-        let cli =
-            Cli::try_parse_from(["cipher", "workspace", "add", "/tmp/project-a"]).unwrap();
+        let cli = Cli::try_parse_from(["cipher", "workspace", "add", "/tmp/project-a"]).unwrap();
         assert_eq!(
             cli.command,
             Some(Commands::Workspace(WorkspaceCommand::Add {
@@ -146,8 +148,7 @@ mod tests {
 
     #[test]
     fn workspace_set_default_subcommand_takes_id() {
-        let cli =
-            Cli::try_parse_from(["cipher", "workspace", "set-default", "project-a"]).unwrap();
+        let cli = Cli::try_parse_from(["cipher", "workspace", "set-default", "project-a"]).unwrap();
         assert_eq!(
             cli.command,
             Some(Commands::Workspace(WorkspaceCommand::SetDefault {

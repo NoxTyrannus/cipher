@@ -422,10 +422,7 @@ impl ExecutionPlatform {
             lines.push("- (none)".to_string());
         }
         for row in methods {
-            lines.push(format!(
-                "- `{}` / {}: {}",
-                row.id, row.name, row.prompt
-            ));
+            lines.push(format!("- `{}` / {}: {}", row.id, row.name, row.prompt));
         }
         lines.join("\n")
     }

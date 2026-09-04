@@ -15,10 +15,10 @@ pub use conversations::{
     CONVERSATION_MIGRATION_PLAN_SCHEMA_VERSION,
 };
 pub use duckdb::{
-    build_duckdb_candidate, ensure_permission_grants_table, ensure_web_fetch_audit_table, ensure_method_call_audit_table,
-    validate_current_duckdb, validate_current_duckdb_connection, DuckdbMigrationIssue,
-    DuckdbMigrationReason, DuckdbMigrationReport, DuckdbValidationReport, MemoryTableDisposition,
-    CANDIDATE_DUCKDB_FILE,
+    build_duckdb_candidate, ensure_method_call_audit_table, ensure_permission_grants_table,
+    ensure_web_fetch_audit_table, validate_current_duckdb, validate_current_duckdb_connection,
+    DuckdbMigrationIssue, DuckdbMigrationReason, DuckdbMigrationReport, DuckdbValidationReport,
+    MemoryTableDisposition, CANDIDATE_DUCKDB_FILE,
 };
 pub use layout::{
     activate_existing_generation, create_staging_generation, generation_name, publish_generation,
