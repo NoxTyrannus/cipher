@@ -1,6 +1,6 @@
 {
-  "schema_version": 1,
-  "description": "五态认知记忆出厂 seed — 用户设计 + DP酱 整理",
+  "schema_version": 2,
+  "description": "出厂认知 seed v2 — v1 五态与三模式全量保留，追加机器结构知识（循环拓扑 / 执行器能力族 / 方法体系 / 硬约束事实）",
   "nodes_file": "nodes.json",
   "edges_file": "edges.json"
 }

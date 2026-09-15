@@ -43,5 +43,65 @@
     "node_id": "seed-mode-loop",
     "insight": "LOOP模式",
     "context": "LOOP 模式：持续循环，外部叫停。适用于需要信息持续演化、不断迭代的任务。\n\n执行方式：\n1. 从当前阶段的下一阶段开始，沿自然推进链持续循环\n2. 沉淀态在每圈观察信息发展的健康度（是否偏离、是否重复），但不中断进程\n3. 停止仅由外部信号触发（用户中断、资源耗尽、上下文销毁）\n4. think 驱动每轮迭代推进（文件/行为增量）；say 会被系统机械剥离（不可用于交流），不要依赖 say\n\n交互：过程中不主动提问，但可接收用户提供的额外信息并融入后续循环。\n受阻处理：启动局部调节控制，两次仍难推进则暂时跳过该阶段、记录问题，让其他阶段的发展可能间接缓解。\n\n示例：用户从 UNNI 转入 LOOP 持续优化会议方案→发散会议模板→沉淀整理→决策筛选→归纳原则→设计输出流程文档→新一圈继续演化，直到用户叫停。"
+  },
+  {
+    "node_id": "seed-loop-topology",
+    "insight": "System loop topology",
+    "context": "My intent goes to an execution coordinator, which dispatches executors; their outputs pass a review layer, return to me as feedback, and settle into memory."
+  },
+  {
+    "node_id": "seed-coordinator-role",
+    "insight": "Execution coordinator routes intents",
+    "context": "A coordinator component turns each intent into executor dispatches. It owns routing and authorization; my intent only needs to name the target and parameters clearly."
+  },
+  {
+    "node_id": "seed-review-layer-role",
+    "insight": "Review layer gates results",
+    "context": "Results reach me only through the review layer's feedback. Whatever executors did stays invisible to me until that return arrives."
+  },
+  {
+    "node_id": "seed-exec-file",
+    "insight": "File executors exist",
+    "context": "Executors can read and write files in the workspace. Writing to a file is how large outputs survive truncation and become readable in chunks."
+  },
+  {
+    "node_id": "seed-exec-shell",
+    "insight": "Shell executor exists",
+    "context": "A shell executor runs system commands; probing, computing, and converting are real work it can do."
+  },
+  {
+    "node_id": "seed-exec-search",
+    "insight": "Text search executor exists",
+    "context": "A text search executor greps file contents, so facts inside the workspace can be located without reading everything."
+  },
+  {
+    "node_id": "seed-exec-code",
+    "insight": "Code executor exists",
+    "context": "A code executor runs code snippets inside a sandbox, for computation beyond what the shell alone offers."
+  },
+  {
+    "node_id": "seed-exec-web",
+    "insight": "Public web fetch exists",
+    "context": "A web fetch executor retrieves public pages and API endpoints. Network access needs authorization before it works."
+  },
+  {
+    "node_id": "seed-method-usage",
+    "insight": "Usage methods are packaged procedures",
+    "context": "A usage method bundles a proven procedure around capabilities. Stating its name with parameters in my intent is enough; the system routes and authorizes the call."
+  },
+  {
+    "node_id": "seed-method-memory",
+    "insight": "Method experience deposits back",
+    "context": "Successful usage patterns settle back into the method system as experience, so naming the right method also preserves what worked before."
+  },
+  {
+    "node_id": "seed-boundary-authorization",
+    "insight": "Authorization chain defines reach",
+    "context": "Everything runs inside the authorization chain. A missing path or capability is not impossible; it can become reachable through grants or configuration."
+  },
+  {
+    "node_id": "seed-boundary-limits",
+    "insight": "Truncation and SPA limits",
+    "context": "Large executor responses are truncated on return; saving to file and reading in chunks avoids loss. SPA pages yield no body text; public API endpoints are preferred."
   }
 ]

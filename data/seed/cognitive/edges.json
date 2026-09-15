@@ -18,5 +18,20 @@
   {"from": "seed-mode-unni", "to": "seed-mode-loop", "relation": "转入:持续迭代时"},
   {"from": "seed-mode-keep", "to": "seed-mode-unni", "relation": "转入:对齐后执行"},
   {"from": "seed-mode-keep", "to": "seed-mode-loop", "relation": "转入:对齐后持续"},
-  {"from": "seed-overview", "to": "seed-divergence", "relation": "总览→分述"}
+  {"from": "seed-overview", "to": "seed-divergence", "relation": "总览→分述"},
+  {"from": "seed-loop-topology", "to": "seed-coordinator-role", "relation": "routes-through"},
+  {"from": "seed-loop-topology", "to": "seed-review-layer-role", "relation": "returns-through"},
+  {"from": "seed-loop-topology", "to": "seed-overview", "relation": "parallels"},
+  {"from": "seed-coordinator-role", "to": "seed-exec-file", "relation": "dispatches"},
+  {"from": "seed-coordinator-role", "to": "seed-exec-shell", "relation": "dispatches"},
+  {"from": "seed-coordinator-role", "to": "seed-exec-search", "relation": "dispatches"},
+  {"from": "seed-coordinator-role", "to": "seed-exec-code", "relation": "dispatches"},
+  {"from": "seed-coordinator-role", "to": "seed-exec-web", "relation": "dispatches"},
+  {"from": "seed-method-usage", "to": "seed-coordinator-role", "relation": "routes-through"},
+  {"from": "seed-method-memory", "to": "seed-method-usage", "relation": "deposits-into"},
+  {"from": "seed-mode-unni", "to": "seed-method-usage", "relation": "executes-through"},
+  {"from": "seed-exec-web", "to": "seed-boundary-authorization", "relation": "constrained-by"},
+  {"from": "seed-loop-topology", "to": "seed-boundary-authorization", "relation": "constrained-by"},
+  {"from": "seed-review-layer-role", "to": "seed-boundary-limits", "relation": "constrained-by"},
+  {"from": "seed-exec-web", "to": "seed-boundary-limits", "relation": "constrained-by"}
 ]

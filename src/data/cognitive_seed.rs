@@ -72,6 +72,55 @@ pub fn ensure_default_cognitive_seed(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 库内 cognitive 条目数（节点 + 边，含 seeded 与习得）。
+fn count_cognitive_entries(db: &TriviumDb) -> usize {
+    db.db()
+        .get_all_ids()
+        .into_iter()
+        .filter(|id| is_cognitive_payload(db.db().get_payload(*id).as_ref()))
+        .count()
+}
+
+/// payload 是否为认知条目（节点或边）。
+fn is_cognitive_payload(payload: Option<&serde_json::Value>) -> bool {
+    matches!(
+        payload
+            .and_then(|p| p.get("_memory_type"))
+            .and_then(|v| v.as_str()),
+        Some("cognitive") | Some("cognitive_edge")
+    )
+}
+
+/// 重播清理：删除库内全部 factory 播种条目（`_memory_type ∈ {cognitive, cognitive_edge}`
+/// 且 `seeded == true`）。旧重播直接重插会造成 seeded 条目重复；习得节点（无 seeded
+/// 标记）不受影响。
+fn purge_seeded_cognitive_entries(db: &mut TriviumDb) -> Result<()> {
+    let stale_ids: Vec<triviumdb::NodeId> = db
+        .db()
+        .get_all_ids()
+        .into_iter()
+        .filter(|id| {
+            db.db()
+                .get_payload(*id)
+                .filter(|payload| {
+                    is_cognitive_payload(Some(payload))
+                        && payload.get("seeded").and_then(|v| v.as_bool()) == Some(true)
+                })
+                .is_some()
+        })
+        .collect();
+    let purged = stale_ids.len();
+    for id in stale_ids {
+        db.db_mut().delete(id).map_err(|e| {
+            AgentError::Bootstrap(format!("purge seeded cognitive entry {id}: {e}"))
+        })?;
+    }
+    if purged > 0 {
+        tracing::info!("cognitive seed: purged {purged} stale seeded entries before replay");
+    }
+    Ok(())
+}
+
 pub fn seed_cognitive_memory(data_dir: &Path, db: &mut TriviumDb) -> Result<()> {
     let seed_root = data_dir.join(SEED_DIR);
     let marker = seed_root.join(SEEDED_MARKER);
@@ -85,11 +134,20 @@ pub fn seed_cognitive_memory(data_dir: &Path, db: &mut TriviumDb) -> Result<()> 
     if let Ok(marker_content) = fs::read_to_string(&marker) {
         if let Ok(seeded_version) = marker_content.trim().parse::<u32>() {
             if seeded_version == manifest.schema_version {
-                tracing::debug!(
-                    "cognitive seed: already seeded (schema_version={})",
-                    manifest.schema_version
-                );
-                return Ok(());
+                if count_cognitive_entries(db) == 0 {
+                    // 库空自愈：marker 残留但记忆库已无认知条目（如用户清空记忆库），
+                    // 继续执行完整播种让出厂认知重生。
+                    tracing::info!(
+                        "cognitive seed: marker matches but memory has no cognitive entries, reseeding (schema_version={})",
+                        manifest.schema_version
+                    );
+                } else {
+                    tracing::debug!(
+                        "cognitive seed: already seeded (schema_version={})",
+                        manifest.schema_version
+                    );
+                    return Ok(());
+                }
             }
         }
     }
@@ -98,6 +156,8 @@ pub fn seed_cognitive_memory(data_dir: &Path, db: &mut TriviumDb) -> Result<()> 
         "cognitive seed: seeding (schema_version={})",
         manifest.schema_version
     );
+
+    purge_seeded_cognitive_entries(db)?;
 
     let nodes_path = seed_root.join(&manifest.nodes_file);
     let nodes_content = fs::read_to_string(&nodes_path)
@@ -787,7 +847,7 @@ mod tests {
             &std::fs::read_to_string(seed_root.join("manifest.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(manifest.schema_version, 1);
+        assert_eq!(manifest.schema_version, 2);
     }
 
     #[test]
@@ -816,13 +876,16 @@ mod tests {
 
         let marker = dir.path().join(SEED_DIR).join(SEEDED_MARKER);
         assert!(marker.exists());
-        assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "1");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "2");
 
         let zero_vec = vec![0.0_f32; 4];
-        let results = db.db().search(&zero_vec, 100, 0, 0.0).unwrap();
+        let results = db.db().search(&zero_vec, 200, 0, 0.0).unwrap();
+        let nodes: Vec<SeedNode> = serde_json::from_str(COGNITIVE_SEED_NODES).unwrap();
+        let edges: Vec<SeedEdge> = serde_json::from_str(COGNITIVE_SEED_EDGES).unwrap();
+        let expected = nodes.len() + edges.len();
         assert!(
-            results.len() >= 29,
-            "expected 9 nodes + 20 edges = 29 entries, got {}",
+            results.len() >= expected,
+            "expected {expected} entries (nodes + edges), got {}",
             results.len()
         );
 
@@ -885,6 +948,101 @@ mod tests {
 
         let marker = dir.path().join(SEED_DIR).join(SEEDED_MARKER);
         assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "2");
+    }
+
+    /// 重播清理（修复）：schema_version 升版触发重播时，旧 seeded 条目先被删除再重插，
+    /// 认知条目总数恰为 seed 清单条数（无重复）；习得节点（无 seeded 标记）不受清理影响。
+    #[test]
+    fn seed_cognitive_memory_replay_purges_stale_seeded_entries_exactly_once() {
+        let dir = tempdir().unwrap();
+        ensure_default_cognitive_seed(dir.path()).unwrap();
+
+        let db_path = dir.path().join("cognitive.trivium");
+        let mut db = TriviumDb::open(&db_path, 4).unwrap();
+
+        seed_cognitive_memory(dir.path(), &mut db).unwrap();
+
+        let nodes: Vec<SeedNode> = serde_json::from_str(COGNITIVE_SEED_NODES).unwrap();
+        let edges: Vec<SeedEdge> = serde_json::from_str(COGNITIVE_SEED_EDGES).unwrap();
+        let expected = nodes.len() + edges.len();
+        assert_eq!(count_cognitive_entries(&db), expected, "首次播种条目数");
+
+        // 习得节点：无 seeded 标记，重播清理不得删除。
+        let zero_vec = vec![0.0_f32; 4];
+        db.db_mut()
+            .insert(
+                &zero_vec,
+                serde_json::json!({
+                    "_memory_type": "cognitive",
+                    "node_id": "learned-1",
+                    "insight": "learned insight",
+                    "context": "acquired at runtime",
+                }),
+            )
+            .unwrap();
+
+        // 升版触发重播。
+        let manifest_path = dir.path().join(SEED_DIR).join("manifest.json");
+        std::fs::write(
+            &manifest_path,
+            r#"{"schema_version":3,"description":"test","nodes_file":"nodes.json","edges_file":"edges.json"}"#,
+        )
+        .unwrap();
+
+        seed_cognitive_memory(dir.path(), &mut db).unwrap();
+
+        assert_eq!(
+            count_cognitive_entries(&db),
+            expected + 1,
+            "重播应清理旧 seeded 条目且恰好重插一次，习得节点保留"
+        );
+        let learned_survived = db.db().get_all_ids().iter().any(|id| {
+            db.db()
+                .get_payload(*id)
+                .map(|p| p.get("node_id").and_then(|v| v.as_str()) == Some("learned-1"))
+                .unwrap_or(false)
+        });
+        assert!(learned_survived, "习得节点不得被重播清理删除");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(SEED_DIR).join(SEEDED_MARKER))
+                .unwrap()
+                .trim(),
+            "3"
+        );
+    }
+
+    /// 库空自愈（修复）：marker 匹配但记忆库中认知条目为 0（如用户清空记忆库而数据目录
+    /// marker 残留）时，仍执行完整播种，出厂认知重生。
+    #[test]
+    fn seed_cognitive_memory_self_heals_when_marker_matches_but_library_emptied() {
+        let dir = tempdir().unwrap();
+        ensure_default_cognitive_seed(dir.path()).unwrap();
+
+        let db_path = dir.path().join("cognitive.trivium");
+        let mut db = TriviumDb::open(&db_path, 4).unwrap();
+
+        seed_cognitive_memory(dir.path(), &mut db).unwrap();
+
+        let marker_path = dir.path().join(SEED_DIR).join(SEEDED_MARKER);
+        assert_eq!(std::fs::read_to_string(&marker_path).unwrap().trim(), "2");
+
+        // 模拟用户清空记忆库：删除全部条目，保留数据目录与 .seeded marker。
+        for id in db.db().get_all_ids() {
+            db.db_mut().delete(id).unwrap();
+        }
+        assert_eq!(count_cognitive_entries(&db), 0, "库应已清空");
+
+        // marker 仍匹配 manifest 版本 → 修复前直接 return；修复后自愈重播。
+        seed_cognitive_memory(dir.path(), &mut db).unwrap();
+
+        let nodes: Vec<SeedNode> = serde_json::from_str(COGNITIVE_SEED_NODES).unwrap();
+        let edges: Vec<SeedEdge> = serde_json::from_str(COGNITIVE_SEED_EDGES).unwrap();
+        assert_eq!(
+            count_cognitive_entries(&db),
+            nodes.len() + edges.len(),
+            "清库后出厂认知应完整重生"
+        );
+        assert_eq!(std::fs::read_to_string(&marker_path).unwrap().trim(), "2");
     }
 
     #[test]
