@@ -863,6 +863,14 @@ pub async fn run_streaming_loop(
     // 自动修复（F1）：按用户输入原文计数的防循环上限。
     let mut auto_repair_counts: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
+
+    // v0.5.3 UNNI 等待收口：循环级状态（select 照常运转，不在分支内裸等收口，F7）。
+    // 仅 UNNI 读写；其余模式恒为初值，行为不变。
+    let storage_root = app.paths.storage_root().to_path_buf();
+    let mut unni_consecutive_wait: u32 = 0;
+    let mut unni_await: Option<UnniAwaitFinalization> = None;
+    // 安全超时触发清算的次数（同一波到期后再次阻塞的递归计数，仅观测）。
+    let mut unni_await_timeouts: u32 = 0;
     loop {
         if should_exit {
             break;
@@ -1201,8 +1209,18 @@ pub async fn run_streaming_loop(
 
                                 match mode_manager.spawn(input).await {
                                     Ok(id) => {
-
                                         state.push_streaming(id);
+                                        // v0.5.3 UNNI：用户轮接管驱动——清除阻塞态并重置
+                                        // 回环等待计数（D1 计数器语义 / F8）。仅在 UNNI 生效，
+                                        // 其余模式两值恒为初值，赋值无副作用。
+                                        if mode_manager.current_name().eq_ignore_ascii_case("unni") {
+                                            if unni_await.take().is_some() {
+                                                tracing::info!(
+                                                    "streaming_loop: UNNI await-finalization cleared by user round"
+                                                );
+                                            }
+                                            unni_consecutive_wait = 0;
+                                        }
                                     }
                                     Err(e) => {
                                         state.set_error(e.to_string());
@@ -1335,6 +1353,21 @@ pub async fn run_streaming_loop(
 
 
             _ = render_tick.tick() => {
+                // v0.5.3 UNNI 阻塞安全超时（D2）：到期解除并 spawn 清算轮（兜底防波悬挂；
+                // 到期后同一波若再次满足阻塞条件允许再入，unni_await_timeouts 记录递归计数）。
+                // 状态仅 UNNI 构造，其余模式恒 None，检查为空转。
+                let await_expired = unni_await
+                    .as_ref()
+                    .is_some_and(|awaiting| awaiting.expired(std::time::Instant::now()));
+                if await_expired {
+                    unni_await = None;
+                    unni_await_timeouts += 1;
+                    tracing::warn!(
+                        timeouts = unni_await_timeouts,
+                        "streaming_loop: UNNI await-finalization safety timeout reached, spawning settlement round"
+                    );
+                    spawn_unni_settlement_round(mode_manager, &mut state, "阻塞安全超时").await;
+                }
                 guard
                     .get_mut()
                     .draw(|f| crate::ui::tui::render::render(&state, f))
@@ -1357,7 +1390,31 @@ pub async fn run_streaming_loop(
                 match event.reason.as_str() {
                     // subagent_complete：纯数据事件（状态变化已落盘 AgentPool / memory.json），
                     // 不触发任何轮；subagent 结果段由洞察中台在输入组装时按状态变化纳入。
+                    // v0.5.3 UNNI：阻塞等待态下本事件被等待波消费（对外仍为纯数据事件）——
+                    // 从波快照移除已收口实例，集合空即波完成 → spawn 清算轮恢复流转。
                     "subagent_complete" => {
+                        let wave_done = match unni_await.as_mut() {
+                            Some(awaiting) => {
+                                // 重新核对池状态防事件乱序：事件对应旧 run 而池中该实例
+                                // 已是新 run（仍 Running）→ 不移除。
+                                let still_running = pool.subagent_states().await.iter().any(|s| {
+                                    s.subagent_id == event.turn_id
+                                        && s.lifecycle
+                                            == crate::agent::execution_types::SubagentLifecycle::Running
+                                });
+                                awaiting.on_subagent_complete(&event.turn_id, still_running)
+                            }
+                            None => false,
+                        };
+                        if wave_done {
+                            unni_await = None;
+                            tracing::info!(
+                                "streaming_loop: UNNI await-finalization wave settled, spawning settlement round (subagent_id={})",
+                                event.turn_id
+                            );
+                            spawn_unni_settlement_round(mode_manager, &mut state, "波内全部收口")
+                                .await;
+                        }
                         tracing::debug!(
                             "streaming_loop: subagent_complete is a data event, no round triggered (subagent_id={})",
                             event.turn_id
@@ -1397,6 +1454,11 @@ pub async fn run_streaming_loop(
                         // 条件）；B 语义交付轮（has_subagent_result=true）经 internal_no_downstream
                         // 在 thinking 层自然断（不派发 execute，不产生 insight_complete），本规则
                         // 不咨询该轮——交付 say 先于任何停止判定流式送达用户。
+                        //
+                        // v0.5.3 UNNI 等待收口（D1）：纯等待轮（loopback idle 且无结果段）改走
+                        // 三分支决策——在跑则计数空转/阻塞等波，不在跑而有未消费数据则清算轮，
+                        // 否则旧停止行为照旧。拉取轮（含结果段）走池检查（复测修复 R3）：仍有
+                        // Running → 阻塞等波（不抢跑派发交付轮）；波空 → 既有 B 交付链派生交付轮。
                         if mode_name == "unni" {
                             let ctx = pool.get_turn_context(&event.turn_id).await;
                             let is_loopback = ctx
@@ -1408,17 +1470,140 @@ pub async fn run_streaming_loop(
                                 .and_then(|c| c.execution.as_ref())
                                 .map(|e| e.lifecycle_actions.is_empty())
                                 .unwrap_or(true);
-                            let subagents_running = pool
-                                .subagent_states()
-                                .await
-                                .iter()
-                                .any(|s| s.lifecycle == crate::agent::execution_types::SubagentLifecycle::Running);
-                            if unni_follow_user_should_stop(is_loopback, actions_empty, subagents_running) {
-                                tracing::info!(
-                                    "streaming_loop: UNNI follow-user stop reached (loopback idle), waiting for user input (thought_id={})",
-                                    event.turn_id
-                                );
-                                continue;
+                            let has_subagent_result =
+                                ctx.as_ref().map(|c| c.has_subagent_result).unwrap_or(false);
+                            // 计数器维护（D1）：actions 非空的执行轮完成、has_subagent_result=true
+                            // 的洞察轮完成 → 清零；用户轮 spawn 的清零在 Submit 分支。
+                            unni_consecutive_wait = unni_wait_counter_after_completion(
+                                actions_empty,
+                                has_subagent_result,
+                                unni_consecutive_wait,
+                            );
+                            if is_loopback && actions_empty {
+                                if has_subagent_result {
+                                    // v0.5.3 复测修复（R3 残留竞态）：拉取轮（该轮洞察已含
+                                    // 结果段，中间/最终均计）+ 池内仍有 Running（部分收口）→
+                                    // 不派发交付轮抢跑——thinking 层 internal_no_downstream
+                                    // 无条件断链，末次收口将无阻塞态可消费、结果孤儿化。
+                                    // 进入 AwaitFinalization 等当前波全部收口（波语义：等全部
+                                    // 收口、一次交付）；波空后经清算轮全量拉取，此分支以
+                                    // "无 Running" 再次命中 → 既有 B 链完整交付。
+                                    let pending: std::collections::HashSet<String> = pool
+                                        .subagent_states()
+                                        .await
+                                        .iter()
+                                        .filter(|s| {
+                                            s.lifecycle
+                                                == crate::agent::execution_types::SubagentLifecycle::Running
+                                        })
+                                        .map(|s| s.subagent_id.clone())
+                                        .collect();
+                                    if unni_puller_should_await_wave(!pending.is_empty()) {
+                                        tracing::info!(
+                                            pending = pending.len(),
+                                            timeouts = unni_await_timeouts,
+                                            "streaming_loop: UNNI puller round with wave still running, blocking until full settlement (thought_id={})",
+                                            event.turn_id
+                                        );
+                                        unni_await = Some(UnniAwaitFinalization::new(
+                                            pending,
+                                            std::time::Instant::now(),
+                                        ));
+                                        continue;
+                                    }
+                                    // 波空 → 现行为不变：落入下方 spawn_platform_insight
+                                    // 派生交付轮（既有 B 交付链）。
+                                } else {
+                                    let subagents_running = pool.subagent_states().await.iter().any(
+                                        |s| {
+                                            s.lifecycle
+                                                == crate::agent::execution_types::SubagentLifecycle::Running
+                                        },
+                                    );
+                                    // 情况一（在跑）不读盘；不在跑才探测未消费数据（情况二）。
+                                    let has_unconsumed = if subagents_running {
+                                        false
+                                    } else {
+                                        unni_detect_unconsumed(&pool, &storage_root).await
+                                    };
+                                    match unni_loopback_decision(
+                                        subagents_running,
+                                        has_unconsumed,
+                                        unni_consecutive_wait,
+                                    ) {
+                                        UnniLoopbackDecision::SpawnRound => {
+                                            // 首个等待轮照常空转（本轮完成，计数累加）。
+                                            unni_consecutive_wait += 1;
+                                        }
+                                        UnniLoopbackDecision::AwaitWave => {
+                                            // 阻塞入口检查（细节 1）：决策依据片刻前状态，
+                                            // 收口可能刚落定——重读池+盘，不对已收口的波空等。
+                                            let pending: std::collections::HashSet<String> = pool
+                                                .subagent_states()
+                                                .await
+                                                .iter()
+                                                .filter(|s| {
+                                                    s.lifecycle == crate::agent::execution_types::SubagentLifecycle::Running
+                                                })
+                                                .map(|s| s.subagent_id.clone())
+                                                .collect();
+                                            if pending.is_empty() {
+                                                tracing::info!(
+                                                    "streaming_loop: UNNI await entry recheck found wave already settled (thought_id={})",
+                                                    event.turn_id
+                                                );
+                                                let settled_unconsumed =
+                                                    unni_detect_unconsumed(&pool, &storage_root).await;
+                                                if settled_unconsumed {
+                                                    spawn_unni_settlement_round(
+                                                        mode_manager,
+                                                        &mut state,
+                                                        "阻塞入口复核发现已收口",
+                                                    )
+                                                    .await;
+                                                    continue;
+                                                }
+                                                // 无未消费 → 落入下方旧停止行为。
+                                            } else {
+                                                tracing::info!(
+                                                    pending = pending.len(),
+                                                    timeouts = unni_await_timeouts,
+                                                    "streaming_loop: UNNI await-finalization entered, blocking until wave settles (thought_id={})",
+                                                    event.turn_id
+                                                );
+                                                unni_await = Some(UnniAwaitFinalization::new(
+                                                    pending,
+                                                    std::time::Instant::now(),
+                                                ));
+                                                continue;
+                                            }
+                                        }
+                                        UnniLoopbackDecision::Settlement => {
+                                            // A 组竞态在此接住：收口落在洞察 LLM 窗口内，
+                                            // 数据在盘上从未被拉取 → 清算轮补一次拉取 → B 交付。
+                                            spawn_unni_settlement_round(
+                                                mode_manager,
+                                                &mut state,
+                                                "存在未消费 subagent 结果",
+                                            )
+                                            .await;
+                                            continue;
+                                        }
+                                        UnniLoopbackDecision::Stop => {}
+                                    }
+                                    // 情况三：旧停止行为照旧（函数本体不变，仅作情况三保留调用）。
+                                    if unni_follow_user_should_stop(
+                                        is_loopback,
+                                        actions_empty,
+                                        subagents_running,
+                                    ) {
+                                        tracing::info!(
+                                            "streaming_loop: UNNI follow-user stop reached (loopback idle), waiting for user input (thought_id={})",
+                                            event.turn_id
+                                        );
+                                        continue;
+                                    }
+                                }
                             }
                         }
                         spawn_platform_insight(mode_manager, &mut state, &pool, &event.turn_id).await;
@@ -1600,6 +1785,193 @@ async fn spawn_platform_insight(
         Ok(id) => state.push_streaming(id),
         Err(e) => state.set_error(e.to_string()),
     }
+}
+
+/// UNNI 清算轮（v0.5.3 D3）：普通回环轮（think → execute(0 动作) → 洞察拉取），
+/// 无新轮型；其洞察拉取必读到盘上 subagent 数据 → has_subagent_result=true →
+/// 既有 B 语义交付轮 → say → 自然停。`has_subagent_result=false`（交付轮由其
+/// insight_complete 按既有链路派生，本函数不直达洞察）。
+async fn spawn_unni_settlement_round(
+    mode_manager: &mut ModeManager,
+    state: &mut TuiState,
+    reason: &str,
+) {
+    let summary =
+        format!("（subagent 收口清算·{reason}）已返回的 subagent 结果待读取，请汇总其输出并交付。");
+    match mode_manager
+        .spawn_with_override(
+            summary.clone(),
+            Some(crate::agent::thought::ThinkingInput::PlatformInsight {
+                summary,
+                has_subagent_result: false,
+            }),
+        )
+        .await
+    {
+        Ok(id) => state.push_streaming(id),
+        Err(e) => state.set_error(e.to_string()),
+    }
+}
+
+/// UNNI 未消费数据探测（v0.5.3）：读池内全部 subagent 的盘上 last_output.t 与
+/// 最近一次洞察拉取时刻，交给纯谓词 [`unni_has_unconsumed`] 判定。
+async fn unni_detect_unconsumed(
+    pool: &std::sync::Arc<crate::agent::agent_pool::AgentPool>,
+    storage_root: &Path,
+) -> bool {
+    let states = pool.subagent_states().await;
+    let last_pull = pool.last_insight_pull_at().await;
+    let mut ts = Vec::with_capacity(states.len());
+    for state in states {
+        let t = crate::agent::subagent_memory::read_last_output(storage_root, &state.subagent_id)
+            .ok()
+            .flatten()
+            .and_then(|output| unni_parse_last_output_t(&output.t));
+        ts.push(t);
+    }
+    unni_has_unconsumed(&ts, last_pull)
+}
+
+/// UNNI 回环等待收口（v0.5.3）：纯等待轮完成后不再派发下一轮的阈值（含本次在内
+/// 计满即阻塞）。1 = 用户拍板语义（任务书 §0）：第 2 轮（首个等待轮）照常空转
+/// ——它由用户轮 insight_complete 派生、不经本决策——第 2 轮完成后第 3 轮起阻塞。
+/// 调大则阻塞前多空转（如 2 = 第 2、3 轮空转，第 4 轮起阻塞）。
+const UNNI_AWAIT_AFTER_WAIT_ROUNDS: u32 = 1;
+
+/// 阻塞安全超时（兜底，防波悬挂）：subagent run 硬超时 3600s，波必然有界；
+/// 到期解除阻塞并 spawn 清算轮（允许到期后同一波再次阻塞，tracing 记录递归计数）。
+const UNNI_AWAIT_WAVE_TIMEOUT_SECS: u64 = 3900;
+
+/// UNNI 回环轮 idle 决策（v0.5.3 D1 三分支，纯函数）。
+///
+/// 输入为决策时刻的快照：是否有在跑 subagent、是否存在未消费 subagent 数据
+/// （max(last_output.t) > last_insight_pull_at）、已完成的连续纯等待轮数（不含本轮）。
+/// 语义（任务书 §0/§2 D1 冻结）：
+/// - 情况一（在跑）：计数 +1 达 `UNNI_AWAIT_AFTER_WAIT_ROUNDS` → 阻塞（本轮不派发）；
+///   未达限 → 照常 spawn 下一轮。阈值 1 时在跑分支恒阻塞（首个等待轮的"照常空转"
+///   由用户轮 insight_complete 派生实现，不经本函数）；
+/// - 情况二（不在跑 + 有未消费数据）→ 清算轮（收口落在洞察 LLM 窗口内的 A 组竞态在此接住）；
+/// - 情况三（不在跑 + 无未消费数据）→ 旧停止行为（调用侧咨询 `unni_follow_user_should_stop`）。
+///
+/// 拉取轮（该轮洞察已含 subagent 结果段）不经本函数：既有 B 语义交付链要求该轮
+/// insight_complete 继续 spawn 交付轮（交付轮经 internal_no_downstream 自然断），
+/// 调用侧在进入本决策前分流（部分收口时阻塞等波，见 `unni_puller_should_await_wave`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnniLoopbackDecision {
+    /// 照常 spawn 下一轮回环（含首个等待轮空转）。
+    SpawnRound,
+    /// 进入 AwaitFinalization：阻塞等待当前波收口。
+    AwaitWave,
+    /// spawn 清算轮（普通回环轮，无新轮型；其洞察拉取必读到盘上数据 → B 语义交付）。
+    Settlement,
+    /// 真无事可做 → 旧停止行为。
+    Stop,
+}
+
+fn unni_loopback_decision(
+    subagents_running: bool,
+    has_unconsumed: bool,
+    consecutive_wait: u32,
+) -> UnniLoopbackDecision {
+    if subagents_running {
+        // 含本次空转在内计满 → 阻塞（下一等待轮不再派发）。
+        if consecutive_wait + 1 >= UNNI_AWAIT_AFTER_WAIT_ROUNDS {
+            UnniLoopbackDecision::AwaitWave
+        } else {
+            UnniLoopbackDecision::SpawnRound
+        }
+    } else if has_unconsumed {
+        UnniLoopbackDecision::Settlement
+    } else {
+        UnniLoopbackDecision::Stop
+    }
+}
+
+/// 拉取轮处置（v0.5.3 复测修复 R3 残留竞态，纯函数）：该轮洞察已含 subagent 结果段
+/// （中间/最终均计）时——池内仍有 Running（部分收口）→ 阻塞等当前波全部收口（不派发
+/// 交付轮抢跑：thinking 层 internal_no_downstream 无条件断链，末次收口将无阻塞态可消费
+/// → 结果孤儿化）；波空 → 既有 B 交付链直接派生交付轮（现行为不变）。
+fn unni_puller_should_await_wave(running_pending: bool) -> bool {
+    running_pending
+}
+
+/// 纯等待轮完成后的计数维护（D1 计数器语义，纯函数）：actions 非空的执行轮完成、
+/// has_subagent_result=true 的洞察轮完成 → 清零；纯等待轮 → 保持累加
+/// （调用侧在累加时 +1）。用户轮 spawn 的清零在 Submit 分支内联（非轮完成事件）。
+fn unni_wait_counter_after_completion(
+    actions_empty: bool,
+    has_subagent_result: bool,
+    current: u32,
+) -> u32 {
+    if !actions_empty || has_subagent_result {
+        0
+    } else {
+        current
+    }
+}
+
+/// 未消费数据判定（D1 情况二谓词，纯函数）：max(subagent last_output.t) 严格晚于
+/// 最近一次洞察拉取 → 有从未被读过的结果。无任何 subagent 数据 → 无未消费；
+/// 本会话从未拉取（last_pull=None）→ 盘上有数据即未消费。
+fn unni_has_unconsumed(
+    last_output_ts: &[Option<chrono::DateTime<chrono::Utc>>],
+    last_pull: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    let latest = last_output_ts.iter().copied().flatten().max();
+    match (latest, last_pull) {
+        (Some(t), Some(pull)) => t > pull,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+/// 解析 last_output.t（UtcTimestamp 字符串 → DateTime）；非规范格式一律按"无数据"
+/// 处理（返回 None），不让坏时间戳参与先后比较。
+fn unni_parse_last_output_t(ts: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
+/// 阻塞等待态（v0.5.3 D2，循环级状态）：select 照常运转，禁止在分支 handler 内
+/// 裸 await 等待收口（F7）。阻塞期间无轮完成 → insight_complete 不可达 →
+/// 停止判定天然不可达（验证而非实现）。
+struct UnniAwaitFinalization {
+    /// 阻塞起点快照：全部 running subagent_id。逐个收口移除，集合空即波完成。
+    pending: std::collections::HashSet<String>,
+    /// now + 安全超时；render_tick 到期解除（兜底）。
+    deadline: std::time::Instant,
+}
+
+impl UnniAwaitFinalization {
+    fn new(pending: std::collections::HashSet<String>, now: std::time::Instant) -> Self {
+        Self {
+            pending,
+            deadline: now + std::time::Duration::from_secs(UNNI_AWAIT_WAVE_TIMEOUT_SECS),
+        }
+    }
+
+    /// 消费 subagent_complete：`still_running` 为调用侧重新核对池状态的结果
+    /// （防事件乱序——事件对应旧 run 而新 run 已受理时不清除）。
+    /// 返回 true 表示波内全部收口（阻塞应解除）。
+    fn on_subagent_complete(&mut self, subagent_id: &str, still_running: bool) -> bool {
+        if !still_running {
+            self.pending.remove(subagent_id);
+        }
+        self.pending.is_empty()
+    }
+
+    /// 安全超时是否到期。
+    fn expired(&self, now: std::time::Instant) -> bool {
+        now >= self.deadline
+    }
+}
+
+/// 停止判定可否被咨询：阻塞期间无轮完成 → insight_complete 不可达 → 不可咨询
+/// （状态机层面的等价断言点，单测覆盖）。
+#[cfg(test)]
+fn unni_stop_rule_consultable(awaiting: Option<&UnniAwaitFinalization>) -> bool {
+    awaiting.is_none()
 }
 
 /// UNNI follow-user stop 判定（任务书 §2.2，2026-08-26 用户确认）。
@@ -1979,5 +2351,335 @@ mod unni_follow_user_stop_tests {
         assert!(unni_follow_user_should_stop(true, true, false));
         // 等待链保护：交付轮之前的轮次若仍见 running subagent，链不被截断。
         assert!(!unni_follow_user_should_stop(true, true, true));
+    }
+}
+
+#[cfg(test)]
+mod unni_loopback_decision_tests {
+    use super::*;
+
+    /// 情况一计数（D1，阈值=1）：首个等待轮完成（计数 0）即阻塞——第 3 轮不再派发
+    /// （任务书 §0：第 2 轮由用户轮派生照常空转，不经本决策）。SpawnRound 分支仅在
+    /// 调大阈值时可达。
+    #[test]
+    fn case1_wait_counting_spawns_then_blocks() {
+        assert_eq!(
+            unni_loopback_decision(true, false, 0),
+            UnniLoopbackDecision::AwaitWave
+        );
+        assert_eq!(
+            unni_loopback_decision(true, false, 5),
+            UnniLoopbackDecision::AwaitWave
+        );
+        assert_eq!(UNNI_AWAIT_AFTER_WAIT_ROUNDS, 1);
+    }
+
+    /// 情况二：不在跑 + 有未消费数据 → 清算轮（A 组竞态接住，不走停止分支）。
+    #[test]
+    fn case2_unconsumed_data_settles() {
+        assert_eq!(
+            unni_loopback_decision(false, true, 0),
+            UnniLoopbackDecision::Settlement
+        );
+        assert_eq!(
+            unni_loopback_decision(false, true, 5),
+            UnniLoopbackDecision::Settlement
+        );
+    }
+
+    /// 情况三：不在跑 + 无未消费数据 → 旧停止行为（unni_follow_user_should_stop 照旧）。
+    #[test]
+    fn case3_no_data_stops_via_legacy_rule() {
+        assert_eq!(
+            unni_loopback_decision(false, false, 0),
+            UnniLoopbackDecision::Stop
+        );
+        // Stop 分支落到旧规则，loopback idle 且无 running → 停。
+        assert!(unni_follow_user_should_stop(true, true, false));
+    }
+
+    /// 计数器重置（D1）：actions 非空的执行轮完成 → 清零；has_subagent_result=true 的
+    /// 洞察轮完成 → 清零；纯等待轮 → 保持。用户轮 spawn 的清零在 Submit 分支内联
+    /// （非轮完成事件，见 run_streaming_loop），等价于从 0 起算（case1 用例覆盖）。
+    #[test]
+    fn counter_reset_conditions() {
+        assert_eq!(unni_wait_counter_after_completion(false, false, 3), 0);
+        assert_eq!(unni_wait_counter_after_completion(true, true, 3), 0);
+        assert_eq!(unni_wait_counter_after_completion(false, true, 3), 0);
+        assert_eq!(unni_wait_counter_after_completion(true, false, 3), 3);
+    }
+
+    /// 等待链完整序列（含用户轮重置基线）：用户轮派发（is_loopback=false 不经决策，
+    /// 派生第 2 轮照常空转）→ 第 2 轮完成（计数 0）→ 阻塞（第 3 轮不再派发）→
+    /// （波收口后）不在跑+未消费 → 清算。
+    #[test]
+    fn wait_chain_sequence_from_user_round() {
+        let counter = 0; // 用户轮 spawn 清零（Submit 分支）
+        assert_eq!(
+            unni_loopback_decision(true, false, counter),
+            UnniLoopbackDecision::AwaitWave
+        );
+    }
+}
+
+#[cfg(test)]
+mod unni_unconsumed_data_tests {
+    use super::*;
+
+    fn parse(ts: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(ts)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// 收口晚于最近一次拉取 → 未消费（A 组形态：拉取 22:10:0x，收口 22:10:36）。
+    #[test]
+    fn completion_after_last_pull_is_unconsumed() {
+        let last_output = [Some(parse("2026-09-11T22:10:36.724951800Z"))];
+        let pull = Some(parse("2026-09-11T22:10:05.123456789Z"));
+        assert!(unni_has_unconsumed(&last_output, pull));
+    }
+
+    /// 收口早于最近一次拉取 → 已消费（清算轮拉取后的形态）。
+    #[test]
+    fn completion_before_last_pull_is_consumed() {
+        let last_output = [Some(parse("2026-09-11T22:10:36.724951800Z"))];
+        let pull = Some(parse("2026-09-11T22:10:42.241935Z"));
+        assert!(!unni_has_unconsumed(&last_output, pull));
+    }
+
+    /// 无任何 subagent 数据 → 无未消费（有无拉取时刻均然）。
+    #[test]
+    fn no_subagent_data_is_never_unconsumed() {
+        assert!(!unni_has_unconsumed(&[], None));
+        assert!(!unni_has_unconsumed(
+            &[],
+            Some(parse("2026-09-11T22:00:00Z"))
+        ));
+        // created 占位目录缺 last_output → None 同样不计。
+        assert!(!unni_has_unconsumed(&[None], None));
+    }
+
+    /// 本会话从未拉取（last_pull=None）而盘上有数据 → 未消费。
+    #[test]
+    fn never_pulled_session_with_data_is_unconsumed() {
+        let last_output = [Some(parse("2026-09-11T22:10:36.724951800Z"))];
+        assert!(unni_has_unconsumed(&last_output, None));
+    }
+
+    /// 坏时间戳按"无数据"处理，不参与先后比较（不误触发清算）。
+    #[test]
+    fn malformed_timestamp_treated_as_no_data() {
+        assert_eq!(unni_parse_last_output_t("not-a-timestamp"), None);
+        assert!(!unni_has_unconsumed(&[None], None));
+    }
+}
+
+#[cfg(test)]
+mod unni_await_finalization_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+
+    fn pending(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    /// 波内逐个收口：集合空才解除（波语义，非 ANY 即交付）。
+    #[test]
+    fn wave_settles_only_when_pending_empty() {
+        let mut awaiting =
+            UnniAwaitFinalization::new(pending(&["sg_a", "sg_b", "sg_c"]), Instant::now());
+        assert!(!awaiting.on_subagent_complete("sg_a", false));
+        assert!(!awaiting.on_subagent_complete("sg_b", false));
+        assert!(awaiting.on_subagent_complete("sg_c", false));
+    }
+
+    /// 未知 id（波外新实例的事件）忽略，不影响等待集合。
+    #[test]
+    fn unknown_subagent_id_is_ignored() {
+        let mut awaiting = UnniAwaitFinalization::new(pending(&["sg_a"]), Instant::now());
+        assert!(!awaiting.on_subagent_complete("sg_zzz", false));
+        assert!(!awaiting.on_subagent_complete("sg_zzz", false));
+        assert!(awaiting.on_subagent_complete("sg_a", false));
+    }
+
+    /// 事件乱序防护：池中该实例仍 Running（事件对应旧 run，新 run 已受理）→ 不移除。
+    #[test]
+    fn still_running_event_does_not_clear_pending() {
+        let mut awaiting = UnniAwaitFinalization::new(pending(&["sg_a"]), Instant::now());
+        assert!(!awaiting.on_subagent_complete("sg_a", true));
+        // 随后真正收口（池内非 Running）→ 正常移除解除。
+        assert!(awaiting.on_subagent_complete("sg_a", false));
+    }
+
+    /// Submit 清除阻塞态并重置计数（F8 用户轮接管；循环内为 take() + = 0，此处
+    /// 固化同一惯用法）。
+    #[test]
+    fn submit_clears_block_and_resets_counter() {
+        let mut unni_await: Option<UnniAwaitFinalization> = Some(UnniAwaitFinalization::new(
+            pending(&["sg_a"]),
+            Instant::now(),
+        ));
+        let mut unni_consecutive_wait: u32 = 2;
+        if unni_await.take().is_some() {
+            unni_consecutive_wait = 0;
+        }
+        assert!(unni_await.is_none());
+        assert_eq!(unni_consecutive_wait, 0);
+    }
+
+    /// 安全超时到期解除（兜底；未到期不解除）。
+    #[test]
+    fn deadline_expiry_releases_block() {
+        let now = Instant::now();
+        let awaiting = UnniAwaitFinalization::new(pending(&["sg_a"]), now);
+        assert!(!awaiting.expired(now));
+        assert!(awaiting.expired(now + Duration::from_secs(UNNI_AWAIT_WAVE_TIMEOUT_SECS)));
+    }
+
+    /// 阻塞期间停止判定不可达（F7/D2 状态机层面）：awaiting 在场 → 不可咨询；
+    /// 解除后恢复可咨询。机制：阻塞期无轮完成 → insight_complete 不产生。
+    #[test]
+    fn stop_rule_not_consultable_while_awaiting() {
+        let awaiting = UnniAwaitFinalization::new(pending(&["sg_a"]), Instant::now());
+        assert!(!unni_stop_rule_consultable(Some(&awaiting)));
+        let none: Option<UnniAwaitFinalization> = None;
+        assert!(unni_stop_rule_consultable(none.as_ref()));
+    }
+}
+
+#[cfg(test)]
+mod unni_settlement_replay_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::time::Instant;
+
+    fn parse(ts: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(ts)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// A 组实锤时序复演（证据 /tmp/cipher-diag/evidence/ABCD/A/probe.cipher.log，
+    /// 数据面 mock 级）：
+    /// 22:09:58 等待轮完成（sg 仍 running）→ 修复后应 AwaitWave 阻塞（旧代码继续空转）；
+    /// 22:10:36 收口写盘 → subagent_complete 被阻塞态消费 → 波空 → 清算轮；
+    /// 22:10:42 旧停止判定点（收口落在洞察 LLM 窗口内：拉取 22:10:0x < 收口）→
+    /// 断言命中 Settlement 而非 Stop（旧代码在此判 idle 停止 → 结果孤儿化静默 5 分钟）。
+    #[test]
+    fn a_group_timeline_hits_settlement_not_stop() {
+        let subagent_id = "sg_26da17b7cbf04b5ab1d20577268c0d35";
+        let last_pull = Some(parse("2026-09-11T22:10:05.123456789Z")); // 最后轮洞察组装打点
+        let completion = parse("2026-09-11T22:10:36.724951800Z"); // 收口写盘（last_output.t）
+
+        // 阻塞入口：22:09:58 等待轮完成，计数已 1，sg 仍 running。
+        assert_eq!(
+            unni_loopback_decision(true, false, 1),
+            UnniLoopbackDecision::AwaitWave
+        );
+        let mut unni_await = Some(UnniAwaitFinalization::new(
+            HashSet::from([subagent_id.to_string()]),
+            Instant::now(),
+        ));
+        // 22:10:36 subagent_complete：池内已非 Running → 移除 → 波空解除 → 清算轮
+        // （循环内解除即 `unni_await = None`，take 惯用法已由 submit 用例固化）。
+        let wave_done = unni_await
+            .as_mut()
+            .map(|a| a.on_subagent_complete(subagent_id, false))
+            .unwrap_or(false);
+        assert!(wave_done);
+        drop(unni_await);
+
+        // 22:10:42 决策点：不在跑 + 盘上有从未拉取的结果 → Settlement（而非 Stop）。
+        let has_unconsumed = unni_has_unconsumed(&[Some(completion)], last_pull);
+        assert!(has_unconsumed);
+        let decision = unni_loopback_decision(false, has_unconsumed, 1);
+        assert_eq!(decision, UnniLoopbackDecision::Settlement);
+        assert_ne!(decision, UnniLoopbackDecision::Stop);
+    }
+
+    /// 回归（L1-4）：无 subagent 场景（纯问答）决策路径与旧行为逐路径一致——
+    /// 用户轮照常 spawn；回环 idle 轮走情况三 → 旧规则判停（不多跑）；
+    /// 回环带 actions 轮照常继续；全程不产生 AwaitWave/Settlement。
+    #[test]
+    fn pure_qa_matches_legacy_behavior() {
+        let no_data: [Option<chrono::DateTime<chrono::Utc>>; 0] = [];
+        // 纯问答：无 subagent 数据 → 永不未消费。
+        assert!(!unni_has_unconsumed(&no_data, None));
+        assert!(!unni_has_unconsumed(
+            &no_data,
+            Some(parse("2026-09-11T22:00:00Z"))
+        ));
+
+        // 用户轮（is_loopback=false）：不进决策区，旧规则亦不停 → spawn（一致）。
+        assert!(!unni_follow_user_should_stop(false, false, false));
+        assert!(!unni_follow_user_should_stop(false, true, false));
+
+        // 回环 idle 轮：情况三 → Stop → 旧规则判停（一致）。
+        assert_eq!(
+            unni_loopback_decision(false, false, 0),
+            UnniLoopbackDecision::Stop
+        );
+        assert!(unni_follow_user_should_stop(true, true, false));
+
+        // 回环带 actions 轮：不进决策区（actions_empty 门），旧规则亦不停 → spawn（一致）。
+        assert!(!unni_follow_user_should_stop(true, false, false));
+
+        // 无 subagent 场景下任何决策输入都不会进入阻塞/清算。
+        assert_ne!(
+            unni_loopback_decision(false, false, 0),
+            UnniLoopbackDecision::AwaitWave
+        );
+        assert_ne!(
+            unni_loopback_decision(false, false, 0),
+            UnniLoopbackDecision::Settlement
+        );
+    }
+}
+
+#[cfg(test)]
+mod unni_puller_wave_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::time::Instant;
+
+    /// R3 残留竞态复演（复测报告 §2.3/§3，数据面 mock 级）：A 先收口（中间态结果
+    /// 入盘）→ 某轮洞察拉取读到结果段（has_subagent_result=true）而 B 仍 Running →
+    /// **部分收口进阻塞而非派发交付轮**（旧路径：交付轮 internal_no_downstream 抢跑
+    /// 无条件断链 → B 收口沦为纯数据事件、无阻塞态可消费 → 末次结果孤儿化静默）；
+    /// B 收口 → 波空解除 → 清算轮全量拉取 → has_subagent_result=true 且无 Running →
+    /// 既有 B 链完整交付（波语义：等全部收口、一次交付）。
+    #[test]
+    fn r3_partial_wave_blocks_instead_of_premature_delivery() {
+        // 拉取轮决策：池内仍有 Running → 阻塞（不派发交付轮）。
+        assert!(unni_puller_should_await_wave(true));
+        let mut unni_await = Some(UnniAwaitFinalization::new(
+            HashSet::from(["sg_cf4d0018".to_string()]),
+            Instant::now(),
+        ));
+        // B 收口（池内非 Running）→ 移除 → 波空解除 → 清算轮。
+        let wave_done = unni_await
+            .as_mut()
+            .map(|a| a.on_subagent_complete("sg_cf4d0018", false))
+            .unwrap_or(false);
+        assert!(wave_done);
+        // 清算轮全量拉取后：has_subagent_result=true 且无 Running → 不再阻塞，
+        // 既有 B 交付链直接派生交付轮（现行为不变）。
+        assert!(!unni_puller_should_await_wave(false));
+    }
+
+    /// 拉取轮阻塞入口与等待轮阻塞共用同一状态机与安全超时（波空/到期/Submit 清除
+    /// 语义一致，行为细节由 unni_await_finalization_tests 覆盖）。
+    #[test]
+    fn puller_block_reuses_await_finalization_semantics() {
+        let awaiting = UnniAwaitFinalization::new(
+            HashSet::from(["sg_a".to_string(), "sg_b".to_string()]),
+            Instant::now(),
+        );
+        // 部分收口（A 完成、B 在跑）不解除；停止判定在阻塞态不可达。
+        let mut awaiting = awaiting;
+        assert!(!awaiting.on_subagent_complete("sg_a", false));
+        assert!(!unni_stop_rule_consultable(Some(&awaiting)));
     }
 }

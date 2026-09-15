@@ -83,6 +83,10 @@ pub struct AgentPool {
     platform_status: Arc<tokio::sync::RwLock<PlatformStatus>>,
 
     event_bus: tokio::sync::broadcast::Sender<PlatformEvent>,
+
+    /// 洞察中台最近一次输入组装时刻（v0.5.3 UNNI 等待收口）：组装在读取 subagent
+    /// 数据前打点，主循环据此判定盘上 last_output 是否从未被拉取过（未消费数据）。
+    last_insight_pull_at: RwLock<Option<chrono::DateTime<chrono::Utc>>>,
 }
 
 impl AgentPool {
@@ -118,9 +122,20 @@ impl AgentPool {
             state_tx,
             platform_status: Arc::new(tokio::sync::RwLock::new(PlatformStatus::default())),
             event_bus,
+            last_insight_pull_at: RwLock::new(None),
         };
 
         (pool, receivers)
+    }
+
+    /// 洞察输入组装打点（必须在读取 subagent 数据前调用，保证"已拉取"语义）。
+    pub async fn set_last_insight_pull_at(&self, at: chrono::DateTime<chrono::Utc>) {
+        *self.last_insight_pull_at.write().await = Some(at);
+    }
+
+    /// 最近一次洞察输入组装时刻；本会话从未组装过则为 None。
+    pub async fn last_insight_pull_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        *self.last_insight_pull_at.read().await
     }
 
     pub fn subscribe_state(&self) -> watch::Receiver<AgentPoolSnapshot> {

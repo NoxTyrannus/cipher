@@ -178,6 +178,9 @@ impl InsightPlatform {
         // 2.0.2 洞察中台输入组装：多段 assistant 原样连续、一次 LLM 调用。
         // 0~N 个已完成 subagent 结果段（memory.json evidence，代码侧组装）；
         // 「有结果」判定 = AgentPool subagent 状态变化（结果段数量 > 0，中间/最终结果均计）。
+        // v0.5.3 UNNI 等待收口：组装前打点（读取数据前），供主循环判定"盘上
+        // last_output 是否从未被拉取"（未消费数据 → 清算轮）；拉取机制零改动。
+        self.pool.set_last_insight_pull_at(chrono::Utc::now()).await;
         let subagent_results = self.build_subagent_result_segments().await;
         let has_subagent_result = !subagent_results.is_empty();
         self.pool
