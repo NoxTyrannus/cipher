@@ -497,7 +497,7 @@ dependencies = [
 
 [[package]]
 name = "cipher"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -511,6 +511,7 @@ dependencies = [
  "hnsw_rs",
  "httptest",
  "jsonschema",
+ "libc",
  "ratatui",
  "reqwest",
  "secrecy",

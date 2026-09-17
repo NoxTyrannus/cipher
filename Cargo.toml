@@ -1,6 +1,6 @@
 [package]
 name = "cipher"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2021"
 description = "终端原生 AI 代理 — 三种工作模式 (UNNI/KEEP/LOOP), 内置执行/洞察/记忆三中台"
 license = "MIT"
@@ -43,6 +43,7 @@ dirs = "5"                                                    # ~/.cipher/ 路�
 clap = { version = "4", features = ["derive"] }              # CLI 子命令解析 (setup/config, per cli spec)
 tracing = "0.1"                                               # self-check 结构化日志
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "0.2"                                                   # C3 子进程组 setpgid + PR_SET_PDEATHSIG
 
 # TUI + mode_runtime (iter53 2026-06-12, per spec 3 + ADR-068 方案 A)
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }   # TUI 渲染
