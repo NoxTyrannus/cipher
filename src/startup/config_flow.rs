@@ -11,12 +11,38 @@ use secrecy::SecretString;
 
 use super::config::{Config, UnniStyle};
 
-const PRESET_TEMPLATES: &[(&str, &str, &str, &str)] = &[(
-    "OpenAI 官方",
-    "openai",
-    "https://api.openai.com/v1",
-    "OpenAI",
-)];
+/// D4（v0.5.4）：/config 新增路径的 max_output 默认值（CLI config_flow 与 TUI
+/// config_panel 两入口共用此单一真源）。注意与 provider 层 config 缺键时的 8192
+/// 兜底（provider.rs `FALLBACK_MAX_OUTPUT_TOKENS`）是用户拍板的**两回事**，不得统一。
+pub(crate) const DEFAULT_MAX_OUTPUT_FOR_NEW_MODELS: u64 = 1024;
+
+/// A4 同款（v0.5.4）：api_type 枚举二选（方向键 + Enter），内部值映射与初始化向导一致。
+fn select_api_type(prompt: &str) -> Result<String, AgentError> {
+    let items: Vec<&str> = crate::startup::init_flow::API_TYPE_SELECTIONS
+        .iter()
+        .map(|(display, _)| *display)
+        .collect();
+    let sel = Select::new()
+        .with_prompt(prompt)
+        .items(&items)
+        .default(0)
+        .interact()
+        .map_err(|e| AgentError::Parse(format!("api_type select: {e}")))?;
+    Ok(crate::startup::init_flow::api_type_selection_internal(sel)
+        .expect("Select 项数与 API_TYPE_SELECTIONS 一致")
+        .to_string())
+}
+
+/// D4：/config 新增路径的 max_output 数字设置项（默认 1024，写入 model config）。
+fn prompt_max_output_default_1024() -> Result<u64, AgentError> {
+    Input::<u64>::new()
+        .with_prompt(format!(
+            "max_output (单次回复 token 上限, 默认 {DEFAULT_MAX_OUTPUT_FOR_NEW_MODELS})"
+        ))
+        .default(DEFAULT_MAX_OUTPUT_FOR_NEW_MODELS)
+        .interact_text()
+        .map_err(|e| AgentError::Parse(format!("max_output: {e}")))
+}
 
 pub fn run_workspace_command(app: &AppState, command: &WorkspaceCommand) -> Result<(), AgentError> {
     let store = WorkspaceStore::open(app.paths.storage_root())?;
@@ -351,42 +377,22 @@ fn list_models(app: &AppState) -> Result<(), AgentError> {
 }
 
 fn add_model(app: &AppState) -> Result<(), AgentError> {
-    let mut items: Vec<String> = PRESET_TEMPLATES
-        .iter()
-        .map(|(n, _, _, _)| n.to_string())
-        .collect();
-    items.push("自定义".to_string());
-    let sel = Select::new()
-        .with_prompt("选择 provider 模板")
-        .items(&items)
-        .default(0)
-        .interact()
-        .map_err(|e| AgentError::Parse(format!("add select: {}", e)))?;
-    let (provider, default_api_url, default_api_type) = if sel < PRESET_TEMPLATES.len() {
-        let t = PRESET_TEMPLATES[sel];
-        (t.1.to_string(), t.2.to_string(), t.3.to_string())
-    } else {
-        let p = Input::<String>::new()
-            .with_prompt("provider")
-            .interact_text()
-            .map_err(|e| AgentError::Parse(format!("provider: {}", e)))?;
-        let u = Input::<String>::new()
-            .with_prompt("api_url")
-            .interact_text()
-            .map_err(|e| AgentError::Parse(format!("api_url: {}", e)))?;
-        let t = Input::<String>::new()
-            .with_prompt("api_type (OpenAI/Responses)")
-            .default("OpenAI".to_string())
-            .interact_text()
-            .map_err(|e| AgentError::Parse(format!("api_type: {}", e)))?;
-        (p, u, t)
-    };
-
+    // A8（v0.5.4）：内置预制模板项及其选择环已删除，直接自定义五步
+    // （provider → api_url → api_type → model_id → API key，已有 key 的 provider 带出）；
+    // 自定义字段控件与文案与初始化向导 A3/A4 同款；name = model_id（A5 同语义）。
+    let input = Input::<String>::new()
+        .with_prompt(crate::startup::init_flow::PROVIDER_PROMPT)
+        .interact_text()
+        .map_err(|e| AgentError::Parse(format!("provider: {}", e)))?;
+    let provider = input.trim().to_string();
+    if find_provider_sample(&app.duckdb, &provider)?.is_some() {
+        println!("provider 已存在，将同步更新其 api_key");
+    }
     let existing = find_provider_sample(&app.duckdb, &provider)?;
     let (api_url, api_type, api_key) = match existing.as_ref() {
         Some(em) if em.api_key.as_ref().map(|k| !k.is_empty()).unwrap_or(false) => {
             println!(
-                "provider={} 已存在，已自动带出其 api_url/api_key/api_type，只填 name + model_id",
+                "provider={} 已存在，已自动带出其 api_url/api_key/api_type，只填 model_id",
                 provider
             );
             (
@@ -396,33 +402,36 @@ fn add_model(app: &AppState) -> Result<(), AgentError> {
             )
         }
         _ => {
+            let api_url = Input::<String>::new()
+                .with_prompt("api_url")
+                .interact_text()
+                .map_err(|e| AgentError::Parse(format!("api_url: {}", e)))?;
+            let api_type = select_api_type("api_type")?;
             let api_key = Password::new()
                 .with_prompt("API key")
                 .interact()
                 .map_err(|e| AgentError::Parse(format!("api_key: {}", e)))?;
-            (default_api_url, default_api_type, api_key)
+            (api_url, api_type, api_key)
         }
     };
 
-    let name = Input::<String>::new()
-        .with_prompt("模型显示名")
-        .interact_text()
-        .map_err(|e| AgentError::Parse(format!("name: {}", e)))?;
     let model_id = Input::<String>::new()
         .with_prompt("model_id")
         .interact_text()
         .map_err(|e| AgentError::Parse(format!("model_id: {}", e)))?;
+    let max_output = prompt_max_output_default_1024()?;
 
     let row = ModelRow {
         id: format!("{}-{}", provider, model_id),
-        name,
+        name: model_id.clone(),
         provider: provider.clone(),
         api_protocol: crate::data::duckdb::loader::default_api_protocol(&api_type),
         api_url,
         api_type,
         model_id,
         api_key: Some(api_key.clone()),
-        config: None,
+        // D4：新增路径写入 max_output（默认 1024）；存量行不回填。
+        config: Some(serde_json::json!({ "max_output": max_output })),
     };
     insert_model(&app.duckdb, &row)?;
     let secret = SecretString::new(api_key);
@@ -473,6 +482,7 @@ fn quick_add_model(app: &AppState) -> Result<(), AgentError> {
         .with_prompt("model_id")
         .interact_text()
         .map_err(|e| AgentError::Parse(format!("model_id: {}", e)))?;
+    let max_output = prompt_max_output_default_1024()?;
     let key = em.api_key.clone().unwrap();
     let row = ModelRow {
         id: format!("{}-{}", provider, model_id),
@@ -483,7 +493,8 @@ fn quick_add_model(app: &AppState) -> Result<(), AgentError> {
         api_type: em.api_type.clone(),
         model_id,
         api_key: Some(key.clone()),
-        config: None,
+        // D4：新增路径写入 max_output（默认 1024）；存量行不回填。
+        config: Some(serde_json::json!({ "max_output": max_output })),
     };
     insert_model(&app.duckdb, &row)?;
     let n = update_model_api_key_by_provider(&app.duckdb, &provider, &SecretString::new(key))?;

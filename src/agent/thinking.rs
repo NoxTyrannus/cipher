@@ -318,6 +318,7 @@ impl ThinkingInstance {
                         result: Ok(LlmResponse {
                             content: String::new(),
                             usage: None,
+                            finish_reason: None,
                         }),
                     });
                 }
@@ -377,6 +378,20 @@ fn insert_think_meta_before_user(messages: &mut Vec<ChatMessage>, think_text: &s
         messages.push(ChatMessage::User { text: user_text });
     } else {
         messages.push(segment);
+    }
+}
+
+/// D3（v0.5.4）截断标记精确文本（用户拍板定稿，禁止改动）。
+pub const TRUNCATION_MARKER: &str = "\nmax_output panic";
+
+/// D3 纯函数：say 链路 finish_reason 呈现。`finish_reason == Some("length")`
+/// （输出被 max_output 上限截断）时在文本尾部追加精确标记 `\nmax_output panic`
+/// （无句号、无其他字）；其余原样返回。think 链路不做。
+pub fn append_truncation_marker(text: &str, finish_reason: Option<&str>) -> String {
+    if finish_reason == Some("length") {
+        format!("{text}{TRUNCATION_MARKER}")
+    } else {
+        text.to_string()
     }
 }
 
@@ -449,7 +464,11 @@ impl ThinkingSchemeHandler for DualThinkingHandler {
             LlmRequest::from_model_row(model_row, think_messages.clone(), api_key.clone())?;
         think_req.system = Some(think_system);
         let think_resp = tokio::select! {
-            resp = provider.call(&think_req) => resp?,
+            // D2：think/say 共用包装层——供应商报 max_tokens 超上限时去掉参数重试一次。
+            resp = crate::logic::model::provider::call_with_max_tokens_fallback(
+                provider.as_ref(),
+                &think_req,
+            ) => resp?,
             _ = cancel.notified() => {
                 persist_terminal_output(
                     thought_store,
@@ -493,7 +512,11 @@ impl ThinkingSchemeHandler for DualThinkingHandler {
             let mut say_req = LlmRequest::from_model_row(model_row, say_messages, api_key)?;
             say_req.system = Some(say_system);
             let say_resp = tokio::select! {
-                resp = provider.call(&say_req) => resp?,
+                // D2：think/say 共用包装层——供应商报 max_tokens 超上限时去掉参数重试一次。
+                resp = crate::logic::model::provider::call_with_max_tokens_fallback(
+                    provider.as_ref(),
+                    &say_req,
+                ) => resp?,
                 _ = cancel.notified() => {
                     persist_terminal_output(
                         thought_store,
@@ -506,7 +529,16 @@ impl ThinkingSchemeHandler for DualThinkingHandler {
             let say_text = crate::common::json_util::strip_reasoning_preamble(&say_resp.content)
                 .trim()
                 .to_string();
-            output.say = (!say_text.is_empty()).then_some(say_text);
+            // D3：finish_reason=length（max_output 截断）→ say 尾部追加可见标记。
+            let truncated = say_resp.finish_reason.as_deref() == Some("length");
+            if truncated {
+                tracing::warn!(
+                    turn_id = %turn_id,
+                    "say 输出被 max_output 上限截断 (finish_reason=length), 已追加标记"
+                );
+            }
+            output.say = (!say_text.is_empty())
+                .then(|| append_truncation_marker(&say_text, say_resp.finish_reason.as_deref()));
         }
 
         // 双脑模式专用语义收口：LOOP/KEEP 无输入时不产生 Say。
@@ -737,6 +769,31 @@ mod tests {
     }
 
     #[test]
+    fn truncation_marker_appended_only_for_length_finish_reason() {
+        // D3：finish_reason=length → 尾部精确追加 \nmax_output panic（无句号、无其他字）。
+        assert_eq!(
+            append_truncation_marker("句子中途截断", Some("length")),
+            "句子中途截断\nmax_output panic"
+        );
+        // 其他 finish_reason / 缺失 → 原样。
+        assert_eq!(append_truncation_marker("完整回复", None), "完整回复");
+        assert_eq!(
+            append_truncation_marker("完整回复", Some("stop")),
+            "完整回复"
+        );
+        assert_eq!(
+            append_truncation_marker("完整回复", Some("content_filter")),
+            "完整回复"
+        );
+    }
+
+    #[test]
+    fn truncation_marker_exact_text_is_frozen() {
+        // 用户拍板的标记精确文本，禁止变更。
+        assert_eq!(TRUNCATION_MARKER, "\nmax_output panic");
+    }
+
+    #[test]
     fn five_states_have_distinct_strs() {
         let ss = [
             ThinkState::Divergence,
@@ -941,6 +998,7 @@ mod tests {
             Ok(crate::logic::model::provider::LlmResponse {
                 content,
                 usage: None,
+                finish_reason: None,
             })
         }
 

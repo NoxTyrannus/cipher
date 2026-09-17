@@ -149,6 +149,36 @@ fn extract_message_content(output: &Option<Vec<ResponsesOutputItem>>) -> String 
 struct ResponsesApiResponse {
     output: Option<Vec<ResponsesOutputItem>>,
     usage: Option<ResponsesUsage>,
+    /// D3（v0.5.4）：协议真实字段 `status`（"completed" / "incomplete" ...）。
+    #[serde(default)]
+    status: Option<String>,
+    /// D3（v0.5.4）：协议真实字段 `incomplete_details.reason`
+    /// （长度截断为 "max_output_tokens"；个别供应商返回 "length"）。
+    #[serde(default)]
+    incomplete_details: Option<ResponsesIncompleteDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct ResponsesIncompleteDetails {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// D3 纯函数：Responses API 的 `status` + `incomplete_details.reason` → finish_reason。
+/// `incomplete`（长度类截断）映射为 `"length"`；其余（completed / 缺失）为 None。
+/// 其他 incomplete 原因（如 content_filter）按原值透传，不冒充 length。
+fn map_responses_finish_reason(
+    status: Option<&str>,
+    incomplete_reason: Option<&str>,
+) -> Option<String> {
+    match status {
+        Some("incomplete") => Some(match incomplete_reason {
+            Some("max_output_tokens") | Some("length") | None => "length".to_string(),
+            Some(other) => other.to_string(),
+        }),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -339,7 +369,19 @@ impl LlmProvider for ResponsesProvider {
             total_tokens: u.total_tokens,
         });
 
-        Ok(LlmResponse { content, usage })
+        let finish_reason = map_responses_finish_reason(
+            api_resp.status.as_deref(),
+            api_resp
+                .incomplete_details
+                .as_ref()
+                .and_then(|d| d.reason.as_deref()),
+        );
+
+        Ok(LlmResponse {
+            content,
+            usage,
+            finish_reason,
+        })
     }
 
     async fn call_stream(
@@ -431,6 +473,9 @@ impl LlmProvider for ResponsesProvider {
         Ok(LlmResponse {
             content: accumulated,
             usage: stream_usage,
+            // 流式协议中长度截断走 response.incomplete 事件（现有错误路径），
+            // 正常 completed 无 length 语义，故此处恒为 None。
+            finish_reason: None,
         })
     }
 }
@@ -707,5 +752,76 @@ mod tests {
         let p = ResponsesProvider::new();
         assert_eq!(p.id(), "responses");
         assert_eq!(p.name(), "Responses API");
+    }
+
+    // ---- D3：finish_reason 解析（status + incomplete_details.reason）----
+
+    #[test]
+    fn responses_json_incomplete_max_output_tokens_maps_to_length() {
+        let body = r#"{
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{"type":"message","content":[{"type":"output_text","text":"截断的"}]}]
+        }"#;
+        let parsed: ResponsesApiResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            map_responses_finish_reason(
+                parsed.status.as_deref(),
+                parsed
+                    .incomplete_details
+                    .as_ref()
+                    .and_then(|d| d.reason.as_deref()),
+            ),
+            Some("length".to_string()),
+            "incomplete + max_output_tokens → length"
+        );
+    }
+
+    #[test]
+    fn responses_json_incomplete_without_details_maps_to_length() {
+        let body = r#"{"status": "incomplete", "output": []}"#;
+        let parsed: ResponsesApiResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            map_responses_finish_reason(
+                parsed.status.as_deref(),
+                parsed
+                    .incomplete_details
+                    .as_ref()
+                    .and_then(|d| d.reason.as_deref()),
+            ),
+            Some("length".to_string()),
+            "incomplete 无 incomplete_details（或 reason=length 字面）→ length"
+        );
+    }
+
+    #[test]
+    fn responses_json_completed_or_missing_status_is_none() {
+        let body = r#"{"status": "completed", "output": []}"#;
+        let parsed: ResponsesApiResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            map_responses_finish_reason(
+                parsed.status.as_deref(),
+                parsed
+                    .incomplete_details
+                    .as_ref()
+                    .and_then(|d| d.reason.as_deref()),
+            ),
+            None,
+            "completed → None"
+        );
+        assert_eq!(
+            map_responses_finish_reason(None, None),
+            None,
+            "缺 status 字段 → None"
+        );
+    }
+
+    #[test]
+    fn responses_json_non_length_incomplete_reason_passes_through() {
+        // 其他 incomplete 原因不冒充 length，按原值透传。
+        assert_eq!(
+            map_responses_finish_reason(Some("incomplete"), Some("content_filter")),
+            Some("content_filter".to_string())
+        );
     }
 }

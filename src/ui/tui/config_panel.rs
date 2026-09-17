@@ -4,13 +4,6 @@ use crossterm::event::KeyCode;
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
-pub const PRESET_TEMPLATES: &[(&str, &str, &str, &str)] = &[(
-    "OpenAI 官方",
-    "openai",
-    "https://api.openai.com/v1",
-    "OpenAI",
-)];
-
 const MENU_ITEMS: &[(&str, bool)] = &[
     ("Model + Provider", true),
     ("工作区管理", true),
@@ -29,6 +22,31 @@ const KEEP_MODE_MENU_LEN: usize = 2;
 /// 思考输出二选：开 / 关。
 const SHOW_THINK_OPTIONS_LEN: usize = 2;
 
+/// v0.5.4：五步新增表单中 api_type 字段的固定下标（枚举字段，Enter 打开两枚举 Select）。
+const ADD_MODEL_API_TYPE_FIELD: usize = 2;
+
+/// v0.5.4（A3 同款）：新增表单当前字段的说明提示（provider 提示语与 init_flow 同源）。
+fn field_hint(label: &str) -> Option<&'static str> {
+    match label {
+        "provider" => Some(crate::startup::init_flow::PROVIDER_PROMPT),
+        "api_type" => Some("方向键 + Enter 选择：OpenAI-Chatcompletion / OpenAI-Responses"),
+        "max_output" => Some("单次回复 token 上限，默认 1024（直接回车保持默认）"),
+        _ => None,
+    }
+}
+
+/// v0.5.4 D4 纯函数（沿用 CLI `Input<u64>` 语义）：解析 max_output 表单字段。
+/// 空值 → 默认 1024（直接回车保持默认）；非负整数原样；其余（含负号/小数/字母）拒绝。
+fn resolve_max_output_field(value: &str) -> Result<u64, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(crate::startup::config_flow::DEFAULT_MAX_OUTPUT_FOR_NEW_MODELS);
+    }
+    trimmed
+        .parse::<u64>()
+        .map_err(|_| format!("max_output 必须是非负整数, got: {value}"))
+}
+
 #[derive(Debug, Clone)]
 pub enum ActionResult {
     Navigate,
@@ -45,10 +63,18 @@ pub struct FormField {
 
 #[derive(Debug, Clone)]
 pub struct AddModelForm {
-    pub template_idx: Option<usize>,
     pub fields: Vec<FormField>,
     pub field_cursor: usize,
     pub submitted: bool,
+}
+
+/// v0.5.4（裁决#1）：api_type 两枚举 Select（与 init_flow A4 同款映射，
+/// 复用 `crate::startup::init_flow::API_TYPE_SELECTIONS`）。随行携带未提交的
+/// AddModelForm，确认后写回 api_type 字段并跳到下一字段。
+#[derive(Debug, Clone)]
+pub struct ApiTypeSelect {
+    pub cursor: usize,
+    pub form: AddModelForm,
 }
 
 #[derive(Debug, Clone)]
@@ -119,9 +145,8 @@ pub enum ConfigView {
 
     AddModel(AddModelForm),
 
-    AddModelSelectTemplate {
-        cursor: usize,
-    },
+    /// v0.5.4（裁决#1）：api_type 两枚举 Select（替代原内置模板选择环）。
+    ApiTypeSelect(ApiTypeSelect),
 
     SetDefault(SetDefaultSelect),
 
@@ -191,6 +216,9 @@ pub enum DbRequest {
         api_key: String,
         name: String,
         model_id: String,
+        /// v0.5.4 D4（裁决补齐）：单次回复 token 上限，写入模型行 config.max_output
+        ///（默认 1024，与 CLI config_flow.rs 同语义同字段名）。
+        max_output: u64,
     },
 
     DeleteModel {
@@ -273,14 +301,22 @@ impl ConfigPanel {
 
     fn check_form_submit(&self) -> DbRequest {
         match &self.view {
-            ConfigView::AddModel(form) if form.submitted => DbRequest::SubmitAddModel {
-                provider: form.fields[0].value.clone(),
-                api_url: form.fields[1].value.clone(),
-                api_type: form.fields[2].value.clone(),
-                api_key: form.fields[3].value.clone(),
-                name: form.fields[4].value.clone(),
-                model_id: form.fields[5].value.clone(),
-            },
+            ConfigView::AddModel(form) if form.submitted => {
+                // v0.5.4 字段序：provider / api_url / api_type / model_id / API key /
+                // max_output；name = model_id（A5 同语义，不再单独问显示名）。
+                // max_output 提交前已经 `resolve_max_output_field` 校验（Input<u64> 语义），
+                // 此处兜底回默认，防御程序化 submitted。
+                DbRequest::SubmitAddModel {
+                    provider: form.fields[0].value.clone(),
+                    api_url: form.fields[1].value.clone(),
+                    api_type: form.fields[2].value.clone(),
+                    model_id: form.fields[3].value.clone(),
+                    api_key: form.fields[4].value.clone(),
+                    name: form.fields[3].value.clone(),
+                    max_output: resolve_max_output_field(&form.fields[5].value)
+                        .unwrap_or(crate::startup::config_flow::DEFAULT_MAX_OUTPUT_FOR_NEW_MODELS),
+                }
+            }
             ConfigView::DeleteModelConfirm(form) if form.submitted => DbRequest::DeleteModel {
                 model_id: form.model_id.clone(),
             },
@@ -347,10 +383,10 @@ impl ConfigPanel {
         match std::mem::replace(&mut self.view, ConfigView::Menu) {
             ConfigView::Menu => self.handle_menu_key(key),
             ConfigView::ModelList => self.handle_model_list_key(key),
-            ConfigView::AddModelSelectTemplate { mut cursor } => {
-                let r = self.handle_template_select_key(key, &mut cursor);
+            ConfigView::ApiTypeSelect(mut sel) => {
+                let r = self.handle_api_type_select_key(key, &mut sel);
                 if matches!(self.view, ConfigView::Menu) {
-                    self.view = ConfigView::AddModelSelectTemplate { cursor };
+                    self.view = ConfigView::ApiTypeSelect(sel);
                 }
                 r
             }
@@ -518,7 +554,9 @@ impl ConfigPanel {
             KeyCode::Esc => ActionResult::Exit,
 
             KeyCode::Char('a') => {
-                self.view = ConfigView::AddModelSelectTemplate { cursor: 0 };
+                // v0.5.4（裁决#1）：内置模板选择环已删除，'a' 直接进入自定义五步表单
+                //（provider → api_url → api_type → model_id → API key，与 init_flow 同序）。
+                self.view = ConfigView::AddModel(Self::new_add_model_form());
                 ActionResult::Navigate
             }
             KeyCode::Char('x') => {
@@ -738,13 +776,29 @@ impl ConfigPanel {
         cursor: &mut usize,
         submitted: &mut bool,
     ) -> ActionResult {
+        // v0.5.4（裁决#1）：api_type 为枚举字段——不可手输/退格，Enter 打开两枚举
+        // Select（OpenAI-Chatcompletion / OpenAI-Responses，映射与 init_flow 同款）。
+        // v0.5.4（D4 补齐）：max_output 为数字字段——仅接受数字输入（Input<u64> 语义）。
+        let on_api_type = fields[*cursor].label == "api_type";
+        let on_max_output = fields[*cursor].label == "max_output";
         match key {
             KeyCode::Left => {
                 self.view = ConfigView::ModelList;
                 ActionResult::Navigate
             }
             KeyCode::Esc => ActionResult::Exit,
-            KeyCode::Tab | KeyCode::Right => {
+            KeyCode::Enter if on_api_type => {
+                self.view = ConfigView::ApiTypeSelect(ApiTypeSelect {
+                    cursor: 0,
+                    form: AddModelForm {
+                        fields: fields.to_vec(),
+                        field_cursor: *cursor,
+                        submitted: *submitted,
+                    },
+                });
+                ActionResult::Navigate
+            }
+            KeyCode::Tab | KeyCode::Right if !on_api_type => {
                 if *cursor < fields.len() - 1 {
                     *cursor += 1;
                 }
@@ -754,15 +808,32 @@ impl ConfigPanel {
                 if *cursor < fields.len() - 1 {
                     *cursor += 1;
                 } else {
+                    // 提交前校验数字字段（沿用 Input<u64> 语义）：非法值拒绝提交并提示。
+                    let mut invalid: Option<String> = None;
+                    for f in fields.iter() {
+                        if f.label == "max_output" {
+                            if let Err(msg) = resolve_max_output_field(&f.value) {
+                                invalid = Some(msg);
+                            }
+                        }
+                    }
+                    if let Some(msg) = invalid {
+                        self.message = Some((msg, true));
+                        return ActionResult::Navigate;
+                    }
                     *submitted = true;
                 }
                 ActionResult::Navigate
             }
-            KeyCode::Backspace => {
+            KeyCode::Backspace if !on_api_type => {
                 fields[*cursor].value.pop();
                 ActionResult::Navigate
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if !on_api_type => {
+                // max_output 沿用 Input<u64> 语义：非数字字符直接拒绝不入框。
+                if on_max_output && !c.is_ascii_digit() {
+                    return ActionResult::Navigate;
+                }
                 fields[*cursor].value.push(c);
                 ActionResult::Navigate
             }
@@ -770,73 +841,89 @@ impl ConfigPanel {
         }
     }
 
-    fn handle_template_select_key(&mut self, key: KeyCode, cursor: &mut usize) -> ActionResult {
+    /// v0.5.4（裁决#1 + D4 补齐）：自定义新增表单（provider → api_url → api_type →
+    /// model_id → API key → max_output，与 init_flow/CLI config_flow 同序同款）。
+    /// api_type 为枚举字段，不可手输，Enter 打开两枚举 Select；max_output 预填
+    /// 默认 1024（直接回车保持默认），仅接受数字输入。
+    fn new_add_model_form() -> AddModelForm {
+        AddModelForm {
+            fields: vec![
+                FormField {
+                    label: "provider",
+                    value: String::new(),
+                    is_secret: false,
+                },
+                FormField {
+                    label: "api_url",
+                    value: String::new(),
+                    is_secret: false,
+                },
+                FormField {
+                    label: "api_type",
+                    value: String::new(),
+                    is_secret: false,
+                },
+                FormField {
+                    label: "model_id",
+                    value: String::new(),
+                    is_secret: false,
+                },
+                FormField {
+                    label: "API key",
+                    value: String::new(),
+                    is_secret: true,
+                },
+                FormField {
+                    label: "max_output",
+                    value: crate::startup::config_flow::DEFAULT_MAX_OUTPUT_FOR_NEW_MODELS
+                        .to_string(),
+                    is_secret: false,
+                },
+            ],
+            field_cursor: 0,
+            submitted: false,
+        }
+    }
+
+    /// v0.5.4（裁决#1）：api_type 两枚举 Select（方向键 + Enter），映射复用
+    /// init_flow::API_TYPE_SELECTIONS（OpenAI-Chatcompletion→OpenAI /
+    /// OpenAI-Responses→Responses）；Left 返回表单，Esc 退出面板。
+    fn handle_api_type_select_key(
+        &mut self,
+        key: KeyCode,
+        sel: &mut ApiTypeSelect,
+    ) -> ActionResult {
+        let option_count = crate::startup::init_flow::API_TYPE_SELECTIONS.len();
         match key {
             KeyCode::Up => {
-                if *cursor > 0 {
-                    *cursor -= 1;
+                if sel.cursor > 0 {
+                    sel.cursor -= 1;
                 }
                 ActionResult::Navigate
             }
             KeyCode::Down => {
-                if *cursor < PRESET_TEMPLATES.len() {
-                    *cursor += 1;
+                if sel.cursor + 1 < option_count {
+                    sel.cursor += 1;
                 }
                 ActionResult::Navigate
             }
             KeyCode::Left => {
-                self.view = ConfigView::ModelList;
+                self.view = ConfigView::AddModel(sel.form.clone());
                 ActionResult::Navigate
             }
             KeyCode::Esc => ActionResult::Exit,
-            KeyCode::Right | KeyCode::Enter => {
-                let (provider, api_url, api_type) = if *cursor < PRESET_TEMPLATES.len() {
-                    let t = PRESET_TEMPLATES[*cursor];
-                    (t.1.to_string(), t.2.to_string(), t.3.to_string())
-                } else {
-                    (String::new(), String::new(), String::new())
-                };
-                self.view = ConfigView::AddModel(AddModelForm {
-                    template_idx: if *cursor < PRESET_TEMPLATES.len() {
-                        Some(*cursor)
-                    } else {
-                        None
-                    },
-                    fields: vec![
-                        FormField {
-                            label: "provider",
-                            value: provider,
-                            is_secret: false,
-                        },
-                        FormField {
-                            label: "api_url",
-                            value: api_url,
-                            is_secret: false,
-                        },
-                        FormField {
-                            label: "api_type",
-                            value: api_type,
-                            is_secret: false,
-                        },
-                        FormField {
-                            label: "API key",
-                            value: String::new(),
-                            is_secret: true,
-                        },
-                        FormField {
-                            label: "模型显示名",
-                            value: String::new(),
-                            is_secret: false,
-                        },
-                        FormField {
-                            label: "model_id",
-                            value: String::new(),
-                            is_secret: false,
-                        },
-                    ],
-                    field_cursor: 3,
-                    submitted: false,
-                });
+            KeyCode::Enter => {
+                let mut form = sel.form.clone();
+                if let Some(internal) =
+                    crate::startup::init_flow::api_type_selection_internal(sel.cursor)
+                {
+                    form.fields[ADD_MODEL_API_TYPE_FIELD].value = internal.to_string();
+                }
+                // 确认后跳到下一字段（model_id）。
+                if form.field_cursor < form.fields.len() - 1 {
+                    form.field_cursor += 1;
+                }
+                self.view = ConfigView::AddModel(form);
                 ActionResult::Navigate
             }
             _ => ActionResult::Navigate,
@@ -1088,9 +1175,9 @@ impl ConfigPanel {
         match &self.view {
             ConfigView::Menu => "← 退出设置    ↑↓ 选择    → 进入    Esc 退出",
             ConfigView::ModelList => {
-                "← 返回上级    ↑↓ 选择    a 新增  x 删除  d 切默认    Esc 退出"
+                "← 返回上级    ↑↓ 选择    a 新增  x 删除  d 切默认    Esc 退出设置"
             }
-            ConfigView::AddModelSelectTemplate { .. }
+            ConfigView::ApiTypeSelect(_)
             | ConfigView::SetDefault(_)
             | ConfigView::ModeStyleSubMenu { .. }
             | ConfigView::UnniModeMenu { .. }
@@ -1148,8 +1235,8 @@ pub fn render(panel: &ConfigPanel, frame: &mut Frame, area: Rect) {
     match &panel.view {
         ConfigView::Menu => render_menu(panel, frame, content_area),
         ConfigView::ModelList => render_model_list(panel, frame, content_area),
-        ConfigView::AddModelSelectTemplate { cursor } => {
-            render_template_list(panel, frame, content_area, *cursor);
+        ConfigView::ApiTypeSelect(sel) => {
+            render_api_type_select(frame, content_area, &sel.form, sel.cursor);
         }
         ConfigView::AddModel(form) => {
             render_form(panel, frame, content_area, &form.fields, form.field_cursor);
@@ -1313,7 +1400,9 @@ fn render_model_list(panel: &ConfigPanel, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_template_list(_panel: &ConfigPanel, frame: &mut Frame, area: Rect, cursor: usize) {
+/// v0.5.4（裁决#1）：api_type 两枚举 Select 渲染（替代原内置模板列表）。
+/// 上方保留未提交表单的完整回显，避免切换视图丢上下文。
+fn render_api_type_select(frame: &mut Frame, area: Rect, form: &AddModelForm, cursor: usize) {
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::Paragraph;
@@ -1321,13 +1410,16 @@ fn render_template_list(_panel: &ConfigPanel, frame: &mut Frame, area: Rect, cur
     let mut lines: Vec<Line> = vec![
         Line::from(""),
         Line::from(vec![Span::styled(
-            "选择 provider 模板:",
+            "api_type (↑↓ 选择, Enter 确认, ← 返回):",
             Style::default().fg(Color::Gray),
         )]),
         Line::from(""),
     ];
 
-    for (i, (name, _, _, _)) in PRESET_TEMPLATES.iter().enumerate() {
+    for (i, (display, _)) in crate::startup::init_flow::API_TYPE_SELECTIONS
+        .iter()
+        .enumerate()
+    {
         let is_sel = cursor == i;
         let style = if is_sel {
             Style::default()
@@ -1338,23 +1430,22 @@ fn render_template_list(_panel: &ConfigPanel, frame: &mut Frame, area: Rect, cur
         };
         let marker = if is_sel { "▶" } else { " " };
         lines.push(Line::from(vec![Span::styled(
-            format!(" {} {}", marker, name),
+            format!(" {} {}", marker, display),
             style,
         )]));
     }
 
-    let is_sel = cursor == PRESET_TEMPLATES.len();
-    let style = if is_sel {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
-    let marker = if is_sel { "▶" } else { " " };
+    lines.push(Line::from(""));
+    let selected = crate::startup::init_flow::api_type_selection_internal(cursor);
     lines.push(Line::from(vec![Span::styled(
-        format!(" {} 自定义", marker),
-        style,
+        format!(
+            "  当前表单: provider={} api_url={} model_id={} → api_type 将写入 {}",
+            form.fields[0].value,
+            form.fields[1].value,
+            form.fields[3].value,
+            selected.unwrap_or(""),
+        ),
+        Style::default().fg(Color::DarkGray),
     )]));
 
     frame.render_widget(Paragraph::new(lines), area);
@@ -1402,6 +1493,13 @@ fn render_form(
     }
 
     lines.push(Line::from(""));
+    // v0.5.4（A3 同款）：当前字段的说明提示（provider 提示语等，与 init_flow 同源）。
+    if let Some(hint) = fields.get(cursor).and_then(|f| field_hint(f.label)) {
+        lines.push(Line::from(vec![Span::styled(
+            format!("  {hint}"),
+            Style::default().fg(Color::DarkGray),
+        )]));
+    }
     lines.push(Line::from(vec![Span::styled(
         "  Tab/→ 下一字段  Enter 确认  ← 取消",
         Style::default().fg(Color::DarkGray),
@@ -2236,11 +2334,42 @@ mod tests {
     }
 
     #[test]
-    fn model_list_a_enters_add_template() {
+    fn model_list_a_enters_add_form_directly_without_templates() {
+        // v0.5.4（裁决#1 + D4 补齐）：内置模板选择环已删除，'a' 直接进入自定义表单；
+        // 字段序：provider → api_url → api_type → model_id → API key → max_output。
         let mut p = ConfigPanel::new();
         p.view = ConfigView::ModelList;
         p.handle_key(KeyCode::Char('a'));
-        assert!(matches!(p.view, ConfigView::AddModelSelectTemplate { .. }));
+        let ConfigView::AddModel(form) = &p.view else {
+            panic!("'a' 应直接进入 AddModel 表单, got {:?}", p.view);
+        };
+        let labels: Vec<&str> = form.fields.iter().map(|f| f.label).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "provider",
+                "api_url",
+                "api_type",
+                "model_id",
+                "API key",
+                "max_output"
+            ],
+            "六字段序（D4：max_output 排 API key 之后）, got: {labels:?}"
+        );
+        assert_eq!(form.field_cursor, 0, "从 provider 起步");
+        assert!(!form.submitted);
+    }
+
+    #[test]
+    fn add_model_form_has_no_template_state() {
+        // v0.5.4（裁决#1）：模板状态机残留（template_idx）不存在；
+        // api_type 字段初始为空（由两枚举 Select 写入，不再由模板带出）。
+        let form = ConfigPanel::new_add_model_form();
+        assert!(
+            form.fields[2].value.is_empty(),
+            "api_type 不应有模板预填值, got: {}",
+            form.fields[2].value
+        );
     }
 
     #[test]
@@ -2391,23 +2520,214 @@ mod tests {
     }
 
     #[test]
-    fn template_select_down_moves_cursor() {
+    fn api_type_enter_opens_enum_select_not_templates() {
+        // v0.5.4（裁决#1）：新增流程中不再存在模板选择视图；
+        // 在 api_type 字段按 Enter 打开的是两枚举 Select。
         let mut p = ConfigPanel::new();
-        p.view = ConfigView::AddModelSelectTemplate { cursor: 0 };
-        p.handle_key(KeyCode::Down);
-        if let ConfigView::AddModelSelectTemplate { cursor } = &p.view {
-            assert_eq!(*cursor, 1);
+        p.view = ConfigView::AddModel(ConfigPanel::new_add_model_form());
+        if let ConfigView::AddModel(f) = &p.view {
+            assert_eq!(f.fields[2].label, "api_type");
+        }
+        p.handle_key(KeyCode::Tab);
+        p.handle_key(KeyCode::Tab); // cursor → api_type
+        p.handle_key(KeyCode::Enter);
+        assert!(
+            matches!(p.view, ConfigView::ApiTypeSelect(_)),
+            "api_type Enter 应打开两枚举 Select, got {:?}",
+            p.view
+        );
+        // 枚举字段不可手输。
+        let mut p2 = ConfigPanel::new();
+        p2.view = ConfigView::AddModel(ConfigPanel::new_add_model_form());
+        p2.handle_key(KeyCode::Tab);
+        p2.handle_key(KeyCode::Tab);
+        p2.handle_key(KeyCode::Char('x'));
+        if let ConfigView::AddModel(f) = &p2.view {
+            assert!(
+                f.fields[2].value.is_empty(),
+                "api_type 不接受键盘输入, got: {}",
+                f.fields[2].value
+            );
         } else {
-            panic!();
+            panic!("仍应在表单视图");
         }
     }
 
     #[test]
-    fn template_select_enter_enters_form() {
+    fn api_type_select_down_confirms_responses_mapping() {
+        // v0.5.4：两枚举 Select 映射与 init_flow::API_TYPE_SELECTIONS 同款
+        //（0→OpenAI / 1→Responses），确认后写回表单并跳到 model_id 字段。
+        assert_eq!(
+            crate::startup::init_flow::API_TYPE_SELECTIONS,
+            &[
+                ("OpenAI-Chatcompletion", "OpenAI"),
+                ("OpenAI-Responses", "Responses")
+            ]
+        );
         let mut p = ConfigPanel::new();
-        p.view = ConfigView::AddModelSelectTemplate { cursor: 0 };
+        p.view = ConfigView::AddModel(ConfigPanel::new_add_model_form());
+        p.handle_key(KeyCode::Tab);
+        p.handle_key(KeyCode::Tab); // cursor → api_type
+        p.handle_key(KeyCode::Enter); // 打开 Select（cursor=0）
+        p.handle_key(KeyCode::Down); // cursor=1
+        p.handle_key(KeyCode::Enter); // 确认
+        let ConfigView::AddModel(form) = &p.view else {
+            panic!("确认后应回到表单, got {:?}", p.view);
+        };
+        assert_eq!(form.fields[2].value, "Responses", "内部值映射为 Responses");
+        assert_eq!(form.field_cursor, 3, "确认后跳到 model_id 字段");
+    }
+
+    #[test]
+    fn api_type_select_left_returns_form_without_change() {
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::AddModel(ConfigPanel::new_add_model_form());
+        p.handle_key(KeyCode::Tab);
+        p.handle_key(KeyCode::Tab);
         p.handle_key(KeyCode::Enter);
-        assert!(matches!(p.view, ConfigView::AddModel(_)));
+        p.handle_key(KeyCode::Left);
+        let ConfigView::AddModel(form) = &p.view else {
+            panic!("Left 应返回表单, got {:?}", p.view);
+        };
+        assert!(form.fields[2].value.is_empty(), "未确认不写入");
+    }
+
+    #[test]
+    fn add_model_form_has_max_output_field_default_1024() {
+        // v0.5.4 D4（裁决补齐）：表单含 max_output 字段且默认 1024
+        //（与 CLI config_flow DEFAULT_MAX_OUTPUT_FOR_NEW_MODELS 同源）。
+        let form = ConfigPanel::new_add_model_form();
+        assert_eq!(form.fields[5].label, "max_output", "第六项为 max_output");
+        assert_eq!(form.fields[5].value, "1024", "默认值 1024");
+        assert!(!form.fields[5].is_secret, "max_output 非秘密字段");
+    }
+
+    #[test]
+    fn max_output_field_rejects_non_digit_typing() {
+        // v0.5.4 D4：沿用 Input<u64> 语义——非数字字符直接拒绝不入框；数字可覆盖。
+        // 导航：api_type 为枚举字段（Tab 不跳过，须经两枚举 Select 确认），
+        // 故路径为 Tab×2 → Select 确认（cursor→model_id）→ Tab×2 → max_output。
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::AddModel(ConfigPanel::new_add_model_form());
+        p.handle_key(KeyCode::Tab);
+        p.handle_key(KeyCode::Tab); // cursor → api_type
+        p.handle_key(KeyCode::Enter); // 打开两枚举 Select
+        p.handle_key(KeyCode::Enter); // 确认（cursor → model_id）
+        p.handle_key(KeyCode::Tab);
+        p.handle_key(KeyCode::Tab); // cursor → max_output
+        p.handle_key(KeyCode::Char('a'));
+        p.handle_key(KeyCode::Char('x'));
+        p.handle_key(KeyCode::Char('-'));
+        p.handle_key(KeyCode::Char('.'));
+        let ConfigView::AddModel(f) = &p.view else {
+            panic!("仍应在表单视图");
+        };
+        assert_eq!(f.field_cursor, 5, "应停在 max_output 字段");
+        assert_eq!(
+            f.fields[5].value, "1024",
+            "非数字输入不得改动默认值, got: {}",
+            f.fields[5].value
+        );
+        // 数字输入可覆盖（先退格再输）。
+        p.handle_key(KeyCode::Backspace);
+        p.handle_key(KeyCode::Char('5'));
+        let ConfigView::AddModel(f) = &p.view else {
+            panic!("仍应在表单视图");
+        };
+        assert_eq!(f.fields[5].value, "1025", "数字输入应生效");
+    }
+
+    #[test]
+    fn resolve_max_output_field_four_states() {
+        // v0.5.4 D4 纯函数：空值→默认 1024；数字原样；非数字（负/小数/字母）拒绝。
+        assert_eq!(
+            resolve_max_output_field(""),
+            Ok(1024),
+            "空值 = 直接回车保持默认"
+        );
+        assert_eq!(resolve_max_output_field("1024"), Ok(1024));
+        assert_eq!(
+            resolve_max_output_field("4096"),
+            Ok(4096),
+            "用户输入覆盖默认"
+        );
+        assert!(resolve_max_output_field("abc").is_err());
+        assert!(resolve_max_output_field("-1").is_err());
+        assert!(resolve_max_output_field("1.5").is_err());
+    }
+
+    #[test]
+    fn submit_with_invalid_max_output_is_rejected() {
+        // v0.5.4 D4：末字段 Enter 提交时校验——非法 max_output 拒绝提交并给错误提示。
+        let mut form = ConfigPanel::new_add_model_form();
+        form.fields[5].value = "12a".into(); // 程序化注入非法值（键盘路径已拦截字母）
+        form.field_cursor = 5;
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::AddModel(form);
+        p.handle_key(KeyCode::Enter);
+        let ConfigView::AddModel(f) = &p.view else {
+            panic!("拒绝提交后仍应在表单, got {:?}", p.view);
+        };
+        assert!(!f.submitted, "非法 max_output 不得提交");
+        assert!(
+            matches!(&p.message, Some((msg, true)) if msg.contains("max_output")),
+            "应给出 max_output 错误提示, got: {:?}",
+            p.message
+        );
+    }
+
+    #[test]
+    fn submitted_add_model_request_is_six_fields_with_max_output() {
+        // v0.5.4 D4：提交请求携带 max_output（默认路径=1024）；name = model_id（A5 同语义）；
+        // api_type 为内部枚举值。
+        let mut form = ConfigPanel::new_add_model_form();
+        form.fields[0].value = "GLM".into();
+        form.fields[1].value = "https://open.bigmodel.cn/api/paas/v4".into();
+        form.fields[2].value = "OpenAI".into();
+        form.fields[3].value = "glm-4-plus".into();
+        form.fields[4].value = "sk-test".into();
+        // fields[5] 保持默认 "1024"（直接回车 = 默认值提交）。
+        form.field_cursor = 5;
+        form.submitted = true;
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::AddModel(form);
+        match p.pending_db_request() {
+            DbRequest::SubmitAddModel {
+                provider,
+                api_url,
+                api_type,
+                api_key,
+                name,
+                model_id,
+                max_output,
+            } => {
+                assert_eq!(provider, "GLM");
+                assert_eq!(api_url, "https://open.bigmodel.cn/api/paas/v4");
+                assert_eq!(api_type, "OpenAI");
+                assert_eq!(api_key, "sk-test");
+                assert_eq!(model_id, "glm-4-plus");
+                assert_eq!(name, model_id, "name 必须 = model_id");
+                assert_eq!(max_output, 1024, "默认路径（直接回车）提交 1024");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submitted_add_model_request_carries_overridden_max_output() {
+        // v0.5.4 D4：用户覆盖 max_output 后提交请求携带用户值。
+        let mut form = ConfigPanel::new_add_model_form();
+        form.fields[3].value = "m".into();
+        form.fields[5].value = "4096".into();
+        form.submitted = true;
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::AddModel(form);
+        match p.pending_db_request() {
+            DbRequest::SubmitAddModel { max_output, .. } => {
+                assert_eq!(max_output, 4096, "用户覆盖值应原样携带");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]
@@ -2514,7 +2834,6 @@ mod tests {
         submitted: bool,
     ) -> ConfigView {
         ConfigView::AddModel(AddModelForm {
-            template_idx: None,
             fields,
             field_cursor,
             submitted,

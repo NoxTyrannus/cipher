@@ -4,10 +4,13 @@ use crate::ui::tui::status_line::{fit_to_width, segments_from_snapshot};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 pub fn render(state: &TuiState, frame: &mut Frame) {
+    // B1（v0.5.4）：整帧先 Clear 再画。此前从不整帧清除 + ratatui 差分上屏，
+    // 上一帧写过、本帧无 widget 覆盖的格子会永久残字（#8/#9 根因）。
+    frame.render_widget(Clear, frame.area());
     if state.mode == TuiMode::Config {
         super::config_panel::render(&state.config_panel, frame, frame.area());
         return;
@@ -300,6 +303,9 @@ fn render_error(state: &TuiState, frame: &mut Frame, area: Rect) {
 }
 
 fn render_input(state: &TuiState, frame: &mut Frame, area: Rect) {
+    // B2（v0.5.4）：输入框 3 行块先清自身（防御）——此前只写第 1 行，
+    // 第 2/3 行上一帧的残字会留存（#8）。
+    frame.render_widget(Clear, area);
     let mode_str = mode_display(state.current_mode);
 
     let prefix = format!("[{}] > ", mode_str);

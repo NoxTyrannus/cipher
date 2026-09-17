@@ -1,8 +1,39 @@
 use super::host_context::HostContext;
 use serde_json::Value;
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// C3（v0.5.4）：子进程统一 pre_exec——先 `setpgid(0, 0)` 自成进程组，
+/// 再 `prctl(PR_SET_PDEATHSIG, SIGKILL)`（顺序勿反）：cipher 父进程退出时内核
+/// 直接 SIGKILL 该子进程。语义（用户已拍板）：子代理派生的一切进程不比主进程长寿。
+fn child_exits_with_parent() -> std::io::Result<()> {
+    unsafe {
+        if libc::setpgid(0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGKILL as libc::c_ulong,
+            0,
+            0,
+            0,
+        ) != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// C3：杀整个子进程组（pgid = 子 pid，setpgid 成功前提下），随后调用方照旧
+/// `child.wait()` 收尸。替代原 `child.kill()`——那只杀 sh 本身，孙进程全孤儿。
+fn kill_process_group(child_pid: u32) {
+    unsafe {
+        libc::kill(-(child_pid as libc::pid_t), libc::SIGKILL);
+    }
+}
 
 fn fail(msg: impl Into<String>) -> Value {
     serde_json::json!({ "success": false, "error": msg.into() })
@@ -493,10 +524,12 @@ pub fn host_shell_exec(ctx: &HostContext, args: &Value) -> Result<Value, String>
         ));
     }
 
-    let syntax_check = std::process::Command::new("sh")
-        .arg("-n")
-        .arg("-c")
-        .arg(command)
+    let mut syntax_cmd = std::process::Command::new("sh");
+    syntax_cmd.arg("-n").arg("-c").arg(command);
+    unsafe {
+        syntax_cmd.pre_exec(child_exits_with_parent);
+    }
+    let syntax_check = syntax_cmd
         .output()
         .map_err(|e| format!("host_shell_exec: syntax check spawn: {e}"))?;
     if !syntax_check.status.success() {
@@ -514,12 +547,17 @@ pub fn host_shell_exec(ctx: &HostContext, args: &Value) -> Result<Value, String>
         .cloned()
         .unwrap_or_default();
 
-    let mut child = std::process::Command::new("sh")
+    let mut shell_cmd = std::process::Command::new("sh");
+    shell_cmd
         .arg("-c")
         .arg(command)
         .current_dir(&workspace_root)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    unsafe {
+        shell_cmd.pre_exec(child_exits_with_parent);
+    }
+    let mut child = shell_cmd
         .spawn()
         .map_err(|e| format!("host_shell_exec: spawn: {e}"))?;
 
@@ -529,7 +567,7 @@ pub fn host_shell_exec(ctx: &HostContext, args: &Value) -> Result<Value, String>
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
+                    kill_process_group(child.id());
                     let _ = child.wait();
                     return Err("host_shell_exec: timeout (30s)".to_string());
                 }
@@ -661,13 +699,17 @@ fn execute_interpreted_code(language: &str, code: &str, ws_root: &Path) -> Resul
     cmd.env_clear();
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    unsafe {
+        cmd.pre_exec(child_exits_with_parent);
+    }
 
     let mut child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
     let timeout = Duration::from_secs(30);
     let start = Instant::now();
     let status = loop {
         if start.elapsed() > timeout {
-            let _ = child.kill();
+            kill_process_group(child.id());
+            let _ = child.wait();
             return Err("code execution timed out (30s)".into());
         }
         match child.try_wait() {
@@ -718,13 +760,17 @@ fn execute_rust_code(code: &str, ws_root: &Path) -> Result<Value, String> {
     cmd.env_clear();
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    unsafe {
+        cmd.pre_exec(child_exits_with_parent);
+    }
 
     let mut child = cmd.spawn().map_err(|e| format!("rustc spawn: {e}"))?;
     let timeout = Duration::from_secs(30);
     let start = Instant::now();
     let status = loop {
         if start.elapsed() > timeout {
-            let _ = child.kill();
+            kill_process_group(child.id());
+            let _ = child.wait();
             return Err("rustc compilation timed out (30s)".into());
         }
         match child.try_wait() {
@@ -757,12 +803,16 @@ fn execute_rust_code(code: &str, ws_root: &Path) -> Result<Value, String> {
     run_cmd.env_clear();
     run_cmd.stdout(std::process::Stdio::piped());
     run_cmd.stderr(std::process::Stdio::piped());
+    unsafe {
+        run_cmd.pre_exec(child_exits_with_parent);
+    }
 
     let mut run_child = run_cmd.spawn().map_err(|e| format!("run spawn: {e}"))?;
     let start = Instant::now();
     let run_status = loop {
         if start.elapsed() > timeout {
-            let _ = run_child.kill();
+            kill_process_group(run_child.id());
+            let _ = run_child.wait();
             return Err("binary execution timed out (30s)".into());
         }
         match run_child.try_wait() {
@@ -808,6 +858,37 @@ mod tests {
 
     fn ctx(root: &Path) -> HostContext {
         HostContext::for_workspace(root.to_path_buf())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn spawned_child_gets_own_process_group_and_group_kill_reaps_it() {
+        // C3：pre_exec 里 setpgid(0,0) → 子进程 pgid == 自身 pid；kill(-pgid) 能杀全组。
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        unsafe {
+            cmd.pre_exec(child_exits_with_parent);
+        }
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id();
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        // /proc/<pid>/stat：comm 后字段依次为 state(3) ppid(4) pgrp(5)。
+        let after_comm = stat.rsplit(')').next().unwrap();
+        let pgrp: u32 = after_comm
+            .split_whitespace()
+            .nth(2)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(pgrp, pid, "setpgid(0,0) 后子进程应自成进程组 (pgid=pid)");
+
+        kill_process_group(pid);
+        let status = child.wait().unwrap();
+        assert!(
+            !status.success(),
+            "SIGKILL 杀全组后子进程不应正常退出 (got: {status})"
+        );
     }
 
     #[test]

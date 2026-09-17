@@ -97,6 +97,9 @@ pub struct OpenAiResponse {
 #[derive(Debug, Deserialize)]
 pub struct OpenAiChoice {
     pub message: OpenAiMessageOut,
+    /// D3（v0.5.4）：`choices[0].finish_reason`（如 "stop" / "length"），缺失为 None。
+    #[serde(default)]
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,6 +166,7 @@ impl LlmProvider for OpenAiProvider {
             .first()
             .and_then(|c| c.message.content.clone())
             .unwrap_or_default();
+        let finish_reason = parsed.choices.first().and_then(|c| c.finish_reason.clone());
 
         Ok(LlmResponse {
             content,
@@ -171,6 +175,7 @@ impl LlmProvider for OpenAiProvider {
                 completion_tokens: u.completion_tokens,
                 total_tokens: u.total_tokens,
             }),
+            finish_reason,
         })
     }
 
@@ -215,6 +220,7 @@ impl LlmProvider for OpenAiProvider {
         let mut stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
         let mut accumulated = String::new();
+        let mut stream_finish_reason: Option<String> = None;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| map_reqwest_error(e, "openai"))?;
@@ -229,6 +235,7 @@ impl LlmProvider for OpenAiProvider {
                             return Ok(LlmResponse {
                                 content: accumulated,
                                 usage: None,
+                                finish_reason: stream_finish_reason,
                             });
                         }
                         let parsed: serde_json::Value = match serde_json::from_str(data) {
@@ -248,6 +255,13 @@ impl LlmProvider for OpenAiProvider {
                                 on_chunk(StreamChunk::Delta(s.to_string()));
                             }
                         }
+                        // D3：SSE 末块 choices[0].finish_reason（如 "length"）。
+                        if let Some(fr) = parsed
+                            .pointer("/choices/0/finish_reason")
+                            .and_then(|v| v.as_str())
+                        {
+                            stream_finish_reason = Some(fr.to_string());
+                        }
                     }
                 }
             }
@@ -260,6 +274,9 @@ impl LlmProvider for OpenAiProvider {
                     .first()
                     .and_then(|c| c.message.content.clone())
                     .unwrap_or_default();
+                if let Some(fr) = parsed.choices.first().and_then(|c| c.finish_reason.clone()) {
+                    stream_finish_reason = Some(fr);
+                }
                 if !accumulated.is_empty() {
                     on_chunk(StreamChunk::Delta(accumulated.clone()));
                 }
@@ -270,6 +287,7 @@ impl LlmProvider for OpenAiProvider {
         Ok(LlmResponse {
             content: accumulated,
             usage: None,
+            finish_reason: stream_finish_reason,
         })
     }
 }
@@ -364,6 +382,26 @@ mod tests {
         let p = OpenAiProvider::new();
         assert_eq!(p.id(), "openai");
         assert_eq!(p.name(), "OpenAI");
+    }
+
+    #[test]
+    fn openai_response_parses_finish_reason() {
+        // D3：choices[0].finish_reason 解析填充。
+        let body = r#"{"choices":[{"message":{"content":"hi"},"finish_reason":"length"}]}"#;
+        let parsed: OpenAiResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            parsed.choices[0].finish_reason.as_deref(),
+            Some("length"),
+            "finish_reason=length 应被解析"
+        );
+    }
+
+    #[test]
+    fn openai_response_missing_finish_reason_is_none() {
+        // D3：缺 finish_reason 字段时为 None（不臆造）。
+        let body = r#"{"choices":[{"message":{"content":"hi"}}]}"#;
+        let parsed: OpenAiResponse = serde_json::from_str(body).unwrap();
+        assert!(parsed.choices[0].finish_reason.is_none());
     }
 
     #[test]

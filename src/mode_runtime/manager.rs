@@ -391,6 +391,7 @@ mod tests {
             Ok(LlmResponse {
                 content: r#"{"think":"durable work","say":"durable reply"}"#.to_string(),
                 usage: None,
+                finish_reason: None,
             })
         }
 
@@ -410,6 +411,7 @@ mod tests {
                 content: r#"{"think":"durable stream work","say":"durable stream reply"}"#
                     .to_string(),
                 usage: None,
+                finish_reason: None,
             })
         }
     }
@@ -449,6 +451,7 @@ mod tests {
             Ok(LlmResponse {
                 content,
                 usage: None,
+                finish_reason: None,
             })
         }
 
@@ -510,6 +513,7 @@ mod tests {
             Ok(LlmResponse {
                 content: INVALID_RAW_OUTPUT.to_string(),
                 usage: None,
+                finish_reason: None,
             })
         }
 
@@ -551,6 +555,7 @@ mod tests {
             Ok(LlmResponse {
                 content: content.to_string(),
                 usage: None,
+                finish_reason: None,
             })
         }
     }

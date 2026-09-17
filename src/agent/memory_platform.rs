@@ -1112,6 +1112,7 @@ mod tests {
             Ok(crate::logic::model::provider::LlmResponse {
                 content: String::new(),
                 usage: None,
+                finish_reason: None,
             })
         }
         async fn call_stream(

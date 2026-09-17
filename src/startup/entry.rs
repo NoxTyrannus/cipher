@@ -902,14 +902,16 @@ pub async fn run_streaming_loop(
                                     sel.candidates = candidates;
                                 }
                             }
-                            DbRequest::SubmitAddModel { provider, api_url, api_type, api_key, name, model_id } => {
+                            DbRequest::SubmitAddModel { provider, api_url, api_type, api_key, name, model_id, max_output } => {
                                 let row = ModelRow {
                                     id: format!("{}-{}", provider, model_id),
                                     name, provider: provider.clone(),
                                     api_protocol: crate::data::duckdb::loader::default_api_protocol(&api_type),
                                     api_url, api_type, model_id,
                                     api_key: Some(api_key.clone()),
-                                    config: None,
+                                    // v0.5.4 D4：TUI 新增路径写入 max_output（默认 1024，
+                                    // 与 CLI config_flow.rs 同语义同字段名）；存量行不回填。
+                                    config: Some(serde_json::json!({ "max_output": max_output })),
                                 };
                                 match insert_model(&app.duckdb, &row) {
                                     Ok(_) => {
@@ -2173,19 +2175,11 @@ fn print_already_configured() {
 }
 
 fn print_welcome_and_help() {
-    let v = env!("CARGO_PKG_VERSION");
+    // A2（v0.5.4）：首屏文案重写为五步配置引导；「进入 TUI 后」快捷键块从首屏删除
+    //（快捷键说明只留在已配置启动屏与本文件上方的 print_already_configured）。
+    let banner = crate::startup::init_flow::first_run_banner(env!("CARGO_PKG_VERSION"));
     println!();
-    println!("    cipher v{v} — 终端原生 AI 代理");
-    println!("    首次启动");
-    println!();
-    println!("    欢迎！检测到尚未配置模型, 接下来引导你完成首次配置。");
-    println!("    依次: 选模型模板 → 填 model_id / api_key → ping 验证。");
-    println!("    (配置失败会要求重填, 无逃生口; 随时可 Ctrl+C 退出)");
-    println!();
-    println!("    进入 TUI 后:");
-    println!("      Tab / Shift+Tab   切换模式 (UNNI / KEEP / LOOP)");
-    println!("      /config           打开配置管理 (改模型 / 切默认)");
-    println!("      /exit              退出");
+    println!("{banner}");
     println!();
 }
 

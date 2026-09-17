@@ -964,6 +964,7 @@ mod tests {
             Ok(LlmResponse {
                 content,
                 usage: None,
+                finish_reason: None,
             })
         }
     }

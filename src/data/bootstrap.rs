@@ -1,5 +1,6 @@
 use crate::common::AgentError;
 use std::path::Path;
+use std::time::Duration;
 
 use super::duckdb::{load_all_into_memory, Registry};
 use super::migration::{prepare_data_dir, validate_current_duckdb_connection, DataPaths};
@@ -7,6 +8,31 @@ use super::permissions::secure_existing_file;
 use super::workspace_store::WorkspaceStore;
 
 const DUCKDB_FILE_SUFFIXES: &[&str] = &["", ".wal", ".wal.checkpoint", ".wal.recovery"];
+
+/// C2（v0.5.4）：DuckDB 文件锁冲突时的重试参数（至多 3 次、间隔 1s）。
+const LOCK_RETRY_LIMIT: usize = 3;
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// C1 分类纯函数：duckdb 打开错误串是否为文件锁冲突
+///（另一活实例仍持有写锁；文件锁随进程存亡，无残留锁文件）。
+pub fn is_lock_conflict_error(message: &str) -> bool {
+    message.contains("Could not set lock") || message.contains("Conflicting lock")
+}
+
+/// C1 PID 提取纯函数：优先取 `PID <n>`，其次 `/proc/<n>/`；提不出返回 None。
+pub fn extract_lock_pid(message: &str) -> Option<u32> {
+    fn digits_after(haystack: &str, marker: &str) -> Option<u32> {
+        let idx = haystack.find(marker)?;
+        let rest = &haystack[idx + marker.len()..];
+        let end = rest
+            .char_indices()
+            .find(|(_, c)| !c.is_ascii_digit())
+            .map(|(i, _)| i)
+            .unwrap_or(rest.len());
+        rest[..end].parse().ok()
+    }
+    digits_after(message, "PID ").or_else(|| digits_after(message, "/proc/"))
+}
 
 pub struct AppState {
     pub duckdb: duckdb::Connection,
@@ -21,17 +47,7 @@ pub fn bootstrap(data_dir: &Path) -> Result<AppState, AgentError> {
 
     let duckdb_path = paths.duckdb();
     secure_duckdb_files(&duckdb_path)?;
-    let conn = match duckdb::Connection::open(&duckdb_path) {
-        Ok(conn) => conn,
-        Err(error) => {
-            let open_error =
-                AgentError::Bootstrap(format!("open DuckDB {:?}: {}", duckdb_path, error));
-            return Err(merge_permission_error(
-                open_error,
-                secure_duckdb_files(&duckdb_path),
-            ));
-        }
-    };
+    let conn = open_duckdb_with_lock_retry(&duckdb_path)?;
     if let Err(error) = secure_duckdb_files(&duckdb_path) {
         drop(conn);
         return Err(merge_permission_error(
@@ -107,6 +123,52 @@ fn secure_duckdb_files(database_path: &Path) -> Result<(), AgentError> {
     Ok(())
 }
 
+/// C1+C2（v0.5.4）：打开活动 DuckDB。锁冲突（另一活实例持有文件锁）先短重试
+/// （至多 3 次、间隔 1s）；仍失败转中文可操作提示（含占用 PID，提不出则不带）。
+/// 非锁冲突错误走原路径不变（含权限修复合并逻辑）。
+fn open_duckdb_with_lock_retry(database_path: &Path) -> Result<duckdb::Connection, AgentError> {
+    let mut attempt = 0usize;
+    loop {
+        match duckdb::Connection::open(database_path) {
+            Ok(conn) => return Ok(conn),
+            Err(error) => {
+                let message = error.to_string();
+                if !is_lock_conflict_error(&message) {
+                    let open_error = AgentError::Bootstrap(format!(
+                        "open DuckDB {:?}: {}",
+                        database_path, error
+                    ));
+                    return Err(merge_permission_error(
+                        open_error,
+                        secure_duckdb_files(database_path),
+                    ));
+                }
+                if attempt >= LOCK_RETRY_LIMIT {
+                    let pid_hint = match extract_lock_pid(&message) {
+                        Some(pid) => format!("（占用进程 PID {pid}）"),
+                        None => format!("（{message}）"),
+                    };
+                    tracing::error!(
+                        database = %database_path.display(),
+                        "bootstrap: DuckDB 锁冲突重试 {} 次仍失败",
+                        LOCK_RETRY_LIMIT
+                    );
+                    return Err(AgentError::Bootstrap(format!(
+                        "模型数据库被占用：可能有另一个 cipher 正在运行{pid_hint}。关闭它或等其退出后重试"
+                    )));
+                }
+                attempt += 1;
+                tracing::warn!(
+                    database = %database_path.display(),
+                    attempt,
+                    "bootstrap: DuckDB 锁冲突, 短暂等待后重试"
+                );
+                std::thread::sleep(LOCK_RETRY_INTERVAL);
+            }
+        }
+    }
+}
+
 fn merge_permission_error(
     operation_error: AgentError,
     permission_result: Result<(), AgentError>,
@@ -123,6 +185,49 @@ fn merge_permission_error(
 mod tests {
     use super::*;
     use std::env;
+
+    #[test]
+    fn lock_conflict_classifier_matches_duckdb_messages() {
+        // C1：duckdb 锁冲突特征串。
+        assert!(is_lock_conflict_error(
+            "IO Error: Could not set lock on file \"/x/cipher.duckdb\": Conflicting lock is held in /proc/23039 (PID 23039)"
+        ));
+        assert!(is_lock_conflict_error("Could not set lock on file"));
+        assert!(is_lock_conflict_error("Conflicting lock is held"));
+        assert!(
+            !is_lock_conflict_error("Os { code: 13, kind: PermissionDenied }"),
+            "权限错误不是锁冲突"
+        );
+        assert!(!is_lock_conflict_error("invalid database file"));
+    }
+
+    #[test]
+    fn lock_pid_extracted_from_pid_marker_first() {
+        // C1：优先 `PID ` 后数字。
+        assert_eq!(
+            extract_lock_pid(
+                "Could not set lock: Conflicting lock is held in /proc/23039 (PID 23039)"
+            ),
+            Some(23039)
+        );
+    }
+
+    #[test]
+    fn lock_pid_extracted_from_proc_path() {
+        // C1：无 `PID ` 标记时回退 `/proc/<n>/`。
+        assert_eq!(
+            extract_lock_pid("Conflicting lock is held in /proc/4242"),
+            Some(4242)
+        );
+    }
+
+    #[test]
+    fn lock_pid_extraction_returns_none_when_absent() {
+        assert_eq!(extract_lock_pid("Could not set lock on file"), None);
+        assert_eq!(extract_lock_pid(""), None);
+        // `/proc/` 后无数字 → None。
+        assert_eq!(extract_lock_pid("held in /proc/self"), None);
+    }
 
     #[test]
     fn bootstrap_creates_data_dir_and_opens_duckdb() {
