@@ -474,10 +474,6 @@ fn quick_add_model(app: &AppState) -> Result<(), AgentError> {
         })
         .expect("picked provider should have a keyed sample row")
         .clone();
-    let name = Input::<String>::new()
-        .with_prompt("模型显示名")
-        .interact_text()
-        .map_err(|e| AgentError::Parse(format!("name: {}", e)))?;
     let model_id = Input::<String>::new()
         .with_prompt("model_id")
         .interact_text()
@@ -486,7 +482,7 @@ fn quick_add_model(app: &AppState) -> Result<(), AgentError> {
     let key = em.api_key.clone().unwrap();
     let row = ModelRow {
         id: format!("{}-{}", provider, model_id),
-        name,
+        name: model_id.clone(),
         provider: provider.clone(),
         api_url: em.api_url.clone(),
         api_protocol: crate::data::duckdb::loader::default_api_protocol(&em.api_type),
