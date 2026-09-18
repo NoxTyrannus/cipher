@@ -240,19 +240,14 @@ mod tests {
     #[test]
     fn hooks_make_child_own_group_leader_and_kill_tree_reaps() {
         // 钩子后 pgid == pid；kill_tree 组杀正常收尸（继承自 C3 的组语义验证）。
+        // getpgid 是 POSIX API（macOS 无 /proc，不可走 /proc/<pid>/stat 解析）。
         let mut child = spawn_sleeper();
         let pid = child.id();
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-        let pgrp: u32 = stat
-            .rsplit(')')
-            .next()
-            .unwrap()
-            .split_whitespace()
-            .nth(2)
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert_eq!(pgrp, pid, "setpgid(0,0) 后子进程应自成进程组 (pgid=pid)");
+        let pgrp = unsafe { libc::getpgid(pid as libc::pid_t) };
+        assert_eq!(
+            pgrp, pid as libc::pid_t,
+            "setpgid(0,0) 后子进程应自成进程组 (pgid=pid)"
+        );
         kill_tree(pid);
         let status = child.wait().unwrap();
         assert!(!status.success(), "组杀应致非正常退出: {status:?}");
