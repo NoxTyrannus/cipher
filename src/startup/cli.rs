@@ -24,6 +24,10 @@ pub enum Commands {
 
     #[command(name = "workspace", subcommand)]
     Workspace(WorkspaceCommand),
+
+    /// 内部：v0.5.5 子进程看门狗（由主进程自动拉起，stdin 为管道读端，不面向用户）。
+    #[command(name = "__watchdog", hide = true)]
+    Watchdog,
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]

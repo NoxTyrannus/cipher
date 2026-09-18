@@ -2,6 +2,7 @@ pub mod error;
 pub mod json_util;
 pub mod time;
 pub mod types;
+pub mod watchdog;
 
 pub use error::{AgentError, Result};
 pub use time::UtcTimestamp;

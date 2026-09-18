@@ -1,39 +1,9 @@
 use super::host_context::HostContext;
+use crate::common::watchdog;
 use serde_json::Value;
 use std::io::Read;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-
-/// C3（v0.5.4）：子进程统一 pre_exec——先 `setpgid(0, 0)` 自成进程组，
-/// 再 `prctl(PR_SET_PDEATHSIG, SIGKILL)`（顺序勿反）：cipher 父进程退出时内核
-/// 直接 SIGKILL 该子进程。语义（用户已拍板）：子代理派生的一切进程不比主进程长寿。
-fn child_exits_with_parent() -> std::io::Result<()> {
-    unsafe {
-        if libc::setpgid(0, 0) != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if libc::prctl(
-            libc::PR_SET_PDEATHSIG,
-            libc::SIGKILL as libc::c_ulong,
-            0,
-            0,
-            0,
-        ) != 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
-/// C3：杀整个子进程组（pgid = 子 pid，setpgid 成功前提下），随后调用方照旧
-/// `child.wait()` 收尸。替代原 `child.kill()`——那只杀 sh 本身，孙进程全孤儿。
-fn kill_process_group(child_pid: u32) {
-    unsafe {
-        libc::kill(-(child_pid as libc::pid_t), libc::SIGKILL);
-    }
-}
 
 fn fail(msg: impl Into<String>) -> Value {
     serde_json::json!({ "success": false, "error": msg.into() })
@@ -526,9 +496,7 @@ pub fn host_shell_exec(ctx: &HostContext, args: &Value) -> Result<Value, String>
 
     let mut syntax_cmd = std::process::Command::new("sh");
     syntax_cmd.arg("-n").arg("-c").arg(command);
-    unsafe {
-        syntax_cmd.pre_exec(child_exits_with_parent);
-    }
+    watchdog::apply_lifecycle_hooks(&mut syntax_cmd);
     let syntax_check = syntax_cmd
         .output()
         .map_err(|e| format!("host_shell_exec: syntax check spawn: {e}"))?;
@@ -554,12 +522,11 @@ pub fn host_shell_exec(ctx: &HostContext, args: &Value) -> Result<Value, String>
         .current_dir(&workspace_root)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    unsafe {
-        shell_cmd.pre_exec(child_exits_with_parent);
-    }
+    watchdog::apply_lifecycle_hooks(&mut shell_cmd);
     let mut child = shell_cmd
         .spawn()
         .map_err(|e| format!("host_shell_exec: spawn: {e}"))?;
+    watchdog::register_child(child.id());
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
@@ -567,8 +534,9 @@ pub fn host_shell_exec(ctx: &HostContext, args: &Value) -> Result<Value, String>
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    kill_process_group(child.id());
+                    watchdog::kill_tree(child.id());
                     let _ = child.wait();
+                    watchdog::reap_child(child.id());
                     return Err("host_shell_exec: timeout (30s)".to_string());
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -576,6 +544,7 @@ pub fn host_shell_exec(ctx: &HostContext, args: &Value) -> Result<Value, String>
             Err(e) => return Err(format!("host_shell_exec: wait: {e}")),
         }
     };
+    watchdog::reap_child(child.id());
 
     let stdout = child
         .stdout
@@ -699,17 +668,17 @@ fn execute_interpreted_code(language: &str, code: &str, ws_root: &Path) -> Resul
     cmd.env_clear();
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-    unsafe {
-        cmd.pre_exec(child_exits_with_parent);
-    }
+    watchdog::apply_lifecycle_hooks(&mut cmd);
 
     let mut child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
+    watchdog::register_child(child.id());
     let timeout = Duration::from_secs(30);
     let start = Instant::now();
     let status = loop {
         if start.elapsed() > timeout {
-            kill_process_group(child.id());
+            watchdog::kill_tree(child.id());
             let _ = child.wait();
+            watchdog::reap_child(child.id());
             return Err("code execution timed out (30s)".into());
         }
         match child.try_wait() {
@@ -718,6 +687,7 @@ fn execute_interpreted_code(language: &str, code: &str, ws_root: &Path) -> Resul
             Err(e) => return Err(format!("wait: {e}")),
         }
     };
+    watchdog::reap_child(child.id());
 
     let stdout = child
         .stdout
@@ -760,17 +730,17 @@ fn execute_rust_code(code: &str, ws_root: &Path) -> Result<Value, String> {
     cmd.env_clear();
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-    unsafe {
-        cmd.pre_exec(child_exits_with_parent);
-    }
+    watchdog::apply_lifecycle_hooks(&mut cmd);
 
     let mut child = cmd.spawn().map_err(|e| format!("rustc spawn: {e}"))?;
+    watchdog::register_child(child.id());
     let timeout = Duration::from_secs(30);
     let start = Instant::now();
     let status = loop {
         if start.elapsed() > timeout {
-            kill_process_group(child.id());
+            watchdog::kill_tree(child.id());
             let _ = child.wait();
+            watchdog::reap_child(child.id());
             return Err("rustc compilation timed out (30s)".into());
         }
         match child.try_wait() {
@@ -779,6 +749,7 @@ fn execute_rust_code(code: &str, ws_root: &Path) -> Result<Value, String> {
             Err(e) => return Err(format!("rustc wait: {e}")),
         }
     };
+    watchdog::reap_child(child.id());
 
     let stderr = child
         .stderr
@@ -803,16 +774,16 @@ fn execute_rust_code(code: &str, ws_root: &Path) -> Result<Value, String> {
     run_cmd.env_clear();
     run_cmd.stdout(std::process::Stdio::piped());
     run_cmd.stderr(std::process::Stdio::piped());
-    unsafe {
-        run_cmd.pre_exec(child_exits_with_parent);
-    }
+    watchdog::apply_lifecycle_hooks(&mut run_cmd);
 
     let mut run_child = run_cmd.spawn().map_err(|e| format!("run spawn: {e}"))?;
+    watchdog::register_child(run_child.id());
     let start = Instant::now();
     let run_status = loop {
         if start.elapsed() > timeout {
-            kill_process_group(run_child.id());
+            watchdog::kill_tree(run_child.id());
             let _ = run_child.wait();
+            watchdog::reap_child(run_child.id());
             return Err("binary execution timed out (30s)".into());
         }
         match run_child.try_wait() {
@@ -821,6 +792,7 @@ fn execute_rust_code(code: &str, ws_root: &Path) -> Result<Value, String> {
             Err(e) => return Err(format!("run wait: {e}")),
         }
     };
+    watchdog::reap_child(run_child.id());
 
     let run_stdout = run_child
         .stdout
@@ -860,36 +832,7 @@ mod tests {
         HostContext::for_workspace(root.to_path_buf())
     }
 
-    #[test]
-    #[cfg(unix)]
-    fn spawned_child_gets_own_process_group_and_group_kill_reaps_it() {
-        // C3：pre_exec 里 setpgid(0,0) → 子进程 pgid == 自身 pid；kill(-pgid) 能杀全组。
-        use std::os::unix::process::CommandExt;
-        let mut cmd = std::process::Command::new("sleep");
-        cmd.arg("30");
-        unsafe {
-            cmd.pre_exec(child_exits_with_parent);
-        }
-        let mut child = cmd.spawn().unwrap();
-        let pid = child.id();
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-        // /proc/<pid>/stat：comm 后字段依次为 state(3) ppid(4) pgrp(5)。
-        let after_comm = stat.rsplit(')').next().unwrap();
-        let pgrp: u32 = after_comm
-            .split_whitespace()
-            .nth(2)
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert_eq!(pgrp, pid, "setpgid(0,0) 后子进程应自成进程组 (pgid=pid)");
-
-        kill_process_group(pid);
-        let status = child.wait().unwrap();
-        assert!(
-            !status.success(),
-            "SIGKILL 杀全组后子进程不应正常退出 (got: {status})"
-        );
-    }
+    // 子进程组/看门狗生命周期测试已随实现移至 common::watchdog（v0.5.5）。
 
     #[test]
     fn file_write_read_roundtrip_within_root() {
