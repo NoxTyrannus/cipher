@@ -1241,6 +1241,22 @@ pub async fn run_streaming_loop(
                         .get_mut()
                         .draw(|f| crate::ui::tui::render::render(&state, f))
                         .map_err(|e| AgentError::Io(format!("draw: {e}")))?;
+                } else if let Event::Paste(text) = event {
+                    // #13（v0.5.6）：TUI 启用 bracketed paste 后的整段粘贴分发——
+                    // config 面板 → 聚焦字段的掩码/追加语义（secret 字段全 *，
+                    // 与 CLI 同一状态机）；主输入行 → 逐字符追加（滤除 `\r`/`\n`
+                    // 维持单行输入现状不劣化）。
+                    if state.mode == TuiMode::Config {
+                        let _ = state.config_panel.handle_paste(&text);
+                    } else {
+                        for c in text.chars().filter(|c| *c != '\r' && *c != '\n') {
+                            state.input_push(c);
+                        }
+                    }
+                    guard
+                        .get_mut()
+                        .draw(|f| crate::ui::tui::render::render(&state, f))
+                        .map_err(|e| AgentError::Io(format!("draw paste: {e}")))?;
                 }
             }
 
@@ -2115,6 +2131,7 @@ struct StreamingTerminalGuard {
 
 impl StreamingTerminalGuard {
     fn new() -> Result<Self, AgentError> {
+        use crossterm::event::EnableBracketedPaste;
         use crossterm::execute;
         use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
         use ratatui::backend::CrosstermBackend;
@@ -2122,18 +2139,32 @@ impl StreamingTerminalGuard {
 
         enable_raw_mode().map_err(|e| AgentError::Io(format!("enable_raw_mode: {e}")))?;
         let mut stdout = std::io::stdout();
-        match execute!(stdout, EnterAlternateScreen) {
+        // #13（v0.5.6）：进入 TUI 启用 bracketed paste（粘贴以 Event::Paste 整段上报，
+        // config 面板 secret 字段据此全 * 显示）；退出时在 Drop 成对关闭。
+        match execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
             Ok(_) => {}
             Err(e) => {
                 let _ = crossterm::terminal::disable_raw_mode();
-                return Err(AgentError::Io(format!("EnterAlternateScreen: {e}")));
+                let _ = execute!(
+                    std::io::stdout(),
+                    crossterm::event::DisableBracketedPaste,
+                    LeaveAlternateScreen
+                );
+                return Err(AgentError::Io(format!(
+                    "EnterAlternateScreen/EnableBracketedPaste: {e}"
+                )));
             }
         }
         let backend = CrosstermBackend::new(stdout);
         match Terminal::new(backend) {
             Ok(t) => Ok(Self { terminal: Some(t) }),
             Err(e) => {
-                let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+                use crossterm::event::DisableBracketedPaste;
+                let _ = execute!(
+                    std::io::stdout(),
+                    DisableBracketedPaste,
+                    LeaveAlternateScreen
+                );
                 let _ = crossterm::terminal::disable_raw_mode();
                 Err(AgentError::Io(format!("Terminal::new: {e}")))
             }
@@ -2151,11 +2182,17 @@ impl StreamingTerminalGuard {
 
 impl Drop for StreamingTerminalGuard {
     fn drop(&mut self) {
+        use crossterm::event::DisableBracketedPaste;
         use crossterm::execute;
         use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
         drop(self.terminal.take());
         let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        // #13：bracketed paste 与备用屏成对关闭（退出 TUI 恢复终端状态）。
+        let _ = execute!(
+            std::io::stdout(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
     }
 }
 

@@ -6,7 +6,7 @@ use crate::data::duckdb::loader::{
 };
 use crate::data::workspace_store::WorkspaceStore;
 use crate::startup::cli::WorkspaceCommand;
-use dialoguer::{Input, Password, Select};
+use dialoguer::{Input, Select};
 use secrecy::SecretString;
 
 use super::config::{Config, UnniStyle};
@@ -407,10 +407,7 @@ fn add_model(app: &AppState) -> Result<(), AgentError> {
                 .interact_text()
                 .map_err(|e| AgentError::Parse(format!("api_url: {}", e)))?;
             let api_type = select_api_type("api_type")?;
-            let api_key = Password::new()
-                .with_prompt("API key")
-                .interact()
-                .map_err(|e| AgentError::Parse(format!("api_key: {}", e)))?;
+            let api_key = prompt_masked_api_key("API_key: ")?;
             (api_url, api_type, api_key)
         }
     };
@@ -501,15 +498,25 @@ fn quick_add_model(app: &AppState) -> Result<(), AgentError> {
     Ok(())
 }
 
+/// #13 同款化（v0.5.6）：CLI /config 的 API key 输入与向导/TUI 面板统一——
+/// 单行掩码（common::masked_input 组件）+ 空 key 拒绝（文案与向导一致）。
+fn prompt_masked_api_key(prompt: &str) -> Result<String, AgentError> {
+    loop {
+        let api_key = crate::common::masked_input::read_masked_line(prompt)?;
+        if crate::startup::init_flow::api_key_input_is_empty(&api_key) {
+            eprintln!("API key 不能为空，请重填。");
+            continue;
+        }
+        return Ok(api_key);
+    }
+}
+
 fn change_provider_key(app: &AppState) -> Result<(), AgentError> {
     let provider = Input::<String>::new()
         .with_prompt("provider (要改 key 的)")
         .interact_text()
         .map_err(|e| AgentError::Parse(format!("provider: {}", e)))?;
-    let api_key = Password::new()
-        .with_prompt("新 API key")
-        .interact()
-        .map_err(|e| AgentError::Parse(format!("api_key: {}", e)))?;
+    let api_key = prompt_masked_api_key("新 API_key: ")?;
     let secret = SecretString::new(api_key);
     let n = update_model_api_key_by_provider(&app.duckdb, &provider, &secret)?;
     if n == 0 {

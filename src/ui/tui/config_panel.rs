@@ -1,3 +1,6 @@
+use crate::common::masked_input::{
+    apply_masked_input_event, render_masked_display, MaskedInputEvent,
+};
 use crate::data::duckdb::loader::ModelRow;
 use crate::data::workspace_store::WorkspaceRow;
 use crossterm::event::KeyCode;
@@ -47,6 +50,14 @@ fn resolve_max_output_field(value: &str) -> Result<u64, String> {
         .map_err(|_| format!("max_output 必须是非负整数, got: {value}"))
 }
 
+/// #13（v0.5.6）：离开 secret 字段（Tab/→/Enter 前进）时收起末位明文，定格全 `*`
+///（与 CLI 组件 Enter 提交定格全掩码同语义；buffer 不变，仅显示层）。
+fn mask_secret_on_exit(fields: &mut [FormField], cursor: usize) {
+    if fields[cursor].is_secret {
+        fields[cursor].last_input_reveal = false;
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ActionResult {
     Navigate,
@@ -59,6 +70,9 @@ pub struct FormField {
     pub label: &'static str,
     pub value: String,
     pub is_secret: bool,
+    /// #13（v0.5.6）：末位明文标记——仅"逐字符键入"置 true（退格/粘贴/初始 false），
+    /// 供无键事件的重绘保持掩码显示（与 CLI 共用 common::masked_input 渲染）。
+    pub last_input_reveal: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -495,6 +509,57 @@ impl ConfigPanel {
         }
     }
 
+    /// #13（v0.5.6）：整段粘贴分发（主循环 `Event::Paste` → 此处，面板 KeyCode 粒度
+    /// 之外的补充入口）。
+    /// - secret 字段（API key）：走掩码状态机 `Paste` 事件——追加全部字符，显示
+    ///   全部 `*`（连末位也不露），`*` 位数与粘贴字符数一致（与 CLI 同一状态机）。
+    /// - 普通文本字段（provider/api_url/model_id/工作区路径/agent 名）：追加粘贴
+    ///   字符（滤除 `\r`/`\n`，维持单行输入现状不劣化）。
+    /// - 数字字段（max_output / KEEP 预算）：仅接受数字字符（与逐键过滤同语义）。
+    /// - 枚举字段（api_type）与非输入视图：忽略（返回 Navigate，不改视图）。
+    pub fn handle_paste(&mut self, text: &str) -> ActionResult {
+        match &mut self.view {
+            ConfigView::AddModel(form) => {
+                let field = &mut form.fields[form.field_cursor];
+                if field.label == "api_type" {
+                    // 枚举字段不可手输/粘贴（与逐键语义一致）。
+                } else if field.is_secret {
+                    let step = apply_masked_input_event(
+                        &field.value,
+                        MaskedInputEvent::Paste(text.into()),
+                    );
+                    field.value = step.buffer;
+                    field.last_input_reveal = step.last_input_reveal;
+                } else if field.label == "max_output" {
+                    for c in text.chars().filter(|c| c.is_ascii_digit()) {
+                        field.value.push(c);
+                    }
+                } else {
+                    for c in text.chars().filter(|c| *c != '\r' && *c != '\n') {
+                        field.value.push(c);
+                    }
+                }
+            }
+            ConfigView::AddWorkspace(form) => {
+                for c in text.chars().filter(|c| *c != '\r' && *c != '\n') {
+                    form.path.push(c);
+                }
+            }
+            ConfigView::RenameAgent(form) => {
+                for c in text.chars().filter(|c| *c != '\r' && *c != '\n') {
+                    form.name.push(c);
+                }
+            }
+            ConfigView::KeepBudgetInput(form) => {
+                for c in text.chars().filter(|c| c.is_ascii_digit()) {
+                    form.input.push(c);
+                }
+            }
+            _ => {}
+        }
+        ActionResult::Navigate
+    }
+
     fn handle_menu_key(&mut self, key: KeyCode) -> ActionResult {
         match key {
             KeyCode::Up => {
@@ -800,12 +865,14 @@ impl ConfigPanel {
             }
             KeyCode::Tab | KeyCode::Right if !on_api_type => {
                 if *cursor < fields.len() - 1 {
+                    mask_secret_on_exit(fields, *cursor);
                     *cursor += 1;
                 }
                 ActionResult::Navigate
             }
             KeyCode::Enter => {
                 if *cursor < fields.len() - 1 {
+                    mask_secret_on_exit(fields, *cursor);
                     *cursor += 1;
                 } else {
                     // 提交前校验数字字段（沿用 Input<u64> 语义）：非法值拒绝提交并提示。
@@ -826,7 +893,15 @@ impl ConfigPanel {
                 ActionResult::Navigate
             }
             KeyCode::Backspace if !on_api_type => {
-                fields[*cursor].value.pop();
+                // #13（v0.5.6）：secret 字段走掩码状态机——退格不回显，显示退为全 `*`。
+                let field = &mut fields[*cursor];
+                if field.is_secret {
+                    let step = apply_masked_input_event(&field.value, MaskedInputEvent::Backspace);
+                    field.value = step.buffer;
+                    field.last_input_reveal = step.last_input_reveal;
+                } else {
+                    field.value.pop();
+                }
                 ActionResult::Navigate
             }
             KeyCode::Char(c) if !on_api_type => {
@@ -834,7 +909,16 @@ impl ConfigPanel {
                 if on_max_output && !c.is_ascii_digit() {
                     return ActionResult::Navigate;
                 }
-                fields[*cursor].value.push(c);
+                // #13（v0.5.6）：secret 字段走掩码状态机——键入后仅末位明文，
+                // 此前字符全部 `*`（输入第二位时第一位应已变 `*`）。
+                let field = &mut fields[*cursor];
+                if field.is_secret {
+                    let step = apply_masked_input_event(&field.value, MaskedInputEvent::Char(c));
+                    field.value = step.buffer;
+                    field.last_input_reveal = step.last_input_reveal;
+                } else {
+                    field.value.push(c);
+                }
                 ActionResult::Navigate
             }
             _ => ActionResult::Navigate,
@@ -852,32 +936,38 @@ impl ConfigPanel {
                     label: "provider",
                     value: String::new(),
                     is_secret: false,
+                    last_input_reveal: false,
                 },
                 FormField {
                     label: "api_url",
                     value: String::new(),
                     is_secret: false,
+                    last_input_reveal: false,
                 },
                 FormField {
                     label: "api_type",
                     value: String::new(),
                     is_secret: false,
+                    last_input_reveal: false,
                 },
                 FormField {
                     label: "model_id",
                     value: String::new(),
                     is_secret: false,
+                    last_input_reveal: false,
                 },
                 FormField {
                     label: "API key",
                     value: String::new(),
                     is_secret: true,
+                    last_input_reveal: false,
                 },
                 FormField {
                     label: "max_output",
                     value: crate::startup::config_flow::DEFAULT_MAX_OUTPUT_FOR_NEW_MODELS
                         .to_string(),
                     is_secret: false,
+                    last_input_reveal: false,
                 },
             ],
             field_cursor: 0,
@@ -1475,7 +1565,9 @@ fn render_form(
             Style::default().fg(Color::Gray)
         };
         let display: String = if f.is_secret && !f.value.is_empty() {
-            "•".repeat(f.value.len())
+            // #13（v0.5.6）：掩码显示与 CLI 共用同一渲染纯函数（一处真源）——
+            // 全 `*` + 可选末位明文（仅"键入"产生），替代原 `•` 全点显示。
+            render_masked_display(&f.value, f.last_input_reveal)
         } else {
             f.value.clone()
         };
@@ -2437,11 +2529,13 @@ mod tests {
                     label: "provider",
                     value: String::new(),
                     is_secret: false,
+                    last_input_reveal: false,
                 },
                 FormField {
                     label: "key",
                     value: String::new(),
                     is_secret: true,
+                    last_input_reveal: false,
                 },
             ],
             0,
@@ -2465,11 +2559,13 @@ mod tests {
                     label: "a",
                     value: String::new(),
                     is_secret: false,
+                    last_input_reveal: false,
                 },
                 FormField {
                     label: "b",
                     value: String::new(),
                     is_secret: true,
+                    last_input_reveal: false,
                 },
             ],
             0,
@@ -2491,6 +2587,7 @@ mod tests {
                 label: "x",
                 value: "ab".into(),
                 is_secret: false,
+                last_input_reveal: false,
             }],
             0,
             false,
@@ -2511,11 +2608,173 @@ mod tests {
                 label: "x",
                 value: String::new(),
                 is_secret: false,
+                last_input_reveal: false,
             }],
             0,
             false,
         );
         p.handle_key(KeyCode::Left);
+        assert!(matches!(p.view, ConfigView::ModelList));
+    }
+
+    // ---- #13（v0.5.6）API key 单行掩码语义（与 CLI 共用 common::masked_input 状态机）----
+
+    fn panel_at_api_key_field() -> ConfigPanel {
+        let mut p = ConfigPanel::new();
+        let mut form = ConfigPanel::new_add_model_form();
+        form.field_cursor = 4; // fields[4] = "API key"（secret 字段）
+        p.view = ConfigView::AddModel(form);
+        p
+    }
+
+    #[test]
+    fn secret_field_typing_reveals_only_last_char() {
+        // 用户规格：输入第二位的时候第一位应该变成 *——"s" → "s"，再键入 k → "*k"。
+        let mut p = panel_at_api_key_field();
+        p.handle_key(KeyCode::Char('s'));
+        p.handle_key(KeyCode::Char('k'));
+        let ConfigView::AddModel(f) = &p.view else {
+            panic!("仍应在表单视图");
+        };
+        assert_eq!(f.fields[4].value, "sk");
+        assert!(f.fields[4].last_input_reveal);
+        let text = render_to_text(&p);
+        assert!(text.contains("*k"), "末位明文渲染: {text}");
+        assert!(!text.contains("sk"), "明文前缀不得回显: {text}");
+    }
+
+    #[test]
+    fn secret_field_backspace_shows_all_stars_no_reveal() {
+        // 退格不回显：显示退为全 *，无明文位（仅"键入"产生末位明文）。
+        let mut p = panel_at_api_key_field();
+        p.handle_key(KeyCode::Char('s'));
+        p.handle_key(KeyCode::Char('k'));
+        p.handle_key(KeyCode::Backspace);
+        let ConfigView::AddModel(f) = &p.view else {
+            panic!("仍应在表单视图");
+        };
+        assert_eq!(f.fields[4].value, "s");
+        assert!(!f.fields[4].last_input_reveal);
+        let text = render_to_text(&p);
+        assert!(!text.contains("*k"), "退格后不得残留末位明文: {text}");
+    }
+
+    #[test]
+    fn secret_field_paste_appends_all_and_masks_everything() {
+        // 整段粘贴：全部 *（连末位也不露），* 位数与粘贴字符数一致。
+        let pasted = "sk-pasted-key-0123456789";
+        let mut p = panel_at_api_key_field();
+        p.handle_paste(pasted);
+        let ConfigView::AddModel(f) = &p.view else {
+            panic!("仍应在表单视图");
+        };
+        assert_eq!(f.fields[4].value, pasted);
+        assert!(!f.fields[4].last_input_reveal);
+        let text = render_to_text(&p);
+        assert!(
+            text.contains(&"*".repeat(pasted.chars().count())),
+            "全 * 且位数与粘贴字符数一致: {text}"
+        );
+        assert!(!text.contains(pasted), "粘贴明文不得回显: {text}");
+    }
+
+    #[test]
+    fn secret_field_typing_after_paste_reveals_only_typed_char() {
+        // 粘贴 5 位后键入 k → *****k（明文只属于"键入"动作）。
+        let mut p = panel_at_api_key_field();
+        p.handle_paste("12345");
+        p.handle_key(KeyCode::Char('k'));
+        let ConfigView::AddModel(f) = &p.view else {
+            panic!("仍应在表单视图");
+        };
+        assert_eq!(f.fields[4].value, "12345k");
+        assert!(f.fields[4].last_input_reveal);
+        let text = render_to_text(&p);
+        assert!(text.contains("*****k"), "仅键入字符明文: {text}");
+    }
+
+    #[test]
+    fn secret_field_masks_when_leaving_field() {
+        // 离开 secret 字段（Tab/Enter 前进）收起末位明文，定格全 `*`（buffer 不变）。
+        let mut p = panel_at_api_key_field();
+        p.handle_key(KeyCode::Char('s'));
+        p.handle_key(KeyCode::Char('k'));
+        p.handle_key(KeyCode::Tab);
+        let ConfigView::AddModel(f) = &p.view else {
+            panic!("仍应在表单视图");
+        };
+        assert_eq!(f.field_cursor, 5, "Tab 前进到 max_output");
+        assert_eq!(f.fields[4].value, "sk", "buffer 不变");
+        assert!(!f.fields[4].last_input_reveal, "末位明文已收起");
+        let text = render_to_text(&p);
+        assert!(text.contains("**"), "定格全 *: {text}");
+        assert!(!text.contains("*k"), "离开字段后不得残留末位明文: {text}");
+    }
+
+    #[test]
+    fn paste_into_plain_field_appends_without_newlines() {
+        // 普通文本字段粘贴维持单行输入现状不劣化（滤除 \r\n 追加其余字符）。
+        let mut p = ConfigPanel::new();
+        let mut form = ConfigPanel::new_add_model_form();
+        form.field_cursor = 0;
+        p.view = ConfigView::AddModel(form);
+        p.handle_paste("abc\r\ndef");
+        let ConfigView::AddModel(f) = &p.view else {
+            panic!("仍应在表单视图");
+        };
+        assert_eq!(f.fields[0].value, "abcdef");
+    }
+
+    #[test]
+    fn paste_into_max_output_filters_non_digits() {
+        // 数字字段粘贴与逐键同语义：非数字不入框。
+        let mut p = ConfigPanel::new();
+        let mut form = ConfigPanel::new_add_model_form();
+        form.field_cursor = 5;
+        p.view = ConfigView::AddModel(form);
+        p.handle_paste("12a3");
+        let ConfigView::AddModel(f) = &p.view else {
+            panic!("仍应在表单视图");
+        };
+        assert_eq!(f.fields[5].value, "1024123");
+    }
+
+    #[test]
+    fn paste_into_api_type_field_is_ignored() {
+        // 枚举字段不可手输/粘贴。
+        let mut p = ConfigPanel::new();
+        let mut form = ConfigPanel::new_add_model_form();
+        form.field_cursor = 2;
+        p.view = ConfigView::AddModel(form);
+        p.handle_paste("xx");
+        let ConfigView::AddModel(f) = &p.view else {
+            panic!("仍应在表单视图");
+        };
+        assert!(f.fields[2].value.is_empty());
+    }
+
+    #[test]
+    fn paste_into_keep_budget_input_filters_digits() {
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::KeepBudgetInput(KeepBudgetInput {
+            target: 0,
+            input: String::new(),
+            submitted: false,
+        });
+        p.handle_paste("1a2");
+        let ConfigView::KeepBudgetInput(f) = &p.view else {
+            panic!("仍应在预算输入视图");
+        };
+        assert_eq!(f.input, "12");
+    }
+
+    #[test]
+    fn paste_into_non_input_view_is_noop() {
+        // 非输入视图收到粘贴：不改视图不 panic。
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::ModelList;
+        let r = p.handle_paste("xxx");
+        assert!(matches!(r, ActionResult::Navigate));
         assert!(matches!(p.view, ConfigView::ModelList));
     }
 
@@ -2771,11 +3030,13 @@ mod tests {
                     label: "p",
                     value: "x".into(),
                     is_secret: false,
+                    last_input_reveal: false,
                 },
                 FormField {
                     label: "k",
                     value: "y".into(),
                     is_secret: true,
+                    last_input_reveal: false,
                 },
             ],
             1,
@@ -2799,11 +3060,13 @@ mod tests {
                     label: "p",
                     value: "x".into(),
                     is_secret: false,
+                    last_input_reveal: false,
                 },
                 FormField {
                     label: "k",
                     value: "y".into(),
                     is_secret: true,
+                    last_input_reveal: false,
                 },
             ],
             0,

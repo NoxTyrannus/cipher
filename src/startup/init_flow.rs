@@ -32,19 +32,6 @@ pub fn api_type_selection_internal(index: usize) -> Option<&'static str> {
         .map(|(_, internal)| *internal)
 }
 
-/// A6 纯函数：API key 掩码摘要。
-/// 长度 ≥12：`已接收：{前3}****{后4}（{N} 字符）`；<12：`已接收：****（{N} 字符）`。
-pub fn mask_api_key_summary(api_key: &str) -> String {
-    let n = api_key.chars().count();
-    if n >= 12 {
-        let first: String = api_key.chars().take(3).collect();
-        let last: String = api_key.chars().skip(n - 4).collect();
-        format!("已接收：{first}****{last}（{n} 字符）")
-    } else {
-        format!("已接收：****（{n} 字符）")
-    }
-}
-
 /// A2（v0.5.4）：首屏文案（重写；不含 TUI 快捷键块——快捷键只留在已配置屏与收尾 n 分支）。
 /// 拍板文案逐字对齐：`⑤ API_key` 行尾分号后接"每步都有说明"为同段延续（；分隔，不换行），
 /// ①~⑤ 行内对齐空格保留。
@@ -175,8 +162,10 @@ async fn prompt_and_configure_model(app: &AppState, _data_dir: &Path) -> Result<
             .interact_text()
             .map_err(|e| AgentError::Parse(format!("model_id input: {}", e)))?;
 
-        // ⑤ API key：Password 不回显 + 掩码摘要确认（回车确认 / r 重填）。
-        let api_key = prompt_api_key_confirmed()?;
+        // ⑤ API key（#13 v0.5.6）：单行掩码输入（键入末位明文/退格与粘贴全 `*`、
+        // Enter 提交、Ctrl+C 中止；语义见 common::masked_input）。
+        // v0.5.4 的「已接收：…回车确认 / r 重填」确认环已删除（位数实时可见）。
+        let api_key = prompt_api_key()?;
 
         let lower_model_id = model_id.to_lowercase();
 
@@ -235,46 +224,25 @@ async fn prompt_and_configure_model(app: &AppState, _data_dir: &Path) -> Result<
     }
 }
 
-/// A6 确认判定纯函数（拍板字面语义）：空输入/回车 = 确认；`r`/`R` = 重填；
-/// 其余输入无效（返回 None，调用方重新提示）。
-pub fn api_key_confirm_decision(input: &str) -> Option<bool> {
-    match input.trim() {
-        "" => Some(true),
-        "r" | "R" => Some(false),
-        _ => None,
-    }
-}
-
-/// A6：API key 环。Password 不回显；提交后打印掩码摘要并请求确认——
-/// 字面语义"回车确认 / r 重填"：Input 接收，空输入/回车=确认，r/R=重填（回到
-/// Password 重输），其余无效输入重新提示；空 key 校验保留。
-fn prompt_api_key_confirmed() -> Result<String, AgentError> {
-    use dialoguer::{Input, Password};
+/// #13（v0.5.6）：API key 环——单行掩码输入（`common::masked_input` 组件）。
+/// 键入末位明文、退格/粘贴全 `*`、Enter 提交、Ctrl+C 中止（Err 走现有中止路径）；
+/// 空 key 拒绝文案沿用 v0.5.4（`API key 不能为空，请重填。`）。
+/// v0.5.4 的 `Password 不回显 + 已接收：…回车确认 / r 重填` 两段式确认环已删除
+/// （位数与粘贴效果在行内实时可见，确认环失去意义）。
+fn prompt_api_key() -> Result<String, AgentError> {
     loop {
-        let api_key = Password::new()
-            .with_prompt("API key")
-            .interact()
-            .map_err(|k| AgentError::Parse(format!("api_key input: {}", k)))?;
-        if api_key.trim().is_empty() {
+        let api_key = crate::common::masked_input::read_masked_line("API_key: ")?;
+        if api_key_input_is_empty(&api_key) {
             eprintln!("API key 不能为空，请重填。");
             continue;
         }
-        println!("{}", mask_api_key_summary(&api_key));
-        let confirmed = loop {
-            let input = Input::<String>::new()
-                .with_prompt("回车确认 / r 重填")
-                .allow_empty(true)
-                .interact_text()
-                .map_err(|e| AgentError::Parse(format!("api_key confirm: {e}")))?;
-            match api_key_confirm_decision(&input) {
-                Some(decision) => break decision,
-                None => eprintln!("无效输入：回车确认，或输入 r 重填。"),
-            }
-        };
-        if confirmed {
-            return Ok(api_key);
-        }
+        return Ok(api_key);
     }
+}
+
+/// #13 纯函数：空 key 判定（沿用 v0.5.4 语义——trim 后为空即空；返回值本身不 trim）。
+pub fn api_key_input_is_empty(api_key: &str) -> bool {
+    api_key.trim().is_empty()
 }
 
 /// A7：收尾 y/n。ping 成功、写入 default_model 后提问 `是否立即启动 cipher?`。
@@ -393,22 +361,12 @@ mod tests {
     }
 
     #[test]
-    fn mask_api_key_summary_long_key_shows_head_and_tail() {
-        // A6：≥12 位 → 前3****后4（N 字符）。
-        let key = "sk-abcdef1234567890"; // 19 字符
-        assert_eq!(key.chars().count(), 19);
-        assert_eq!(mask_api_key_summary(key), "已接收：sk-****7890（19 字符）");
-    }
-
-    #[test]
-    fn mask_api_key_summary_short_key_is_fully_masked() {
-        // A6：<12 位 → ****（N 字符）。
-        assert_eq!(mask_api_key_summary("abc45678"), "已接收：****（8 字符）");
-        let boundary12 = "abcdefghijkl"; // 恰 12 位 → 长档
-        assert_eq!(
-            mask_api_key_summary(boundary12),
-            "已接收：abc****ijkl（12 字符）"
-        );
+    fn api_key_input_is_empty_follows_trim_semantics() {
+        // #13：空 key 判定沿用 v0.5.4 语义（trim 后为空即空；含纯空白/换行）。
+        assert!(api_key_input_is_empty(""));
+        assert!(api_key_input_is_empty("   "));
+        assert!(api_key_input_is_empty("\r\n"));
+        assert!(!api_key_input_is_empty("sk-x"));
     }
 
     #[test]
@@ -428,14 +386,10 @@ mod tests {
     }
 
     #[test]
-    fn api_key_confirm_decision_follows_approved_literal_semantics() {
-        // A6：拍板字面语义——空输入/回车=确认，r/R=重填，其余无效（重新提示）。
-        assert_eq!(api_key_confirm_decision(""), Some(true), "空输入 = 确认");
-        assert_eq!(api_key_confirm_decision("   "), Some(true), "纯空白 = 确认");
-        assert_eq!(api_key_confirm_decision("r"), Some(false), "r = 重填");
-        assert_eq!(api_key_confirm_decision("R"), Some(false), "R = 重填");
-        assert_eq!(api_key_confirm_decision("y"), None, "其余输入无效");
-        assert_eq!(api_key_confirm_decision("rr"), None, "其余输入无效");
+    fn confirmation_ring_helpers_are_removed() {
+        // #13：v0.5.4 确认环（已接收摘要 + 回车确认/r 重填）已删除——
+        // 相关函数不再存在由编译保证；此处锁定提示前缀与向导五步文案不被误改。
+        assert!(first_run_banner("0.5.6").contains("⑤ API_key"));
     }
 
     #[test]
