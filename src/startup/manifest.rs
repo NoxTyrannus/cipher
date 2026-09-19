@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const APP_VERSION: &str = "0.5.5";
+pub const APP_VERSION: &str = "0.5.6";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptFileState {
