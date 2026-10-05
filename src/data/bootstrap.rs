@@ -47,7 +47,7 @@ pub fn bootstrap(data_dir: &Path) -> Result<AppState, AgentError> {
 
     let duckdb_path = paths.duckdb();
     secure_duckdb_files(&duckdb_path)?;
-    let conn = open_duckdb_with_lock_retry(&duckdb_path)?;
+    let conn = open_duckdb_with_lock_retry(&duckdb_path, "bootstrap")?;
     if let Err(error) = secure_duckdb_files(&duckdb_path) {
         drop(conn);
         return Err(merge_permission_error(
@@ -126,7 +126,12 @@ fn secure_duckdb_files(database_path: &Path) -> Result<(), AgentError> {
 /// C1+C2（v0.5.4）：打开活动 DuckDB。锁冲突（另一活实例持有文件锁）先短重试
 /// （至多 3 次、间隔 1s）；仍失败转中文可操作提示（含占用 PID，提不出则不带）。
 /// 非锁冲突错误走原路径不变（含权限修复合并逻辑）。
-fn open_duckdb_with_lock_retry(database_path: &Path) -> Result<duckdb::Connection, AgentError> {
+/// #15（v0.5.7）：`context` 用于错误定位（"bootstrap" / "pre-bootstrap seed"），
+/// pre-bootstrap seed 打开点（entry.rs）复用同一套识别+重试+中文提示。
+pub(crate) fn open_duckdb_with_lock_retry(
+    database_path: &Path,
+    context: &str,
+) -> Result<duckdb::Connection, AgentError> {
     let mut attempt = 0usize;
     loop {
         match duckdb::Connection::open(database_path) {
@@ -135,7 +140,7 @@ fn open_duckdb_with_lock_retry(database_path: &Path) -> Result<duckdb::Connectio
                 let message = error.to_string();
                 if !is_lock_conflict_error(&message) {
                     let open_error = AgentError::Bootstrap(format!(
-                        "open DuckDB {:?}: {}",
+                        "open DuckDB for {context} {:?}: {}",
                         database_path, error
                     ));
                     return Err(merge_permission_error(
@@ -199,6 +204,22 @@ mod tests {
             "权限错误不是锁冲突"
         );
         assert!(!is_lock_conflict_error("invalid database file"));
+    }
+
+    #[test]
+    fn open_with_lock_retry_reports_context_on_open_failure() {
+        // #15（v0.5.7）：非锁冲突打开错误透传 context，pre-bootstrap 打开点可定位。
+        let invalid = std::path::PathBuf::from("/dev/null/invalid/cipher.duckdb");
+        match open_duckdb_with_lock_retry(&invalid, "pre-bootstrap seed") {
+            Err(crate::common::AgentError::Bootstrap(msg)) => {
+                assert!(
+                    msg.contains("open DuckDB for pre-bootstrap seed"),
+                    "错误应含 context 前缀, got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected Bootstrap error, got: {other:?}"),
+            Ok(_) => panic!("expected failure, got Ok"),
+        }
     }
 
     #[test]

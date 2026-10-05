@@ -151,8 +151,10 @@ pub async fn run_setup(
 fn ensure_capability_seed_before_bootstrap(data_dir: &Path) -> Result<(), AgentError> {
     let paths = crate::data::migration::prepare_data_dir(data_dir)?;
     crate::data::cognitive_seed::ensure_default_capabilities(data_dir)?;
-    let conn = duckdb::Connection::open(paths.duckdb())
-        .map_err(|e| AgentError::Bootstrap(format!("open DuckDB for pre-bootstrap seed: {e}")))?;
+    // #15（v0.5.7）：pre-bootstrap 打开点接入与主打开点（bootstrap.rs）同一套
+    // 锁冲突识别 + 短重试 + 中文提示——活实例持锁时不再抛英文原始错误。
+    let conn =
+        crate::data::bootstrap::open_duckdb_with_lock_retry(&paths.duckdb(), "pre-bootstrap seed")?;
     crate::data::duckdb::create_all_tables(&conn)?;
     crate::data::cognitive_seed::import_factory_defaults(&conn, data_dir)?;
     crate::data::cognitive_seed::upgrade_seed_deltas(&conn, data_dir)?;

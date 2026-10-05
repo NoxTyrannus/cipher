@@ -875,10 +875,13 @@ impl ConfigPanel {
                     mask_secret_on_exit(fields, *cursor);
                     *cursor += 1;
                 } else {
-                    // 提交前校验数字字段（沿用 Input<u64> 语义）：非法值拒绝提交并提示。
+                    // 提交前校验：secret 空 key 拒绝（#16，v0.5.7，文案同 CLI 两入口）；
+                    // max_output 沿用 Input<u64> 语义——非法值拒绝提交并提示。
                     let mut invalid: Option<String> = None;
                     for f in fields.iter() {
-                        if f.label == "max_output" {
+                        if f.is_secret && f.value.trim().is_empty() {
+                            invalid = Some("API key 不能为空，请重填。".to_string());
+                        } else if f.label == "max_output" {
                             if let Err(msg) = resolve_max_output_field(&f.value) {
                                 invalid = Some(msg);
                             }
@@ -2913,6 +2916,26 @@ mod tests {
         assert!(resolve_max_output_field("abc").is_err());
         assert!(resolve_max_output_field("-1").is_err());
         assert!(resolve_max_output_field("1.5").is_err());
+    }
+
+    #[test]
+    fn submit_with_empty_api_key_is_rejected() {
+        // #16（v0.5.7）：secret 字段空值拒绝提交（文案同 CLI 两入口），submitted 不置真。
+        let mut form = ConfigPanel::new_add_model_form();
+        form.fields[4].value = "  ".into(); // 空白视为空（trim 语义）
+        form.field_cursor = 5;
+        let mut p = ConfigPanel::new();
+        p.view = ConfigView::AddModel(form);
+        p.handle_key(KeyCode::Enter);
+        let ConfigView::AddModel(f) = &p.view else {
+            panic!("拒绝提交后仍应在表单, got {:?}", p.view);
+        };
+        assert!(!f.submitted, "空 API key 不得提交");
+        assert!(
+            matches!(&p.message, Some((msg, true)) if msg.contains("API key 不能为空")),
+            "应给出空 key 错误提示, got: {:?}",
+            p.message
+        );
     }
 
     #[test]
