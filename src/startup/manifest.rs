@@ -5,13 +5,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const APP_VERSION: &str = "0.5.7";
+pub const APP_VERSION: &str = "0.5.9";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptFileState {
     pub default_sha256: String,
     pub last_auto_version: String,
     pub user_modified: bool,
+    /// 用户确认保留（启动询问选 Y）时的文件内容哈希；None=从未确认过。
+    /// 启动时文件哈希等于此值则静默保留、不再询问；用户再次修改文件后才重新询问。
+    #[serde(default)]
+    pub user_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +89,7 @@ pub fn ensure_fresh_install(
                 default_sha256: sha256_bytes(content.as_bytes()),
                 last_auto_version: APP_VERSION.to_string(),
                 user_modified: false,
+                user_sha256: None,
             },
         );
     }
@@ -128,9 +133,14 @@ pub fn upgrade_prompts(
             None
         };
 
+        let user_sha256_confirmed = state.and_then(|s| s.user_sha256.clone());
+        // 文件内容与出厂默认一致时一律按未修改处理，不弹询问（历史粘性标记也不算数）。
+        let matches_default = current_hash.as_deref() == Some(default_hash.as_str());
         let user_modified = match state {
             Some(s) => {
-                s.user_modified || current_hash.as_deref() != Some(s.default_sha256.as_str())
+                !matches_default
+                    && (s.user_modified
+                        || current_hash.as_deref() != Some(s.default_sha256.as_str()))
             }
             None => current_hash.is_some(),
         };
@@ -143,9 +153,15 @@ pub fn upgrade_prompts(
                     default_sha256: default_hash.clone(),
                     last_auto_version: APP_VERSION.to_string(),
                     user_modified: false,
+                    user_sha256: None,
                 },
             );
             report.upgraded.push(name.to_string());
+            continue;
+        }
+
+        // 用户已对当前内容确认过（上次启动选了 Y）：静默保留，不再重复询问。
+        if user_sha256_confirmed.is_some() && user_sha256_confirmed == current_hash {
             continue;
         }
 
@@ -163,6 +179,7 @@ pub fn upgrade_prompts(
                         default_sha256: default_hash.clone(),
                         last_auto_version: APP_VERSION.to_string(),
                         user_modified: false,
+                        user_sha256: None,
                     },
                 );
                 report.backed_up.push(name.to_string());
@@ -175,6 +192,7 @@ pub fn upgrade_prompts(
                         default_sha256: default_hash.clone(),
                         last_auto_version: APP_VERSION.to_string(),
                         user_modified: false,
+                        user_sha256: None,
                     },
                 );
                 report.overwritten.push(name.to_string());
@@ -186,6 +204,7 @@ pub fn upgrade_prompts(
                         default_sha256: default_hash.clone(),
                         last_auto_version: APP_VERSION.to_string(),
                         user_modified: true,
+                        user_sha256: current_hash,
                     },
                 );
                 report.skipped.push(name.to_string());

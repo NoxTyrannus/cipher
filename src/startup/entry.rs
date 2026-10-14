@@ -69,25 +69,8 @@ fn ensure_default_prompts_interactive(unified_root: &Path) -> Result<(), AgentEr
         return Ok(());
     }
 
-    let report = manifest::upgrade_prompts(unified_root, &defaults, |name| {
-        let items = vec![
-            "备份后升级".to_string(),
-            "销毁旧文件升级".to_string(),
-            "取消（保留用户文件）".to_string(),
-        ];
-        let sel = dialoguer::Select::new()
-            .with_prompt(format!("提示词 {name} 已被用户修改，如何处理？"))
-            .items(&items)
-            .default(0)
-            .interact()
-            .unwrap_or(2);
-        match sel {
-            0 => UpgradeChoice::Backup,
-            1 => UpgradeChoice::Overwrite,
-            _ => UpgradeChoice::Cancel,
-        }
-    })
-    .map_err(|e| AgentError::Io(format!("upgrade prompts: {e}")))?;
+    let report = manifest::upgrade_prompts(unified_root, &defaults, prompt_keep_or_reset)
+        .map_err(|e| AgentError::Io(format!("upgrade prompts: {e}")))?;
 
     if !report.skipped.is_empty() {
         tracing::info!(
@@ -96,6 +79,37 @@ fn ensure_default_prompts_interactive(unified_root: &Path) -> Result<(), AgentEr
         );
     }
     Ok(())
+}
+
+/// 用户修改过提示词后的 Y/N 问答：Y=继续使用用户的文件；N=备份到 backups/ 后重置为默认。
+/// 非 TTY（无头运行/驱动 pty）不询问，一律按 Y 处理——不阻塞自动化，也永不破坏用户文件。
+fn prompt_keep_or_reset(name: &str) -> UpgradeChoice {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return UpgradeChoice::Cancel;
+    }
+    for _ in 0..3 {
+        print!("提示词 {name} 文件已修改，是否更新？[Y=使用你的修改 / N=重置为默认] ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => return UpgradeChoice::Cancel,
+            Ok(_) => {
+                if let Some(choice) = choice_from_answer(&line) {
+                    return choice;
+                }
+            }
+        }
+    }
+    UpgradeChoice::Cancel
+}
+
+fn choice_from_answer(answer: &str) -> Option<UpgradeChoice> {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" | "是" => Some(UpgradeChoice::Cancel),
+        "n" | "no" | "否" => Some(UpgradeChoice::Backup),
+        _ => None,
+    }
 }
 
 fn load_config(
@@ -2234,6 +2248,110 @@ fn load_default_agent_display_name(conn: &duckdb::Connection) -> Option<String> 
 #[cfg(test)]
 mod prompt_install_tests {
     use super::*;
+
+    #[test]
+    fn confirmed_user_choice_is_not_reprompted() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let defaults = [("system.md", "factory")];
+        crate::startup::manifest::ensure_fresh_install(root, &defaults).unwrap();
+
+        // 第一次：用户改了文件并选 Y → 保留并记录确认哈希。
+        std::fs::write(root.join("prompts/system.md"), "my-persona").unwrap();
+        let report1 = manifest::upgrade_prompts(root, &defaults, |_| UpgradeChoice::Cancel)
+            .unwrap();
+        assert_eq!(report1.skipped, vec!["system.md".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(root.join("prompts/system.md")).unwrap(),
+            "my-persona"
+        );
+
+        // 第二次：内容未再修改 → 不再询问（decide 被调用即失败）。
+        let report2 = manifest::upgrade_prompts(root, &defaults, |_| {
+            panic!("已确认的文件不应再次询问");
+        })
+        .unwrap();
+        assert!(report2.upgraded.is_empty());
+        assert!(report2.backed_up.is_empty());
+        assert!(report2.overwritten.is_empty());
+        assert!(report2.skipped.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(root.join("prompts/system.md")).unwrap(),
+            "my-persona"
+        );
+    }
+
+    #[test]
+    fn re_modified_file_prompts_again_and_remember_new_choice() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let defaults = [("system.md", "factory")];
+        crate::startup::manifest::ensure_fresh_install(root, &defaults).unwrap();
+
+        std::fs::write(root.join("prompts/system.md"), "persona-v1").unwrap();
+        manifest::upgrade_prompts(root, &defaults, |_| UpgradeChoice::Cancel).unwrap();
+
+        // 用户再次修改 → 应重新询问；再选 Y → 保留新内容并记住新哈希。
+        std::fs::write(root.join("prompts/system.md"), "persona-v2").unwrap();
+        let called = std::cell::Cell::new(0);
+        let report = manifest::upgrade_prompts(root, &defaults, |_| {
+            called.set(called.get() + 1);
+            UpgradeChoice::Cancel
+        })
+        .unwrap();
+        assert_eq!(called.get(), 1);
+        assert_eq!(report.skipped, vec!["system.md".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(root.join("prompts/system.md")).unwrap(),
+            "persona-v2"
+        );
+        let m = manifest::load(&root.join("manifest.json")).unwrap();
+        assert!(m.files["prompts/system.md"].user_sha256.is_some());
+    }
+
+    #[test]
+    fn restored_default_file_does_not_prompt_despite_sticky_flag() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let defaults = [("system.md", "factory")];
+        crate::startup::manifest::ensure_fresh_install(root, &defaults).unwrap();
+
+        // 确认过用户版本后，又手动把文件还原成出厂内容 → 不应询问。
+        std::fs::write(root.join("prompts/system.md"), "persona-v1").unwrap();
+        manifest::upgrade_prompts(root, &defaults, |_| UpgradeChoice::Cancel).unwrap();
+        std::fs::write(root.join("prompts/system.md"), "factory").unwrap();
+        let report = manifest::upgrade_prompts(root, &defaults, |_| {
+            panic!("文件已是出厂内容，不应询问");
+        })
+        .unwrap();
+        assert!(!report.skipped.is_empty() || !report.upgraded.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(root.join("prompts/system.md")).unwrap(),
+            "factory"
+        );
+    }
+
+    #[test]
+    fn choice_from_answer_maps_yn() {
+        assert!(matches!(
+            choice_from_answer("y"),
+            Some(UpgradeChoice::Cancel)
+        ));
+        assert!(matches!(
+            choice_from_answer(" 是 "),
+            Some(UpgradeChoice::Cancel)
+        ));
+        assert!(matches!(
+            choice_from_answer("n"),
+            Some(UpgradeChoice::Backup)
+        ));
+        assert!(matches!(
+            choice_from_answer("no"),
+            Some(UpgradeChoice::Backup)
+        ));
+        assert!(choice_from_answer("随便").is_none());
+        assert!(choice_from_answer("").is_none());
+    }
 
     #[test]
     fn fresh_install_writes_every_factory_prompt_and_manifest() {
