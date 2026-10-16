@@ -2258,8 +2258,8 @@ mod prompt_install_tests {
 
         // 第一次：用户改了文件并选 Y → 保留并记录确认哈希。
         std::fs::write(root.join("prompts/system.md"), "my-persona").unwrap();
-        let report1 = manifest::upgrade_prompts(root, &defaults, |_| UpgradeChoice::Cancel)
-            .unwrap();
+        let report1 =
+            manifest::upgrade_prompts(root, &defaults, |_| UpgradeChoice::Cancel).unwrap();
         assert_eq!(report1.skipped, vec!["system.md".to_string()]);
         assert_eq!(
             std::fs::read_to_string(root.join("prompts/system.md")).unwrap(),
