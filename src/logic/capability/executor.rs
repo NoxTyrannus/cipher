@@ -248,6 +248,22 @@ impl CapabilityExecutor {
                 };
                 return raw.map_err(|e| AgentError::Script(format!("builtin {builtin_name}: {e}")));
             }
+            // B4（v0.5.11）：多模式证据检索（证据与推断分离，只报告命中片段）。
+            // 各依赖可选：缺 conn/storage_root/triviumdb 时对应模式半边降级为
+            // hit=false + note，不构成执行失败。
+            "evidence.check" => {
+                let duckdb_guard = self.duckdb.as_ref().and_then(|db| db.lock().ok());
+                let trivium_guard = self.triviumdb.as_ref().and_then(|db| db.lock().ok());
+                return super::evidence::evidence_check(
+                    self.storage_root.as_deref(),
+                    duckdb_guard.as_deref(),
+                    trivium_guard.as_deref(),
+                    host,
+                    &self.web_allowed_domains,
+                    input,
+                )
+                .map_err(|e| AgentError::Script(format!("builtin evidence.check: {e}")));
+            }
             "db.insert" => return self.builtin_db_insert(input),
             "db.update" => return self.builtin_db_update(input),
             "db.delete" => return self.builtin_db_delete(input),
