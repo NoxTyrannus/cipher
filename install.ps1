@@ -69,6 +69,35 @@ function Download-And-Install {
 
     Write-Host "== 下载 $url =="
     curl.exe -fSL $url -o $zipPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "下载失败 (curl 退出码 $LASTEXITCODE): $url"
+    }
+
+    # 校验和验证：Release 附带 SHA256SUMS 则强制校验，缺失则警告跳过
+    if ($Tag -eq "latest") {
+        $sumsUrl = "https://github.com/$GhRepo/releases/latest/download/SHA256SUMS"
+    } else {
+        $sumsUrl = "https://github.com/$GhRepo/releases/download/$Tag/SHA256SUMS"
+    }
+    $sumsPath = Join-Path $tmpdir "SHA256SUMS"
+    curl.exe -fsSL $sumsUrl -o $sumsPath
+    if ($LASTEXITCODE -eq 0 -and (Test-Path $sumsPath)) {
+        $expected = (Get-Content $sumsPath | ForEach-Object {
+            $parts = $_ -split '\s+', 2
+            if ($parts.Count -eq 2 -and $parts[1].Trim().TrimStart('*') -eq $asset) { $parts[0].ToLower() }
+        } | Select-Object -First 1)
+        if ($expected) {
+            $actual = (Get-FileHash -Algorithm SHA256 $zipPath).Hash.ToLower()
+            if ($actual -ne $expected) {
+                throw "SHA256 校验失败: 期望 $expected, 实际 $actual"
+            }
+            Write-Host "== SHA256 校验通过 =="
+        } else {
+            Write-Host "警告: SHA256SUMS 中未找到 $asset 条目，跳过校验"
+        }
+    } else {
+        Write-Host "警告: Release 未提供 SHA256SUMS，跳过校验和验证"
+    }
 
     Write-Host "== 解压 =="
     $extractDir = Join-Path $tmpdir "extract"
@@ -95,6 +124,9 @@ function Build-And-Install {
     }
     Write-Host "== 构建 release 版本 (可能需要几分钟) =="
     cargo build --release
+    if ($LASTEXITCODE -ne 0) {
+        throw "构建失败 (cargo 退出码 $LASTEXITCODE)"
+    }
     $binPath = Join-Path (Get-Location) "target\release\$BinName.exe"
     if (-not (Test-Path $binPath)) {
         throw "构建失败: 未找到 $binPath"
