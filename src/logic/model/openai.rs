@@ -1,7 +1,7 @@
 use super::error::map_reqwest_error;
 use super::message::{normalize_with_system, ChatMessage};
 use super::provider::{LlmProvider, LlmRequest, LlmResponse, Usage};
-use super::stream::{find_double_newline, StreamChunk};
+use super::stream::{SseDecoder, StreamChunk};
 use crate::common::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -15,9 +15,12 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn new() -> Self {
+        // 不设客户端级总超时（旧 90s 会掐断 >90s 的流式生成）：流式 body 改由
+        // read_timeout 做「单次读空闲」保护（容忍慢推理模型的首 token 延迟）；
+        // 非流式 call 在 RequestBuilder 上加请求级 90s 总超时，维持原行为。
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(90))
+            .read_timeout(Duration::from_secs(300))
             .build()
             .expect("reqwest client build");
         Self { client }
@@ -115,6 +118,56 @@ pub struct OpenAiUsage {
     pub total_tokens: u32,
 }
 
+#[derive(Debug)]
+enum OpenAiSseOutcome {
+    Continue,
+    /// 收到 [DONE]，调用方应直接结束读流循环（Done 通知由收尾统一发出）。
+    Done,
+}
+
+/// 处理一条 SSE 事件的 data 载荷。
+///
+/// 空载荷直接跳过（部分服务器发空 data: 保活行，旧实现会在此 JSON 解析
+/// 失败并终止整流）；非空但 JSON 解析失败仍按旧语义报 Error 并终止整流。
+fn process_openai_sse_event(
+    data: &str,
+    accumulated: &mut String,
+    finish_reason: &mut Option<String>,
+    on_chunk: &mut (dyn FnMut(StreamChunk) + Send),
+) -> Result<OpenAiSseOutcome> {
+    if data == "[DONE]" {
+        return Ok(OpenAiSseOutcome::Done);
+    }
+    if data.is_empty() {
+        return Ok(OpenAiSseOutcome::Continue);
+    }
+    let parsed: serde_json::Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(e) => {
+            let err_msg = format!("openai SSE parse: {e}");
+            on_chunk(StreamChunk::Error(err_msg.clone()));
+            return Err(crate::common::AgentError::Llm(err_msg));
+        }
+    };
+    if let Some(s) = parsed
+        .pointer("/choices/0/delta/content")
+        .and_then(|v| v.as_str())
+    {
+        if !s.is_empty() {
+            accumulated.push_str(s);
+            on_chunk(StreamChunk::Delta(s.to_string()));
+        }
+    }
+    // D3：SSE 末块 choices[0].finish_reason（如 "length"）。
+    if let Some(fr) = parsed
+        .pointer("/choices/0/finish_reason")
+        .and_then(|v| v.as_str())
+    {
+        *finish_reason = Some(fr.to_string());
+    }
+    Ok(OpenAiSseOutcome::Continue)
+}
+
 #[async_trait]
 impl LlmProvider for OpenAiProvider {
     fn id(&self) -> &'static str {
@@ -131,6 +184,7 @@ impl LlmProvider for OpenAiProvider {
         let result = self
             .client
             .post(&url)
+            .timeout(Duration::from_secs(90))
             .bearer_auth(&api_key_str)
             .json(&body)
             .send()
@@ -143,6 +197,7 @@ impl LlmProvider for OpenAiProvider {
                 let body = build_openai_request(req, false);
                 self.client
                     .post(&url)
+                    .timeout(Duration::from_secs(90))
                     .bearer_auth(&api_key_str)
                     .json(&body)
                     .send()
@@ -218,57 +273,53 @@ impl LlmProvider for OpenAiProvider {
         }
 
         let mut stream = resp.bytes_stream();
-        let mut buf: Vec<u8> = Vec::new();
+        let mut decoder = SseDecoder::new();
         let mut accumulated = String::new();
         let mut stream_finish_reason: Option<String> = None;
+        // 服务器忽略 stream=true 直接回完整 JSON 时的非流式补救原料：仅在尚无
+        // 任何 delta 时保留原始 body；某批次已完成事件分发（说明确在走 SSE）
+        // 则丢弃此前残留，近似旧 buf「最后一个完整事件之后的字节」语义。
+        let mut raw_tail: Vec<u8> = Vec::new();
+        let mut done = false;
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| map_reqwest_error(e, "openai"))?;
-            buf.extend_from_slice(&chunk);
-            while let Some(pos) = find_double_newline(&buf) {
-                let event_bytes: Vec<u8> = buf.drain(..pos + 2).collect();
-                let event = String::from_utf8_lossy(&event_bytes);
-                for line in event.lines() {
-                    if let Some(data) = line.strip_prefix("data: ") {
-                        if data == "[DONE]" {
-                            on_chunk(StreamChunk::Done);
-                            return Ok(LlmResponse {
-                                content: accumulated,
-                                usage: None,
-                                finish_reason: stream_finish_reason,
-                            });
+        while !done {
+            let events = match stream.next().await {
+                Some(Ok(chunk)) => {
+                    let events = decoder.feed(&chunk);
+                    if events.is_empty() {
+                        if accumulated.is_empty() {
+                            raw_tail.extend_from_slice(&chunk);
                         }
-                        let parsed: serde_json::Value = match serde_json::from_str(data) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                let err_msg = format!("openai SSE parse: {e}");
-                                on_chunk(StreamChunk::Error(err_msg.clone()));
-                                return Err(crate::common::AgentError::Llm(err_msg));
-                            }
-                        };
-                        if let Some(s) = parsed
-                            .pointer("/choices/0/delta/content")
-                            .and_then(|v| v.as_str())
-                        {
-                            if !s.is_empty() {
-                                accumulated.push_str(s);
-                                on_chunk(StreamChunk::Delta(s.to_string()));
-                            }
-                        }
-                        // D3：SSE 末块 choices[0].finish_reason（如 "length"）。
-                        if let Some(fr) = parsed
-                            .pointer("/choices/0/finish_reason")
-                            .and_then(|v| v.as_str())
-                        {
-                            stream_finish_reason = Some(fr.to_string());
-                        }
+                    } else if accumulated.is_empty() {
+                        raw_tail.clear();
+                    }
+                    events
+                }
+                Some(Err(e)) => return Err(map_reqwest_error(e, "openai")),
+                None => {
+                    // EOF：解码器收尾（无空行结尾的残留事件仍按事件分发）。
+                    done = true;
+                    decoder.finish()
+                }
+            };
+            for data in events {
+                match process_openai_sse_event(
+                    &data,
+                    &mut accumulated,
+                    &mut stream_finish_reason,
+                    on_chunk,
+                )? {
+                    OpenAiSseOutcome::Continue => {}
+                    OpenAiSseOutcome::Done => {
+                        done = true;
+                        break;
                     }
                 }
             }
         }
 
-        if accumulated.is_empty() && !buf.is_empty() {
-            if let Ok(parsed) = serde_json::from_slice::<OpenAiResponse>(&buf) {
+        if accumulated.is_empty() && !raw_tail.is_empty() {
+            if let Ok(parsed) = serde_json::from_slice::<OpenAiResponse>(&raw_tail) {
                 accumulated = parsed
                     .choices
                     .first()
@@ -441,5 +492,46 @@ mod tests {
         };
         let j = serde_json::to_string(&req).unwrap();
         assert!(j.contains("\"stream\":true"), "got {j}");
+    }
+
+    // httptest 0.15 仅支持整体 body 响应（无 body_from_fn），无法逐 chunk 慢发；
+    // 跨 feed 边界切割由 stream.rs 的 SseDecoder 单测覆盖，此处验证
+    // CRLF 分帧 / 无空格 data: / 注释行 / [DONE] 经真实 HTTP 栈端到端可达。
+    #[tokio::test]
+    async fn openai_call_stream_parses_crlf_events_over_http() {
+        use httptest::{matchers::*, responders::*, Expectation, Server};
+        let mut server = Server::run();
+        let url_trimmed = server.url_str("").trim_end_matches('/').to_string();
+        let sse = concat!(
+            ": keep-alive\r\n\r\n",
+            "data:{\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"llo\"},\"finish_reason\":\"stop\"}]}\r\n\r\n",
+            "data: [DONE]\r\n\r\n",
+        );
+        server.expect(
+            Expectation::matching(request::path("/v1/chat/completions")).respond_with(
+                status_code(200)
+                    .insert_header("Content-Type", "text/event-stream")
+                    .body(sse),
+            ),
+        );
+        let p = OpenAiProvider::new();
+        let req = LlmRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![user_msg("hi")],
+            api_url: format!("{url_trimmed}/v1"),
+            api_key: Some(secrecy::SecretString::new("sk-test".to_string())),
+            ..Default::default()
+        };
+        let mut chunks: Vec<StreamChunk> = Vec::new();
+        let mut on_chunk = |chunk: StreamChunk| chunks.push(chunk);
+        let resp = p.call_stream(&req, &mut on_chunk).await.unwrap();
+        assert_eq!(resp.content, "hello");
+        assert_eq!(resp.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(chunks.len(), 3, "Delta x2 + Done: {chunks:?}");
+        assert!(matches!(&chunks[0], StreamChunk::Delta(s) if s == "he"));
+        assert!(matches!(&chunks[1], StreamChunk::Delta(s) if s == "llo"));
+        assert!(matches!(chunks.last(), Some(StreamChunk::Done)));
+        server.verify_and_clear();
     }
 }

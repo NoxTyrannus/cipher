@@ -1,7 +1,7 @@
 use super::error::map_reqwest_error;
 use super::message::{normalize_with_system, ChatMessage};
 use super::provider::{LlmProvider, LlmRequest, LlmResponse, Usage};
-use super::stream::{find_double_newline, StreamChunk};
+use super::stream::{SseDecoder, StreamChunk};
 use crate::common::{AgentError, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -17,9 +17,12 @@ pub struct ResponsesProvider {
 
 impl ResponsesProvider {
     pub fn new() -> Self {
+        // 不设客户端级总超时（旧 90s 会掐断 >90s 的流式生成）：流式 body 改由
+        // read_timeout 做「单次读空闲」保护（容忍慢推理模型的首 token 延迟）；
+        // 非流式 call 在 RequestBuilder 上加请求级 90s 总超时，维持原行为。
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(90))
+            .read_timeout(Duration::from_secs(300))
             .build()
             .expect("reqwest client build");
         Self { client }
@@ -166,15 +169,18 @@ struct ResponsesIncompleteDetails {
 }
 
 /// D3 纯函数：Responses API 的 `status` + `incomplete_details.reason` → finish_reason。
-/// `incomplete`（长度类截断）映射为 `"length"`；其余（completed / 缺失）为 None。
-/// 其他 incomplete 原因（如 content_filter）按原值透传，不冒充 length。
+/// `incomplete` 且原因为长度类（max_output_tokens / length 字面）映射为 `"length"`；
+/// 原因缺失（reason=None）时无法断定是长度截断，返回 `"incomplete"` 原值，
+/// 避免下游误加「（截断）」标记；其余原因（如 content_filter）按原值透传，不冒充
+/// length。completed / 缺失 status 为 None。
 fn map_responses_finish_reason(
     status: Option<&str>,
     incomplete_reason: Option<&str>,
 ) -> Option<String> {
     match status {
         Some("incomplete") => Some(match incomplete_reason {
-            Some("max_output_tokens") | Some("length") | None => "length".to_string(),
+            Some("max_output_tokens") | Some("length") => "length".to_string(),
+            None => "incomplete".to_string(),
             Some(other) => other.to_string(),
         }),
         _ => None,
@@ -327,6 +333,7 @@ impl LlmProvider for ResponsesProvider {
         let resp = match self
             .client
             .post(&url)
+            .timeout(Duration::from_secs(90))
             .header("Authorization", format!("Bearer {api_key}"))
             .header("Content-Type", "application/json")
             .json(&body)
@@ -339,6 +346,7 @@ impl LlmProvider for ResponsesProvider {
                 let body = build_responses_request(req, false);
                 self.client
                     .post(&url)
+                    .timeout(Duration::from_secs(90))
                     .header("Authorization", format!("Bearer {api_key}"))
                     .header("Content-Type", "application/json")
                     .json(&body)
@@ -443,28 +451,29 @@ impl LlmProvider for ResponsesProvider {
 
         let mut accumulated = String::new();
         let mut stream_usage: Option<Usage> = None;
-        let mut buf: Vec<u8> = Vec::new();
+        let mut decoder = SseDecoder::new();
+        let mut stopped = false;
 
         let mut byte_stream = stream_resp.bytes_stream();
-        'stream: while let Some(chunk_result) = byte_stream.next().await {
-            let chunk = chunk_result.map_err(|e| map_reqwest_error(e, PROVIDER_NAME))?;
-            buf.extend_from_slice(&chunk);
-
-            while let Some(pos) = find_double_newline(&buf) {
-                let event_bytes = buf[..pos].to_vec();
-                buf = buf[pos + 2..].to_vec();
-                let event_str = String::from_utf8_lossy(&event_bytes);
-
-                for line in event_str.lines() {
-                    let Some(data) = line.strip_prefix("data: ") else {
-                        continue;
-                    };
-                    if data.is_empty() {
-                        continue;
-                    }
-                    match process_sse_data(data, &mut accumulated, &mut stream_usage, on_chunk)? {
-                        SseEventOutcome::Continue => {}
-                        SseEventOutcome::Stop => break 'stream,
+        while !stopped {
+            let events = match byte_stream.next().await {
+                Some(Ok(chunk)) => decoder.feed(&chunk),
+                Some(Err(e)) => return Err(map_reqwest_error(e, PROVIDER_NAME)),
+                None => {
+                    // EOF：解码器收尾（无空行结尾的残留事件仍按事件分发）。
+                    stopped = true;
+                    decoder.finish()
+                }
+            };
+            for data in events {
+                if data.is_empty() {
+                    continue;
+                }
+                match process_sse_data(&data, &mut accumulated, &mut stream_usage, on_chunk)? {
+                    SseEventOutcome::Continue => {}
+                    SseEventOutcome::Stop => {
+                        stopped = true;
+                        break;
                     }
                 }
             }
@@ -754,6 +763,55 @@ mod tests {
         assert_eq!(p.name(), "Responses API");
     }
 
+    // httptest 0.15 仅支持整体 body 响应（无 body_from_fn），无法逐 chunk 慢发；
+    // 跨 feed 边界切割由 stream.rs 的 SseDecoder 单测覆盖，此处验证
+    // CRLF 分帧 / 无空格 data: / event: 字段行忽略经真实 HTTP 栈端到端可达。
+    #[tokio::test]
+    async fn responses_call_stream_parses_crlf_events_over_http() {
+        use httptest::{matchers::*, responders::*, Expectation, Server};
+        let mut server = Server::run();
+        let url_trimmed = server.url_str("").trim_end_matches('/').to_string();
+        let sse = concat!(
+            ": keep-alive\r\n\r\n",
+            "event: response.output_text.delta\r\n",
+            "data:{\"type\":\"response.output_text.delta\",\"delta\":\"he\"}\r\n\r\n",
+            "data:{\"type\":\"response.output_text.delta\",\"delta\":\"llo\"}\r\n\r\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\r\n\r\n",
+        );
+        server.expect(
+            Expectation::matching(request::path("/v1/responses")).respond_with(
+                status_code(200)
+                    .insert_header("Content-Type", "text/event-stream")
+                    .body(sse),
+            ),
+        );
+        let p = ResponsesProvider::new();
+        let req = LlmRequest {
+            model: "gpt-5".to_string(),
+            messages: vec![ChatMessage::User {
+                text: "hi".to_string(),
+            }],
+            api_url: url_trimmed,
+            api_key: Some(secrecy::SecretString::new("sk-test".to_string())),
+            ..Default::default()
+        };
+        let mut chunks: Vec<StreamChunk> = Vec::new();
+        let mut on_chunk = |chunk: StreamChunk| chunks.push(chunk);
+        let resp = p.call_stream(&req, &mut on_chunk).await.unwrap();
+        assert_eq!(resp.content, "hello");
+        let usage = resp.usage.expect("completed usage");
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            (1, 2, 3)
+        );
+        assert_eq!(chunks.len(), 3, "Delta x2 + Done: {chunks:?}");
+        server.verify_and_clear();
+    }
+
     // ---- D3：finish_reason 解析（status + incomplete_details.reason）----
 
     #[test]
@@ -778,7 +836,9 @@ mod tests {
     }
 
     #[test]
-    fn responses_json_incomplete_without_details_maps_to_length() {
+    fn responses_json_incomplete_without_details_maps_to_incomplete() {
+        // reason 缺失时无法断定是长度截断，返回 "incomplete" 原值，
+        // 不冒充 length（下游仅对 "length" 加截断标记）。
         let body = r#"{"status": "incomplete", "output": []}"#;
         let parsed: ResponsesApiResponse = serde_json::from_str(body).unwrap();
         assert_eq!(
@@ -789,8 +849,22 @@ mod tests {
                     .as_ref()
                     .and_then(|d| d.reason.as_deref()),
             ),
-            Some("length".to_string()),
-            "incomplete 无 incomplete_details（或 reason=length 字面）→ length"
+            Some("incomplete".to_string()),
+            "incomplete 无 incomplete_details → incomplete（不臆造 length）"
+        );
+        // incomplete_details 存在但 reason 为 null：同样视为原因缺失。
+        let body = r#"{"status": "incomplete", "incomplete_details": {}, "output": []}"#;
+        let parsed: ResponsesApiResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            map_responses_finish_reason(
+                parsed.status.as_deref(),
+                parsed
+                    .incomplete_details
+                    .as_ref()
+                    .and_then(|d| d.reason.as_deref()),
+            ),
+            Some("incomplete".to_string()),
+            "incomplete + reason=null → incomplete"
         );
     }
 
@@ -822,6 +896,11 @@ mod tests {
         assert_eq!(
             map_responses_finish_reason(Some("incomplete"), Some("content_filter")),
             Some("content_filter".to_string())
+        );
+        // "length" 字面仍归一化为 length。
+        assert_eq!(
+            map_responses_finish_reason(Some("incomplete"), Some("length")),
+            Some("length".to_string())
         );
     }
 }
