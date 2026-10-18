@@ -39,6 +39,12 @@ pub const BUILTIN_EXECUTORS: &[&str] = &[
     "builtin:usage_method.observe",
     "builtin:method.invoke",
     "builtin:web.fetch.public",
+    // v0.5.11 B2：permission.* 种子能力存在但曾不在白名单——行被清后无法经
+    // import 恢复，补齐；B3：完成状态台账分子。
+    "builtin:permission.grant",
+    "builtin:permission.revoke",
+    "builtin:ledger.read",
+    "builtin:ledger.write",
 ];
 
 fn fail(msg: impl Into<String>) -> Result<Value, String> {
@@ -98,6 +104,28 @@ pub fn capability_import(
     let usage_rows = array(args, "usage_methods");
     if base_rows.is_empty() && comp_rows.is_empty() && usage_rows.is_empty() {
         return fail("capability.import: at least one definition array must be non-empty");
+    }
+
+    // v0.5.11 B2 收口（校验先行，写入前拒绝）：subagent 实例（mode='subagent'）的
+    // 授权直写 agent 表会绕开 permission_grants 审计与回收语义（E1 实测中转链断裂后
+    // 这里成了唯一裸通路）；实例授权请经 permission.grant（审计+回收）或创建时经
+    // 模板 allowlist 子集裁剪。其他目标（'agent'/平台行）保持原行为。
+    let grant_to_agent = args.get("grant_to_agent").and_then(|v| v.as_str());
+    if let Some(agent_id) = grant_to_agent.filter(|s| !s.trim().is_empty()) {
+        let target_mode: Option<String> = conn
+            .query_row(
+                "SELECT mode FROM agent WHERE id = ?",
+                duckdb::params![agent_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("capability.import: read target agent '{agent_id}' mode: {e}"))?;
+        if target_mode.as_deref() == Some("subagent") {
+            return fail(format!(
+                "capability.import: grant_to_agent '{agent_id}' 是 subagent 实例 \
+                 （mode='subagent'），实例授权请经 permission.grant 或模板 allowlist，\
+                 不得经 import 直写"
+            ));
+        }
     }
 
     // 1) 先校验，全部通过才写入（原子导入）。
@@ -187,7 +215,7 @@ pub fn capability_import(
     }
 
     // 3) 可选授权：导入的能力同时授予指定 agent（自迭代闭环）。
-    let grant_to_agent = args.get("grant_to_agent").and_then(|v| v.as_str());
+    // （subagent 实例目标已在头部校验阶段拒绝，见上。）
     if let Some(agent_id) = grant_to_agent.filter(|s| !s.trim().is_empty()) {
         let mut caps: Vec<String> = imported_base
             .iter()
@@ -473,8 +501,8 @@ mod tests {
                     "id": "echo.test",
                     "name": "Echo Test",
                     "description": "echo",
-                    "schema_in": {"type":"object"},
-                    "schema_out": {"type":"object"},
+                    "schema_in": {"type": "object"},
+                    "schema_out": {"type": "object"},
                     "executor": "builtin:shell.exec",
                     "version": "1.0.0"
                 }]
@@ -484,5 +512,90 @@ mod tests {
         assert_eq!(out["success"], true);
         let caps = load_agent_capability_allowlist(&conn, "agent").unwrap();
         assert!(caps.contains(&"echo.test".to_string()));
+    }
+
+    /// B2（v0.5.11）收口两态：非实例目标（'agent'/平台行）照常授权；
+    /// subagent 实例（mode='subagent'）拒绝且不写任何行。
+    #[test]
+    fn import_grant_to_subagent_instance_rejected() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        crate::data::duckdb::schema::create_all_tables(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO agent (id,name,mode,capability_allowlist,is_default) VALUES \
+             ('sub-1','Sub Instance','subagent','[\"file.read\"]',false); \
+             INSERT INTO agent (id,name,mode,capability_allowlist,is_default) VALUES \
+             ('plat','Platform','platform','[]',false);",
+        )
+        .unwrap();
+        let out = capability_import(
+            &conn,
+            &None,
+            &serde_json::json!({
+                "grant_to_agent": "sub-1",
+                "base_capabilities": [{
+                    "id": "echo.inst",
+                    "name": "Echo Inst",
+                    "description": "echo",
+                    "schema_in": {"type": "object"},
+                    "schema_out": {"type": "object"},
+                    "executor": "builtin:shell.exec",
+                    "version": "1.0.0"
+                }]
+            }),
+        )
+        .unwrap();
+        assert_eq!(out["success"], false, "实例目标应被拒绝");
+        let error = out["error"].as_str().unwrap();
+        assert!(
+            error.contains("permission.grant"),
+            "错误应指向实例授权通路: {error}"
+        );
+        // 原子性：校验先行，拒绝后能力行与实例 allowlist 均未写入。
+        let cap_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM base_capability WHERE id = 'echo.inst'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cap_count, 0, "拒绝后不得有写入残留");
+        let caps = load_agent_capability_allowlist(&conn, "sub-1").unwrap();
+        assert_eq!(caps, vec!["file.read".to_string()]);
+
+        // 对照：平台行（非实例）保持原授权行为。
+        let out = capability_import(
+            &conn,
+            &None,
+            &serde_json::json!({
+                "grant_to_agent": "plat",
+                "base_capabilities": [{
+                    "id": "echo.inst",
+                    "name": "Echo Inst",
+                    "description": "echo",
+                    "schema_in": {"type": "object"},
+                    "schema_out": {"type": "object"},
+                    "executor": "builtin:shell.exec",
+                    "version": "1.0.0"
+                }]
+            }),
+        )
+        .unwrap();
+        assert_eq!(out["success"], true, "平台行应照常授权");
+        let caps = load_agent_capability_allowlist(&conn, "plat").unwrap();
+        assert!(caps.contains(&"echo.inst".to_string()));
+    }
+
+    /// B2/B3（v0.5.11）：permission.* 与 ledger.* 进入 BUILTIN_EXECUTORS 白名单，
+    /// 行被清后可经 import 恢复。
+    #[test]
+    fn builtin_executors_cover_permission_and_ledger() {
+        for id in [
+            "builtin:permission.grant",
+            "builtin:permission.revoke",
+            "builtin:ledger.read",
+            "builtin:ledger.write",
+        ] {
+            assert!(BUILTIN_EXECUTORS.contains(&id), "缺少 {id}");
+        }
     }
 }

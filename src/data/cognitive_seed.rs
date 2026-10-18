@@ -17,7 +17,9 @@ const CAPABILITY_SEED_DIR: &str = "seed/capabilities";
 /// 版本判定只作用于 `base_capabilities.json`（唯一版本化的种子文件）：
 /// - 新格式：`{"seed_version": N, "capabilities": [...]}`；
 /// - 旧格式（v0.4.6 及以前）：纯数组，视为 version 1 → 触发重写。
-pub const CAPABILITY_SEED_VERSION: u32 = 3;
+///
+/// v4（v0.5.11 B2/B3）：新增 ledger.read / ledger.write 能力行（完成状态台账）。
+pub const CAPABILITY_SEED_VERSION: u32 = 4;
 
 pub const COGNITIVE_SEED_MANIFEST: &str = include_str!("../../data/seed/cognitive/manifest.json");
 pub const COGNITIVE_SEED_NODES: &str = include_str!("../../data/seed/cognitive/nodes.json");
@@ -522,40 +524,82 @@ fn insert_memory_agent_row(
     Ok(())
 }
 
-/// 四 subagent 模板内置定义（id, display_name, lifecycle_kind, startup）——
+/// 七 subagent 模板内置定义（id, display_name, lifecycle_kind, startup, allowlist）——
 /// seed 与 upgrade_seed_deltas 共用。
-const SUBAGENT_TEMPLATE_DEFS: &[(&str, &str, &str, &str)] = &[
+///
+/// v0.5.11 B2 起 allowlist 按**模板**差异化：per-template 宽集是唯一可行的授权
+/// 路线（permission.grant 中转链断于 execution-platform，E1 实测）。前四个任务模板
+/// 共用 [`TEMPLATE_WIDE_ALLOWLIST`]；register/verify/inspect 三个专用模板持窄集。
+const SUBAGENT_TEMPLATE_DEFS: &[(&str, &str, &str, &str, &[&str])] = &[
     (
         "subagent.template.normal",
         "Normal Subagent Template",
         "temporary",
         "normal",
+        TEMPLATE_WIDE_ALLOWLIST,
     ),
     (
         "subagent.template.resident",
         "Resident Subagent Template",
         "resident",
         "normal",
+        TEMPLATE_WIDE_ALLOWLIST,
     ),
     (
         "subagent.template.scheduled",
         "Scheduled Subagent Template",
         "temporary",
         "scheduled",
+        TEMPLATE_WIDE_ALLOWLIST,
     ),
     (
         "subagent.template.condition",
         "Condition Subagent Template",
         "resident",
         "condition",
+        TEMPLATE_WIDE_ALLOWLIST,
+    ),
+    // v0.5.11 B2 三个专用模板（均 resident）：注册（自迭代能力导入）、验证
+    // （只读查询核对导入结果）、检查（记忆检索 + 台账读写 + 只读文件集）。
+    (
+        "subagent.template.register",
+        "Register Subagent Template",
+        "resident",
+        "normal",
+        &["capability.import"],
+    ),
+    (
+        "subagent.template.verify",
+        "Verify Subagent Template",
+        "resident",
+        "normal",
+        &["db.query"],
+    ),
+    (
+        "subagent.template.inspect",
+        "Inspect Subagent Template",
+        "resident",
+        "normal",
+        &[
+            "memory.retrieve",
+            "ledger.read",
+            "ledger.write",
+            "file.read",
+            "file.list",
+            "path.exists",
+            "text.grep",
+        ],
     ),
 ];
 
-/// 模板宽安全集（模板 = 类型封装 + 宽集；实例只做子集裁剪）。
+/// 任务模板宽安全集（模板 = 类型封装 + 宽集；实例只做子集裁剪）。
+/// v0.5.11 B2：追加 file.chunk_read（E3 实证：REA 轮次因 chunk_read 不在宽集导致
+/// 8k 缺口不可恢复；只读能力，风险面与 file.read 同级）。
 const TEMPLATE_WIDE_ALLOWLIST: &[&str] = &[
     "file.read",
     "file.list",
     "file.write",
+    "file.chunk_read",
     "path.exists",
     "text.grep",
     "shell.exec",
@@ -563,11 +607,13 @@ const TEMPLATE_WIDE_ALLOWLIST: &[&str] = &[
 
 /// 按内置定义构建模板行的（prompt, allowlist_json, config_json）——seed 与
 /// upgrade_seed_deltas 共用，保证两条路径写入的定义一致。
+/// `allowlist` 为该模板的授权宽集（v0.5.11 B2 起 per-template 差异化）。
 fn build_subagent_template_row(
     id: &str,
     name: &str,
     lifecycle: &str,
     startup: &str,
+    allowlist: &[&str],
 ) -> Result<(String, String, String)> {
     let trigger = match startup {
         "scheduled" => serde_json::json!({
@@ -596,26 +642,26 @@ fn build_subagent_template_row(
     let prompt = format!(
         "你是 subagent「{name}」，一个有最小记忆的异步工作单元。\n             ## 角色与任务边界\n             - 只处理执行中台分配的任务，不越界，不访问未授权能力，不创建/删除其他 subagent。\n             - 完成分配任务后立即以简报合同收口，不额外继续工作。\n             ## 能力调用规范\n             - 能力调用规范见系统提供的统一片段（capability_call.md 由运行时按需拼接），不要自行重写调用协议。\n             - 你只能调用 available_capabilities 中已授权的能力。\n             ## 运行方式\n             - 每轮从固定能力组选择 0/1/多个能力，多个调用按声明顺序依次执行；能力调用结果不回到本轮 LLM。\n             - 每轮只做一次模型调用。\n             ## 简报输出合同\n             - 任务完成时输出：{{\"done\": true, \"summary\": \"简明结果\"}}"
     );
-    let allowlist_json =
-        serde_json::to_string(&TEMPLATE_WIDE_ALLOWLIST.to_vec()).map_err(|error| {
-            AgentError::Parse(format!("serialize template allowlist for {id}: {error}"))
-        })?;
+    let allowlist_json = serde_json::to_string(&allowlist.to_vec()).map_err(|error| {
+        AgentError::Parse(format!("serialize template allowlist for {id}: {error}"))
+    })?;
     Ok((prompt, allowlist_json, config.to_string()))
 }
 
-/// 四个 subagent 模板行（§5.1 / §14）。
+/// 七个 subagent 模板行（§5.1 / §14）。
 ///
-/// `mode = 'subagent_template'`，可读不可改；capability_allowlist 为**宽安全集**
-/// （四个模板同宽集，实例创建时由实例 allowlist 只做子集裁剪，宽集上限允许任意
-/// 任务按需取用——保守性由实例设计裁剪承担，不再由模板窄集承担）；
-/// config.subagent 含 lifecycle/startup/trigger/memory_window_pct/briefing/预算字段。
+/// `mode = 'subagent_template'`，可读不可改；capability_allowlist 为该模板的授权
+/// **宽集**（任务模板四件套同宽集，register/verify/inspect 专用模板持窄集——
+/// v0.5.11 B2：per-template 宽集是唯一可行授权路线，实例创建时由实例 allowlist
+/// 只做子集裁剪，保守性由实例设计裁剪承担）；config.subagent 含
+/// lifecycle/startup/trigger/memory_window_pct/briefing/预算字段。
 /// 升级策略：`INSERT ... ON CONFLICT (id) DO UPDATE SET capability_allowlist`——
-/// 旧数据目录模板行（窄集）在 seed 时自动宽化为当前宽集（幂等，仅对已知四模板 id，
+/// 旧数据目录模板行在 seed 时自动升级为当前宽集（幂等，仅对已知模板 id，
 /// 不改用户自建模板行）。
 pub fn seed_subagent_templates(conn: &duckdb::Connection) -> Result<()> {
-    for (id, name, lifecycle, startup) in SUBAGENT_TEMPLATE_DEFS {
+    for (id, name, lifecycle, startup, allowlist) in SUBAGENT_TEMPLATE_DEFS {
         let (prompt, allowlist_json, config_json) =
-            build_subagent_template_row(id, name, lifecycle, startup)?;
+            build_subagent_template_row(id, name, lifecycle, startup, allowlist)?;
         conn.execute(
             "INSERT INTO agent (id, name, mode, prompt, capability_allowlist, config, display_name, is_default) \
              VALUES (?, ?, 'subagent_template', ?, CAST(? AS JSON), CAST(? AS JSON), ?, false) \
@@ -681,7 +727,10 @@ pub fn seed_platform_agents(conn: &duckdb::Connection) -> Result<()> {
     seed_execution_platform(conn)
 }
 
-/// execution-platform 内置能力集（v0.4.4 起：六个 subagent.* + permission.grant/revoke）。
+/// execution-platform 内置能力集
+/// （v0.4.4 起：六个 subagent.* + permission.grant/revoke；
+///   v0.5.11 追加 ledger.read/write——IT-2 实测主 Agent 的台账读写经平台中转，
+///   平台无此二能力则收口/更新交付状态的编排动作整条被 capability_not_authorized 拒绝）。
 const EXECUTION_PLATFORM_CAPS: &[&str] = &[
     "subagent.create",
     "subagent.run",
@@ -692,6 +741,8 @@ const EXECUTION_PLATFORM_CAPS: &[&str] = &[
     "permission.grant",
     "permission.revoke",
     "method.invoke",
+    "ledger.read",
+    "ledger.write",
 ];
 
 /// execution-platform 平台行（v0.4.4）：六个 subagent.* + permission.grant/revoke。
@@ -780,9 +831,10 @@ fn insert_subagent_template_row(
     name: &str,
     lifecycle: &str,
     startup: &str,
+    allowlist: &[&str],
 ) -> Result<()> {
     let (prompt, allowlist_json, config_json) =
-        build_subagent_template_row(id, name, lifecycle, startup)?;
+        build_subagent_template_row(id, name, lifecycle, startup, allowlist)?;
     conn.execute(
         "INSERT INTO agent (id, name, mode, prompt, capability_allowlist, config, display_name, is_default) \
          VALUES (?, ?, 'subagent_template', ?, CAST(? AS JSON), CAST(? AS JSON), ?, false) \
@@ -796,7 +848,8 @@ fn insert_subagent_template_row(
 /// agent/模板缺失补插（v0.4.7，TA-C）：在 import_factory_defaults 之后调用。
 ///
 /// 遍历内置清单——平台 agents（execution-platform/insight-platform/capability-memory-agent）、
-/// 四记忆 agent、四 subagent 模板——注册表缺 id → 按内置定义插入行（含 config/allowlist）；
+/// 四记忆 agent、七 subagent 模板（v0.5.11 B2 含 register/verify/inspect）——注册表
+/// 缺 id → 按内置定义插入行（含 config/allowlist）；
 /// 已存在 → 不动（含用户手工修改，与 seed_* 的升级语义分离）；内置已删除的 id → 不动。
 /// 幂等（重复启动无副作用）。
 pub fn upgrade_seed_deltas(conn: &duckdb::Connection, _data_dir: &Path) -> Result<()> {
@@ -818,10 +871,11 @@ pub fn upgrade_seed_deltas(conn: &duckdb::Connection, _data_dir: &Path) -> Resul
             tracing::info!("upgrade_seed_deltas: inserted missing memory agent {id}");
         }
     }
-    // 3) 四 subagent 模板。
-    for (id, name, lifecycle, startup) in SUBAGENT_TEMPLATE_DEFS {
+    // 3) 七 subagent 模板（v0.5.11 B2：含 register/verify/inspect 三个专用模板；
+    //    缺 id 插入——已初始化的旧库经此升级路径拿到新模板，已有行不动）。
+    for (id, name, lifecycle, startup, allowlist) in SUBAGENT_TEMPLATE_DEFS {
         if !agent_row_exists(conn, id)? {
-            insert_subagent_template_row(conn, id, name, lifecycle, startup)?;
+            insert_subagent_template_row(conn, id, name, lifecycle, startup, allowlist)?;
             tracing::info!("upgrade_seed_deltas: inserted missing subagent template {id}");
         }
     }
@@ -1076,7 +1130,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(template_count, 4);
+        assert_eq!(template_count, 7);
         let platform_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM agent WHERE mode = 'platform'",
@@ -1095,7 +1149,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(template_count_after, 4);
+        assert_eq!(template_count_after, 7);
         let platform_count_after: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM agent WHERE mode = 'platform'",
@@ -1105,7 +1159,8 @@ mod tests {
             .unwrap();
         assert_eq!(platform_count_after, 3);
 
-        // 模板 allowlist 为宽安全集（四模板同宽集，实例只做子集裁剪）。
+        // 模板 allowlist 为宽安全集（四任务模板同宽集，实例只做子集裁剪；
+        // register/verify/inspect 专用窄集见专门测试）。
         let allowlist_text: Option<String> = conn
             .query_row(
                 "SELECT CAST(capability_allowlist AS VARCHAR) FROM agent                  WHERE id = 'subagent.template.normal'",
@@ -1124,6 +1179,7 @@ mod tests {
             "file.read",
             "file.list",
             "file.write",
+            "file.chunk_read",
             "path.exists",
             "text.grep",
             "shell.exec",
@@ -1181,7 +1237,7 @@ mod tests {
         import_factory_defaults(&conn, dir.path()).unwrap();
 
         let wide: serde_json::Value = serde_json::from_str(
-            r#"["file.read","file.list","file.write","path.exists","text.grep","shell.exec"]"#,
+            r#"["file.read","file.list","file.write","file.chunk_read","path.exists","text.grep","shell.exec"]"#,
         )
         .unwrap();
         for id in [
@@ -1202,9 +1258,135 @@ mod tests {
         }
     }
 
+    /// v0.5.11 B2：seed 后三个专用模板（register/verify/inspect）存在且持各自
+    /// 窄集；四任务模板持含 file.chunk_read 的宽集；全部 mode='subagent_template'。
+    #[test]
+    fn seed_registers_specialized_templates_with_per_template_allowlists() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        crate::data::duckdb::schema::create_all_tables(&conn).unwrap();
+        let dir = tempdir().unwrap();
+        ensure_default_capabilities(dir.path()).unwrap();
+        import_factory_defaults(&conn, dir.path()).unwrap();
+
+        let expected: &[(&str, &[&str])] = &[
+            ("subagent.template.register", &["capability.import"]),
+            ("subagent.template.verify", &["db.query"]),
+            (
+                "subagent.template.inspect",
+                &[
+                    "memory.retrieve",
+                    "ledger.read",
+                    "ledger.write",
+                    "file.read",
+                    "file.list",
+                    "path.exists",
+                    "text.grep",
+                ],
+            ),
+        ];
+        for (id, allowlist) in expected {
+            let (mode, caps_text, config_text): (String, String, String) = conn
+                .query_row(
+                    "SELECT mode, CAST(capability_allowlist AS VARCHAR), \
+                     COALESCE(CAST(config AS VARCHAR), '') FROM agent WHERE id = ?",
+                    duckdb::params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap_or_else(|e| panic!("{id} 应存在: {e}"));
+            assert_eq!(mode, "subagent_template", "{id} mode");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&caps_text).unwrap(),
+                serde_json::to_value(allowlist).unwrap(),
+                "{id} allowlist 应为专用窄集"
+            );
+            let config: serde_json::Value = serde_json::from_str(&config_text).unwrap();
+            assert_eq!(
+                config["subagent"]["lifecycle"], "resident",
+                "{id} 应为 resident"
+            );
+        }
+
+        // normal 模板宽集含 file.chunk_read（E3 缺口修复）。
+        let caps_text: Option<String> = conn
+            .query_row(
+                "SELECT CAST(capability_allowlist AS VARCHAR) FROM agent WHERE id = 'subagent.template.normal'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let allowlist: serde_json::Value = serde_json::from_str(&caps_text.unwrap()).unwrap();
+        let ids: Vec<&str> = allowlist
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(ids.contains(&"file.chunk_read"), "宽集缺 file.chunk_read");
+    }
+
+    /// v0.5.11 B2 升级路径：已初始化的旧库（无三个新模板）经 upgrade_seed_deltas
+    /// 补插新模板；已有行（含用户改过的 allowlist）不动。
+    #[test]
+    fn upgrade_seed_deltas_inserts_missing_specialized_templates_keeps_user_rows() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        crate::data::duckdb::schema::create_all_tables(&conn).unwrap();
+        let dir = tempdir().unwrap();
+        ensure_default_capabilities(dir.path()).unwrap();
+        import_factory_defaults(&conn, dir.path()).unwrap();
+
+        // 模拟旧库：删除三个新模板；并给 normal 一个用户自定义窄集。
+        conn.execute_batch(
+            "DELETE FROM agent WHERE id IN \
+             ('subagent.template.register', 'subagent.template.verify', 'subagent.template.inspect');",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE agent SET capability_allowlist = CAST(? AS JSON) \
+             WHERE id = 'subagent.template.normal'",
+            duckdb::params![r#"["file.read"]"#],
+        )
+        .unwrap();
+
+        upgrade_seed_deltas(&conn, dir.path()).unwrap();
+
+        // 新模板补插且 allowlist 为内置窄集。
+        let caps_text: String = conn
+            .query_row(
+                "SELECT CAST(capability_allowlist AS VARCHAR) FROM agent \
+                 WHERE id = 'subagent.template.register'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(caps_text, r#"["capability.import"]"#);
+
+        // 用户改过的 normal 行：upgrade 路径不覆盖（宽化由 seed_subagent_templates
+        // 的 DO UPDATE 负责，两条路径语义分离）。
+        let normal: String = conn
+            .query_row(
+                "SELECT CAST(capability_allowlist AS VARCHAR) FROM agent \
+                 WHERE id = 'subagent.template.normal'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(normal, r#"["file.read"]"#, "已有行不得被 upgrade 覆盖");
+
+        // 幂等。
+        upgrade_seed_deltas(&conn, dir.path()).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent WHERE mode = 'subagent_template'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 7);
+    }
+
     #[test]
     fn seed_templates_do_not_touch_custom_template_rows() {
-        // 仅已知四模板 id 宽化：用户自建模板行（同 mode，不同 id）不受影响。
+        // 仅已知内置模板 id 宽化/升级：用户自建模板行（同 mode，不同 id）不受影响。
         let conn = duckdb::Connection::open_in_memory().unwrap();
         crate::data::duckdb::schema::create_all_tables(&conn).unwrap();
         let dir = tempdir().unwrap();
@@ -1291,7 +1473,7 @@ mod tests {
         let allowlist: serde_json::Value = serde_json::from_str(&text.unwrap()).unwrap();
         assert_eq!(
             allowlist.as_array().unwrap().len(),
-            10,
+            12,
             "再次 seed 不得重复追加能力"
         );
     }
@@ -1513,16 +1695,16 @@ mod tests {
         assert_eq!(count, 1, "旧目录升级后注册表补齐 web.fetch.public");
     }
 
-    /// 最新目录（version 3 文件）：不重写——文件保持原样（用户/历史内容不被覆盖）。
+    /// 最新目录（当前版本文件）：不重写——文件保持原样（用户/历史内容不被覆盖）。
     #[test]
     fn latest_version_dir_not_rewritten() {
         let dir = tempdir().unwrap();
         ensure_default_capabilities(dir.path()).unwrap();
         let base_path = dir.path().join("seed/capabilities/base_capabilities.json");
 
-        // 篡改为另一个 version 3 内容（不含 web.fetch.public）——模拟已升级目录的本地状态。
+        // 篡改为另一个当前版本内容（不含 ledger.read）——模拟已升级目录的本地状态。
         let custom = serde_json::json!({
-            "seed_version": 3,
+            "seed_version": CAPABILITY_SEED_VERSION,
             "capabilities": [
                 {"id": "file.read", "name": "Read File", "type": "function",
                  "description": "custom", "schema_in": {}, "schema_out": {},
@@ -1541,7 +1723,7 @@ mod tests {
             Some(CAPABILITY_SEED_VERSION as u64),
             "最新版本文件保持原版本号"
         );
-        assert!(!text.contains("web.fetch.public"), "最新版本文件不得被重写");
+        assert!(!text.contains("ledger.read"), "最新版本文件不得被重写");
     }
 
     /// v2 → v3 升级（v0.4.8 种子版本迭代）：version 2 文件（旧 code.exec 描述、
