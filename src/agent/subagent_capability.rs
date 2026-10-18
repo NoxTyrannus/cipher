@@ -4,6 +4,8 @@
 //! - 持久生命周期状态机（任务书 §4.3）：`created -> idle ⇄ running`；
 //!   `running -> failed/idle`；`idle/failed -> sleeping`（仅 wake 回 idle）；
 //!   `idle/sleeping/failed -> tombstoned`（终态，幂等）。
+//!   B5-1（v0.5.11，方案 §3.1）：failed 终态在 invocation 闭合
+//!   （`close_subagent_invocation`）时自动转 tombstoned，超预算子代理自动清算。
 //! - 状态存 agent 表：`mode='subagent'` 实例行，`config.subagent.*` 承载生命周期/启动/预算。
 //! - 全局 invocation 事实日志（§4.5）：`<storage_root>/invocations/<id>.json`（不可变首文件）
 //!   + `<id>.result.json`（执行后闭合终态）。所有副作用前 `invocation.prewrite`，预写失败禁止副作用。
@@ -514,31 +516,62 @@ fn subagent_update(
             SubagentError::failed(format!("subagent.update prewrite failed: {error}"))
         })?;
 
+    // B5-3（v0.5.11）：updated_fields 只列「值真的变了」的字段——迭代前实测教训
+    // 「授权已更新 ≠ 已变更」：同值请求不计入；请求了但同值的字段进 unchanged_fields，
+    // 当 updated_fields 为空时以 warning 引导调用方。trigger 的 null 与缺省语义等价，
+    // 比较前归一化。
+    let normalize_trigger =
+        |value: &Option<serde_json::Value>| value.as_ref().filter(|v| !v.is_null()).cloned();
+    let mut updated_fields: Vec<&str> = Vec::new();
+    let mut unchanged_fields: Vec<&str> = Vec::new();
+    for (field, requested, changed) in [
+        (
+            "prompt",
+            args.get("prompt").is_some(),
+            new_prompt != instance.prompt,
+        ),
+        (
+            "capability_allowlist",
+            args.get("capability_allowlist").is_some(),
+            new_allowlist != instance.capability_allowlist,
+        ),
+        (
+            "startup",
+            args.get("startup").is_some(),
+            new_startup != current.startup,
+        ),
+        (
+            "trigger",
+            args.get("trigger").is_some(),
+            normalize_trigger(&new_trigger) != normalize_trigger(&current.trigger),
+        ),
+        (
+            "model_id",
+            args.get("model_id").is_some(),
+            new_model_id != current.model_id,
+        ),
+        (
+            "budget",
+            args.get("budget").is_some(),
+            new_budget != current.budget,
+        ),
+    ] {
+        if !requested {
+            continue;
+        }
+        if changed {
+            updated_fields.push(field);
+        } else {
+            unchanged_fields.push(field);
+        }
+    }
+
     // 4) persist：更新 prompt/config/updated_at。running 中只写持久行（冻结快照语义由 runtime 侧保证）。
     let mut updated_config = current.clone();
     updated_config.model_id = new_model_id;
     updated_config.startup = new_startup;
     updated_config.trigger = new_trigger;
     updated_config.budget = new_budget;
-    let mut updated_fields = Vec::new();
-    if args.get("prompt").is_some() {
-        updated_fields.push("prompt".to_string());
-    }
-    if args.get("capability_allowlist").is_some() {
-        updated_fields.push("capability_allowlist".to_string());
-    }
-    if args.get("startup").is_some() {
-        updated_fields.push("startup".to_string());
-    }
-    if args.get("trigger").is_some() {
-        updated_fields.push("trigger".to_string());
-    }
-    if args.get("model_id").is_some() {
-        updated_fields.push("model_id".to_string());
-    }
-    if args.get("budget").is_some() {
-        updated_fields.push("budget".to_string());
-    }
 
     persist_agent_row(
         conn,
@@ -552,12 +585,22 @@ fn subagent_update(
             .with_invocation(invocation_id.clone())
     })?;
 
+    // B5-3：全部请求字段均为同值时附加 warning（字段名 + 未变更原因）。
+    let only_noop_requested = updated_fields.is_empty() && !unchanged_fields.is_empty();
+    let mut output = serde_json::json!({
+        "subagent_id": subagent_id,
+        "lifecycle": updated_config.lifecycle,
+        "updated_fields": updated_fields,
+    });
+    if only_noop_requested {
+        output["warning"] = serde_json::Value::String(format!(
+            "{} 未变更（当前值与请求值相同）",
+            unchanged_fields.join("、")
+        ));
+    }
+
     Ok(MoleculeOutcome {
-        output: serde_json::json!({
-            "subagent_id": subagent_id,
-            "lifecycle": updated_config.lifecycle,
-            "updated_fields": updated_fields,
-        }),
+        output,
         final_state: "completed",
         invocation_id,
     })
@@ -607,13 +650,38 @@ fn subagent_run(
         }
     }
 
-    let task_input = args
-        .get("task_input")
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string)
-        .or_else(|| config.task_input.clone())
-        .unwrap_or_default();
+    // B5-4（v0.5.11，方案 §3）：task_input 引导式校验——区分「字段缺失」与「提供了但
+    // 为空串」两种文案，并附 schema 字段提示（字段名 / 期望类型 / 一句话示例），替代
+    // 原先放行空值、由 runtime 深处报干巴巴 "task_input is empty" 的行为。缺失时仍
+    // 回退创建时携带的 task_input。
+    const TASK_INPUT_HINT: &str =
+        "schema 提示：task_input（string，必填、非空）——本次运行的任务描述，\
+示例：{\"task_input\": \"请汇总 /data 下的销售数据并输出为 CSV\"}";
+    let task_input = match args.get("task_input") {
+        Some(serde_json::Value::String(text)) if !text.trim().is_empty() => text.clone(),
+        Some(serde_json::Value::String(_)) => {
+            return Err(SubagentError::rejected(format!(
+                "subagent.run: task_input 提供了但为空串（或纯空白），无法构成运行输入。{TASK_INPUT_HINT}"
+            )))
+        }
+        Some(_) => {
+            return Err(SubagentError::rejected(format!(
+                "subagent.run: task_input 类型错误（期望 string）。{TASK_INPUT_HINT}"
+            )))
+        }
+        None => match config
+            .task_input
+            .as_deref()
+            .filter(|fallback| !fallback.trim().is_empty())
+        {
+            Some(fallback) => fallback.to_string(),
+            None => {
+                return Err(SubagentError::rejected(format!(
+                    "subagent.run: task_input 字段缺失（本次参数未提供，创建时也未携带可回退的 task_input）。{TASK_INPUT_HINT}"
+                )))
+            }
+        },
+    };
 
     // 冻结本次 run 的定义快照。
     let definition = SubagentDefinition {
@@ -812,6 +880,35 @@ fn subagent_delete(
         }
     }
 
+    // B5-2（v0.5.11，方案 §3）：delete 前置台账检查——目标子代理 last_output 非空
+    // （持有产物）而 deliverable_ledger 中 owner_agent 命中 0 行时拒绝删除，引导先经
+    // ledger.write 登记或确认放弃；running 拒绝/幂等返回等既有语义不变。
+    if subagent_has_meaningful_output(storage_root, subagent_id) {
+        crate::data::migration::ensure_deliverable_ledger_table(conn).map_err(|error| {
+            SubagentError::failed(format!(
+                "subagent.delete ensure deliverable_ledger table: {error}"
+            ))
+        })?;
+        let ledger_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM deliverable_ledger WHERE owner_agent = ?",
+                duckdb::params![subagent_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                SubagentError::failed(format!(
+                    "subagent.delete deliverable_ledger count '{subagent_id}': {error}"
+                ))
+            })?;
+        if ledger_count == 0 {
+            return Err(SubagentError::rejected(format!(
+                "subagent.delete: 子代理 '{subagent_id}' 持有未登记台账的唯一产物\
+                 （last_output 非空，deliverable_ledger 中 owner_agent 命中 0 条），拒绝删除。\
+                 请先经 ledger.write 登记该产物，或确认放弃后再删除"
+            )));
+        }
+    }
+
     let invocation_id =
         prewrite_invocation(conn, storage_root, "subagent.delete", args).map_err(|error| {
             SubagentError::failed(format!("subagent.delete prewrite failed: {error}"))
@@ -842,6 +939,19 @@ fn subagent_delete(
         final_state: "completed",
         invocation_id,
     })
+}
+
+/// B5-2（v0.5.11）：目标子代理是否持有「唯一产物」（last_output 非空）。
+///
+/// 现成通路读 `<storage_root>/subagents/<id>/last_output.json`：summary 非空即视为持有
+/// 产物；文件缺失、创建占位（旧形态不可解析）或 summary 为空（run 受理的 running 占位）
+/// 均视为无产物（delete 放行）。
+fn subagent_has_meaningful_output(storage_root: &Path, subagent_id: &str) -> bool {
+    match crate::agent::subagent_memory::read_last_output(storage_root, subagent_id) {
+        Ok(Some(last)) => !last.summary.trim().is_empty(),
+        Ok(None) => false,
+        Err(_) => false,
+    }
 }
 
 fn method_invoke(
@@ -1529,6 +1639,13 @@ fn prewrite_invocation(
 /// B6（v0.5.11）：收口同时回填 method_call_audit 中该 subagent 关联 running 行的终态
 /// （按 result JSON 的 subagent_id 匹配；回填失败只告警，不影响 invocation 闭合的
 /// 返回语义——两条事实相互独立，均尽力写入）。
+///
+/// B5-1（v0.5.11，方案 §3.1）：`final_state == "failed"` 时自动把持久行
+/// failed -> tombstoned（+ `tombstoned_at`，软删语义）——超预算/终败子代理自动清算，
+/// 不再依赖 Agent 自觉调用 subagent.delete；记忆/last_output 文件保留供复盘。
+/// 守卫：仅当持久行当前 lifecycle == failed 才执行（TC 收口先写 failed 再闭合
+/// invocation，正常失败路径必然命中）；非 failed（成功实例的迟到失败回调、running、
+/// 已 tombstoned）一律不动。清算失败只告警，不影响 invocation 闭合的返回语义。
 pub fn close_subagent_invocation(
     duckdb: Option<&Arc<Mutex<duckdb::Connection>>>,
     storage_root: &Path,
@@ -1540,25 +1657,62 @@ pub fn close_subagent_invocation(
     let invocation = append_invocation_result(storage_root, invocation_id, final_state, error);
     if let Some(duckdb) = duckdb {
         match duckdb.lock() {
-            Ok(conn) => match finalize_method_call_audit(&conn, subagent_id, final_state, error) {
-                Ok(updated) if updated > 0 => {
-                    tracing::debug!(
-                        "method_call_audit backfill: {updated} row(s) -> terminal for {subagent_id}"
-                    );
+            Ok(conn) => {
+                match finalize_method_call_audit(&conn, subagent_id, final_state, error) {
+                    Ok(updated) if updated > 0 => {
+                        tracing::debug!(
+                            "method_call_audit backfill: {updated} row(s) -> terminal for {subagent_id}"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            "close_subagent_invocation: method_call_audit backfill failed: {e}"
+                        );
+                    }
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        "close_subagent_invocation: method_call_audit backfill failed: {e}"
-                    );
+                if final_state == "failed" {
+                    if let Err(e) = tombstone_failed_subagent_row(&conn, subagent_id) {
+                        tracing::warn!(
+                            "close_subagent_invocation: auto tombstone failed for {subagent_id}: {e}"
+                        );
+                    }
                 }
-            },
+            }
             Err(_) => tracing::warn!(
                 "close_subagent_invocation: duckdb lock poisoned, skip method_call_audit backfill"
             ),
         }
     }
     invocation
+}
+
+/// B5-1（v0.5.11，方案 §3.1）：终态失败自动 tombstone——把持久行 `failed -> tombstoned`
+/// 并写入 `tombstoned_at`（复用 subagent.delete 的软删语义；记忆/last_output 文件保留）。
+///
+/// 守卫（见 `close_subagent_invocation` 文档）：仅当当前 lifecycle == failed 执行，
+/// 天然幂等（tombstoned 后不再命中），并防迟到/错序回调误清算成功实例；
+/// 行不存在或非 subagent 行静默跳过。
+fn tombstone_failed_subagent_row(conn: &duckdb::Connection, subagent_id: &str) -> Result<()> {
+    let Some(row) = resolve_agent_row(conn, subagent_id)? else {
+        return Ok(());
+    };
+    if row.mode != "subagent" {
+        return Ok(());
+    }
+    let mut config = row.subagent_config()?;
+    if config.lifecycle != LIFECYCLE_FAILED {
+        return Ok(());
+    }
+    config.lifecycle = LIFECYCLE_TOMBSTONED.to_string();
+    config.tombstoned_at = Some(now_iso());
+    persist_agent_row(
+        conn,
+        &row.id,
+        &row.prompt,
+        &row.capability_allowlist,
+        &serde_json::json!({ "subagent": config }),
+    )
 }
 
 /// 执行后追加 invocation 终态（<id>.result.json），保持首文件不可变。
@@ -1827,10 +1981,7 @@ fn finalize_method_call_audit(
         .map_err(|e| AgentError::Bootstrap(format!("method_call_audit backfill prepare: {e}")))?;
     let rows = statement
         .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-            ))
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
         })
         .map_err(|e| AgentError::Bootstrap(format!("method_call_audit backfill query: {e}")))?;
     let candidates = rows
@@ -1850,8 +2001,8 @@ fn finalize_method_call_audit(
         if row_subagent_id != Some(subagent_id) {
             continue;
         }
-        let mut result_json = parsed
-            .unwrap_or_else(|| serde_json::json!({ "subagent_id": subagent_id }));
+        let mut result_json =
+            parsed.unwrap_or_else(|| serde_json::json!({ "subagent_id": subagent_id }));
         if let Some(object) = result_json.as_object_mut() {
             object.insert("status".into(), serde_json::json!(status));
             object.insert("final_state".into(), serde_json::json!(status));
@@ -2532,11 +2683,12 @@ mod tests {
         let output = create_default(&db, storage_root.path());
         let id = subagent_id(&output);
 
+        // B5-4：run 现要求 task_input（缺失/空串在分子层拒绝）。
         call(
             &db,
             storage_root.path(),
             "subagent.run",
-            serde_json::json!({"subagent_id": id}),
+            serde_json::json!({"subagent_id": id, "task_input": "demo task"}),
         )
         .unwrap();
         // running -> run rejected
@@ -2544,7 +2696,7 @@ mod tests {
             &db,
             storage_root.path(),
             "subagent.run",
-            serde_json::json!({"subagent_id": id}),
+            serde_json::json!({"subagent_id": id, "task_input": "demo task"}),
         );
         assert!(matches!(result, Err(AgentError::Parse(_))));
 
@@ -2580,7 +2732,7 @@ mod tests {
             &db,
             storage_root.path(),
             "subagent.run",
-            serde_json::json!({"subagent_id": id}),
+            serde_json::json!({"subagent_id": id, "task_input": "demo task"}),
         )
         .unwrap();
         // running -> sleep rejected
@@ -2657,7 +2809,7 @@ mod tests {
             &db,
             storage_root.path(),
             "subagent.run",
-            serde_json::json!({"subagent_id": id}),
+            serde_json::json!({"subagent_id": id, "task_input": "demo task"}),
         )
         .unwrap();
         // running -> delete rejected
@@ -2780,7 +2932,7 @@ mod tests {
             &db,
             storage_root.path(),
             "subagent.run",
-            serde_json::json!({"subagent_id": id}),
+            serde_json::json!({"subagent_id": id, "task_input": "demo task"}),
         )
         .unwrap();
 
@@ -3136,8 +3288,7 @@ mod tests {
         )
         .unwrap();
 
-        let (status, error, result_text) =
-            with_conn(&db, |conn| audit_row(conn, &method_call_id));
+        let (status, error, result_text) = with_conn(&db, |conn| audit_row(conn, &method_call_id));
         assert_ne!(status, "running");
         assert_eq!(status, "succeeded");
         assert!(error.is_none());
@@ -3161,10 +3312,7 @@ mod tests {
             with_conn(&db, |conn| audit_row(conn, &method_call_id));
         assert_eq!(status_again, "succeeded");
         assert!(error_again.is_none());
-        assert_eq!(
-            result_text_again, result_text,
-            "幂等回调不得改动已终态行"
-        );
+        assert_eq!(result_text_again, result_text, "幂等回调不得改动已终态行");
     }
 
     #[test]
@@ -3231,8 +3379,7 @@ mod tests {
             Some("provider exploded"),
         )
         .unwrap();
-        let (status, error, result_text) =
-            with_conn(&db, |conn| audit_row(conn, method_call_id));
+        let (status, error, result_text) = with_conn(&db, |conn| audit_row(conn, method_call_id));
         assert_eq!(status, "failed");
         assert_eq!(error.as_deref(), Some("provider exploded"));
         let result: serde_json::Value = serde_json::from_str(&result_text).unwrap();
@@ -3278,5 +3425,309 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600, "wrong permissions for {name}: {mode:o}");
         }
+    }
+
+    // ---- B5-1（v0.5.11）：超预算终败自动 tombstone ----
+
+    #[test]
+    fn close_failed_invocation_auto_tombstones_failed_row() {
+        let db = test_conn_arc();
+        let storage_root = tempfile::tempdir().unwrap();
+        let output = create_default(&db, storage_root.path());
+        let id = subagent_id(&output);
+
+        // 模拟 entry.rs 收口第一段：set_subagent_lifecycle(Failed)。
+        with_conn(&db, |conn| {
+            set_subagent_lifecycle(conn, &id, SubagentLifecycle::Failed).unwrap()
+        });
+        close_subagent_invocation(
+            Some(&db),
+            storage_root.path(),
+            &id,
+            "inv_b5_1_fail",
+            "failed",
+            Some("total run timeout"),
+        )
+        .unwrap();
+
+        let row = with_conn(&db, |conn| resolve_agent_row(conn, &id).unwrap().unwrap());
+        let config = row.subagent_config().unwrap();
+        assert_eq!(config.lifecycle, "tombstoned");
+        let first_tombstoned_at = config.tombstoned_at.clone();
+        assert!(
+            first_tombstoned_at.is_some(),
+            "tombstoned_at must be written"
+        );
+
+        // 幂等：重复 failed 回调不刷新 tombstoned_at（守卫：非 failed 不动）。
+        close_subagent_invocation(
+            Some(&db),
+            storage_root.path(),
+            &id,
+            "inv_b5_1_fail",
+            "failed",
+            Some("late duplicate"),
+        )
+        .unwrap();
+        let config_again = with_conn(&db, |conn| resolve_agent_row(conn, &id).unwrap().unwrap())
+            .subagent_config()
+            .unwrap();
+        assert_eq!(config_again.tombstoned_at, first_tombstoned_at);
+        assert_eq!(config_again.lifecycle, "tombstoned");
+
+        // 软删语义：记忆/last_output 文件仍保留供复盘。
+        let dir = storage_root.path().join("subagents").join(&id);
+        assert!(dir.join("memory.json").exists());
+        assert!(dir.join("last_output.json").exists());
+    }
+
+    #[test]
+    fn close_failed_invocation_skips_non_failed_rows() {
+        let db = test_conn_arc();
+        let storage_root = tempfile::tempdir().unwrap();
+
+        // idle 实例收到迟到失败回调（成功收口后的重复回调形态）：不误清算。
+        let output = create_default(&db, storage_root.path());
+        let id = subagent_id(&output);
+        close_subagent_invocation(
+            Some(&db),
+            storage_root.path(),
+            &id,
+            "inv_b5_1_late",
+            "failed",
+            Some("late duplicate after success"),
+        )
+        .unwrap();
+        let config = with_conn(&db, |conn| resolve_agent_row(conn, &id).unwrap().unwrap())
+            .subagent_config()
+            .unwrap();
+        assert_eq!(config.lifecycle, "idle", "非 failed 行不得被自动清算");
+        assert!(config.tombstoned_at.is_none());
+
+        // completed 收口同样不触发 tombstone。
+        close_subagent_invocation(
+            Some(&db),
+            storage_root.path(),
+            &id,
+            "inv_b5_1_late",
+            "completed",
+            None,
+        )
+        .unwrap();
+        let config = with_conn(&db, |conn| resolve_agent_row(conn, &id).unwrap().unwrap())
+            .subagent_config()
+            .unwrap();
+        assert_eq!(config.lifecycle, "idle");
+
+        // 不存在的 subagent：静默跳过，不报错。
+        close_subagent_invocation(
+            Some(&db),
+            storage_root.path(),
+            "sg_never_existed",
+            "inv_b5_1_ghost",
+            "failed",
+            Some("ghost"),
+        )
+        .unwrap();
+    }
+
+    // ---- B5-2（v0.5.11）：delete 前置台账检查 ----
+
+    #[test]
+    fn delete_ledger_gate_three_states() {
+        let db = test_conn_arc();
+        let storage_root = tempfile::tempdir().unwrap();
+        // 建表（Y 簇契约：crate::data::migration::ensure_deliverable_ledger_table）。
+        with_conn(&db, |conn| {
+            crate::data::migration::ensure_deliverable_ledger_table(conn).unwrap()
+        });
+
+        // 态三：无 last_output（仅有创建占位文件）→ 放行删除。
+        let clean = create_default(&db, storage_root.path());
+        let clean_id = subagent_id(&clean);
+        let deleted = call(
+            &db,
+            storage_root.path(),
+            "subagent.delete",
+            serde_json::json!({"subagent_id": clean_id}),
+        )
+        .unwrap();
+        assert_eq!(deleted["lifecycle"], "tombstoned");
+
+        // 态一：有 last_output（产物）无台账行 → 拒绝删除并引导登记。
+        let holder = create_default(&db, storage_root.path());
+        let holder_id = subagent_id(&holder);
+        crate::agent::subagent_memory::write_last_output(
+            storage_root.path(),
+            &holder_id,
+            "completed",
+            "唯一产物：销售数据汇总 CSV",
+        )
+        .unwrap();
+        let rejected = call(
+            &db,
+            storage_root.path(),
+            "subagent.delete",
+            serde_json::json!({"subagent_id": holder_id}),
+        )
+        .expect_err("unregistered output must block delete");
+        assert!(matches!(rejected, AgentError::Parse(_)));
+        let message = rejected.to_string();
+        assert!(
+            message.contains("deliverable_ledger"),
+            "应指向台账表: {message}"
+        );
+        assert!(
+            message.contains("ledger.write"),
+            "应引导经 ledger.write 登记: {message}"
+        );
+        // 拒绝后行未被软删。
+        let config = with_conn(&db, |conn| {
+            resolve_agent_row(conn, &holder_id).unwrap().unwrap()
+        })
+        .subagent_config()
+        .unwrap();
+        assert_eq!(config.lifecycle, "idle");
+        assert!(config.tombstoned_at.is_none());
+
+        // 态二：登记台账行（owner_agent 匹配）→ 放行删除。
+        with_conn(&db, |conn| {
+            conn.execute(
+                "INSERT INTO deliverable_ledger (id, item, state, owner_agent) \
+                 VALUES ('dl_test_1', '销售数据汇总 CSV', 'open', ?)",
+                duckdb::params![holder_id],
+            )
+            .unwrap();
+        });
+        let deleted = call(
+            &db,
+            storage_root.path(),
+            "subagent.delete",
+            serde_json::json!({"subagent_id": holder_id}),
+        )
+        .unwrap();
+        assert_eq!(deleted["lifecycle"], "tombstoned");
+        assert_eq!(deleted["archived"], true);
+    }
+
+    // ---- B5-3（v0.5.11）：update 返回强化 ----
+
+    #[test]
+    fn update_same_value_returns_empty_fields_with_warning() {
+        let db = test_conn_arc();
+        let storage_root = tempfile::tempdir().unwrap();
+        let output = create_default(&db, storage_root.path());
+        let id = subagent_id(&output);
+
+        // 同值 allowlist + 同值 model_id：请求了但值相同 → 空数组 + warning
+        // （迭代前实测教训：「授权已更新 ≠ 已变更」）。
+        let updated = call(
+            &db,
+            storage_root.path(),
+            "subagent.update",
+            serde_json::json!({
+                "subagent_id": id,
+                "capability_allowlist": ["file.read", "file.list", "path.exists", "text.grep"],
+                "model_id": MODEL_MINI,
+            }),
+        )
+        .unwrap();
+        assert_eq!(updated["updated_fields"], serde_json::json!([]));
+        let warning = updated["warning"].as_str().expect("warning must exist");
+        assert!(
+            warning.contains("capability_allowlist") && warning.contains("未变更"),
+            "warning 应点名未变更字段: {warning}"
+        );
+
+        // 真变更：字段列入数组，且不再附带 warning。
+        let updated = call(
+            &db,
+            storage_root.path(),
+            "subagent.update",
+            serde_json::json!({
+                "subagent_id": id,
+                "prompt": "真实变更的新角色",
+            }),
+        )
+        .unwrap();
+        assert_eq!(updated["updated_fields"], serde_json::json!(["prompt"]));
+        assert!(updated["warning"].is_null(), "有实际变更时不应有 warning");
+        let row = with_conn(&db, |conn| resolve_agent_row(conn, &id).unwrap().unwrap());
+        assert_eq!(row.prompt, "真实变更的新角色");
+    }
+
+    // ---- B5-4（v0.5.11）：run 参数引导式错误 ----
+
+    #[test]
+    fn run_task_input_guided_errors_distinguish_missing_and_empty() {
+        let db = test_conn_arc();
+        let storage_root = tempfile::tempdir().unwrap();
+        // 创建时未携带 task_input（无回退）。
+        let output = create_default(&db, storage_root.path());
+        let id = subagent_id(&output);
+        let invocation_files_before = count_invocation_files(storage_root.path());
+
+        // 态一：字段缺失。
+        let missing = call(
+            &db,
+            storage_root.path(),
+            "subagent.run",
+            serde_json::json!({"subagent_id": id}),
+        )
+        .expect_err("missing task_input must reject");
+        let missing_text = missing.to_string();
+        assert!(matches!(missing, AgentError::Parse(_)));
+        assert!(
+            missing_text.contains("task_input 字段缺失"),
+            "应指明字段缺失: {missing_text}"
+        );
+        assert!(
+            missing_text.contains("string") && missing_text.contains("示例"),
+            "应附 schema 字段提示（期望类型 + 示例）: {missing_text}"
+        );
+
+        // 态二：提供了但为空串/纯空白（与缺失文案区分）。
+        for empty in ["", "   "] {
+            let empty_result = call(
+                &db,
+                storage_root.path(),
+                "subagent.run",
+                serde_json::json!({"subagent_id": id, "task_input": empty}),
+            )
+            .expect_err("empty task_input must reject");
+            let empty_text = empty_result.to_string();
+            assert!(
+                empty_text.contains("空串") && !empty_text.contains("字段缺失"),
+                "空串文案应与缺失区分: {empty_text}"
+            );
+            assert!(
+                empty_text.contains("string") && empty_text.contains("示例"),
+                "应附 schema 字段提示: {empty_text}"
+            );
+        }
+
+        // 非字符串类型：引导到期望类型。
+        let typed = call(
+            &db,
+            storage_root.path(),
+            "subagent.run",
+            serde_json::json!({"subagent_id": id, "task_input": 42}),
+        )
+        .expect_err("non-string task_input must reject");
+        assert!(typed.to_string().contains("类型错误"));
+
+        // 拒绝发生在副作用前：生命周期仍 idle、无新增 invocation 事实。
+        assert_eq!(with_conn(&db, |conn| lifecycle_of(conn, &id)), "idle");
+        assert_eq!(
+            count_invocation_files(storage_root.path()),
+            invocation_files_before,
+            "拒绝不得产生 prewrite 副作用"
+        );
+    }
+
+    fn count_invocation_files(storage_root: &Path) -> usize {
+        std::fs::read_dir(storage_root.join("invocations"))
+            .map(|entries| entries.filter_map(|entry| entry.ok()).count())
+            .unwrap_or(0)
     }
 }
