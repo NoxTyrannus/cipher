@@ -59,12 +59,108 @@ pub struct CapabilityExecutor {
     web_allowed_domains: Vec<String>,
 }
 
-const ALLOWED_TABLES: &[&str] = &[
-    "base_capability",
-    "composite_capability",
-    "usage_method",
-    "agent",
-];
+/// db.* 内置能力可达的表白名单（v0.5.11 D3 缺省：移除 `agent` 表——注册表回读走
+/// 白名单收缩，agent 表不再经 db.* 可达；grant/seed/capability.import 等主链路
+/// 均直写 SQL，不经 db.*）。
+const ALLOWED_TABLES: &[&str] = &["base_capability", "composite_capability", "usage_method"];
+
+#[cfg(not(test))]
+fn is_allowed_table(table: &str) -> bool {
+    ALLOWED_TABLES.contains(&table)
+}
+
+/// 测试编译期额外放行 db.* 类型回读基线的探针表（生产构建不可见）。
+#[cfg(test)]
+fn is_allowed_table(table: &str) -> bool {
+    const TEST_TYPE_PROBE_TABLE: &str = "_db_query_type_probe";
+    ALLOWED_TABLES.contains(&table) || table == TEST_TYPE_PROBE_TABLE
+}
+
+/// 列名标识符校验（v0.5.11 A6）：db.insert 的 JSON key 与 db.update 的 SET 列
+/// 直接拼进 SQL，只放行 `[A-Za-z_][A-Za-z0-9_]*`，阻断经列名的 SQL 注入。
+fn validate_column_ident(cap: &str, column: &str) -> Result<()> {
+    let mut chars = column.chars();
+    let valid =
+        matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if valid {
+        Ok(())
+    } else {
+        Err(AgentError::Parse(format!(
+            "{cap}: invalid column name '{column}' (must match [A-Za-z_][A-Za-z0-9_]*)"
+        )))
+    }
+}
+
+/// where 子句守卫（v0.5.11 A6）：where 原样拼接进 SQL，SELECT 场景可嵌
+/// `IN (SELECT ...)` 子查询读到白名单外表（如 model 表的 key），因此 where 中
+/// 出现 "select"（大小写不敏感）即拒绝。这是务实加固，不是完整 SQL 解析。
+fn validate_where_clause(cap: &str, where_clause: &str) -> Result<()> {
+    if where_clause.to_ascii_lowercase().contains("select") {
+        return Err(AgentError::Parse(format!(
+            "{cap}: subqueries are not allowed in 'where'"
+        )));
+    }
+    Ok(())
+}
+
+/// db.query 行值 → JSON（v0.5.11 A6 类型修复）：按 duckdb `ValueRef` 类型映射，
+/// NULL 保持 null（不再变空串）、布尔/数值保型、TIMESTAMP 转 RFC3339（UTC）；
+/// 其余类型给可读字符串表示（Blob/Geometry 为 hex，Date 为 `YYYY-MM-DD`，
+/// Decimal 用 Display，Enum 用标签，List/Struct/Map 等容器用 Debug）。
+/// NaN/Infinity 浮点经 serde_json `From<f64>` 规则映射为 null（JSON 无非有限数）。
+fn duckdb_value_ref_to_json(value: duckdb::types::ValueRef<'_>) -> serde_json::Value {
+    use chrono::{DateTime, SecondsFormat, Utc};
+    use duckdb::types::ValueRef;
+    match value {
+        ValueRef::Null => serde_json::Value::Null,
+        ValueRef::Boolean(v) => serde_json::Value::Bool(v),
+        ValueRef::TinyInt(v) => serde_json::Value::from(i64::from(v)),
+        ValueRef::SmallInt(v) => serde_json::Value::from(i64::from(v)),
+        ValueRef::Int(v) => serde_json::Value::from(i64::from(v)),
+        ValueRef::BigInt(v) => serde_json::Value::from(v),
+        ValueRef::HugeInt(v) => i64::try_from(v)
+            .map(serde_json::Value::from)
+            .unwrap_or_else(|_| serde_json::Value::String(v.to_string())),
+        ValueRef::UTinyInt(v) => serde_json::Value::from(u64::from(v)),
+        ValueRef::USmallInt(v) => serde_json::Value::from(u64::from(v)),
+        ValueRef::UInt(v) => serde_json::Value::from(u64::from(v)),
+        ValueRef::UBigInt(v) => serde_json::Value::from(v),
+        ValueRef::UHugeInt(v) => u64::try_from(v)
+            .map(serde_json::Value::from)
+            .unwrap_or_else(|_| serde_json::Value::String(v.to_string())),
+        ValueRef::Float(v) => serde_json::Value::from(f64::from(v)),
+        ValueRef::Double(v) => serde_json::Value::from(v),
+        ValueRef::Text(bytes) => {
+            serde_json::Value::String(String::from_utf8_lossy(bytes).into_owned())
+        }
+        ValueRef::Timestamp(unit, raw) => {
+            let micros = unit.to_micros(raw);
+            DateTime::<Utc>::from_timestamp_micros(micros)
+                .map(|dt| {
+                    serde_json::Value::String(dt.to_rfc3339_opts(SecondsFormat::Micros, true))
+                })
+                .unwrap_or_else(|| {
+                    serde_json::Value::String(format!("(timestamp out of range: {raw})"))
+                })
+        }
+        ValueRef::Date32(days) => DateTime::<Utc>::from_timestamp(i64::from(days) * 86_400, 0)
+            .map(|dt| serde_json::Value::String(dt.format("%Y-%m-%d").to_string()))
+            .unwrap_or_else(|| serde_json::Value::String(format!("(date out of range: {days})"))),
+        ValueRef::Blob(bytes) | ValueRef::Geometry(bytes) => serde_json::Value::String(
+            bytes.iter().map(|b| format!("{b:02x}")).collect(),
+        ),
+        ValueRef::Decimal(v) => serde_json::Value::String(v.to_string()),
+        ValueRef::Enum(..) => serde_json::Value::String(
+            value
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|_| format!("{value:?}")),
+        ),
+        // Time64/Interval/List/Struct/Map/Array/Union 及未来新增类型。
+        other => serde_json::Value::String(format!("{other:?}")),
+    }
+}
 
 impl CapabilityExecutor {
     pub fn set_workspace_root(&self, workspace_root: &Path) {
@@ -395,7 +491,7 @@ impl CapabilityExecutor {
             .get("table")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AgentError::Parse("db.insert: missing 'table'".into()))?;
-        if !ALLOWED_TABLES.contains(&table) {
+        if !is_allowed_table(table) {
             return Err(AgentError::NotFound(format!(
                 "db.insert: table '{table}' not allowed"
             )));
@@ -403,14 +499,20 @@ impl CapabilityExecutor {
         let data = input
             .get("data")
             .ok_or_else(|| AgentError::Parse("db.insert: missing 'data'".into()))?;
+        let obj = data
+            .as_object()
+            .ok_or_else(|| AgentError::Parse("db.insert: data must be object".into()))?;
+        // A6：列名拼进 SQL 前做标识符白名单校验，阻断注入。
+        for column in obj.keys() {
+            validate_column_ident("db.insert", column)?;
+        }
         let db = self
             .duckdb
             .as_ref()
             .ok_or_else(|| AgentError::NotFound("db.insert: duckdb not configured".into()))?;
-        let conn = db.lock().unwrap();
-        let obj = data
-            .as_object()
-            .ok_or_else(|| AgentError::Parse("db.insert: data must be object".into()))?;
+        let conn = db.lock().map_err(|e| {
+            AgentError::Script(format!("builtin db.insert: lock poisoned: {e}"))
+        })?;
         let columns: Vec<&str> = obj.keys().map(|s| s.as_str()).collect();
         let placeholders: Vec<String> = (0..columns.len()).map(|i| format!("${}", i + 1)).collect();
         let sql = format!(
@@ -439,7 +541,7 @@ impl CapabilityExecutor {
             .get("table")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AgentError::Parse("db.update: missing 'table'".into()))?;
-        if !ALLOWED_TABLES.contains(&table) {
+        if !is_allowed_table(table) {
             return Err(AgentError::NotFound(format!(
                 "db.update: table '{table}' not allowed"
             )));
@@ -448,14 +550,21 @@ impl CapabilityExecutor {
             .get("data")
             .ok_or_else(|| AgentError::Parse("db.update: missing 'data'".into()))?;
         let where_clause = input.get("where").and_then(|v| v.as_str()).unwrap_or("1=1");
+        let obj = data
+            .as_object()
+            .ok_or_else(|| AgentError::Parse("db.update: data must be object".into()))?;
+        // A6：SET 列与 where 均拼进 SQL，先做标识符校验与子查询守卫。
+        for column in obj.keys() {
+            validate_column_ident("db.update", column)?;
+        }
+        validate_where_clause("db.update", where_clause)?;
         let db = self
             .duckdb
             .as_ref()
             .ok_or_else(|| AgentError::NotFound("db.update: duckdb not configured".into()))?;
-        let conn = db.lock().unwrap();
-        let obj = data
-            .as_object()
-            .ok_or_else(|| AgentError::Parse("db.update: data must be object".into()))?;
+        let conn = db.lock().map_err(|e| {
+            AgentError::Script(format!("builtin db.update: lock poisoned: {e}"))
+        })?;
         let set_clause: Vec<String> = obj
             .keys()
             .enumerate()
@@ -486,7 +595,7 @@ impl CapabilityExecutor {
             .get("table")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AgentError::Parse("db.delete: missing 'table'".into()))?;
-        if !ALLOWED_TABLES.contains(&table) {
+        if !is_allowed_table(table) {
             return Err(AgentError::NotFound(format!(
                 "db.delete: table '{table}' not allowed"
             )));
@@ -495,11 +604,15 @@ impl CapabilityExecutor {
             .get("where")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AgentError::Parse("db.delete: missing 'where'".into()))?;
+        // A6：where 拼进 SQL 前做子查询守卫。
+        validate_where_clause("db.delete", where_clause)?;
         let db = self
             .duckdb
             .as_ref()
             .ok_or_else(|| AgentError::NotFound("db.delete: duckdb not configured".into()))?;
-        let conn = db.lock().unwrap();
+        let conn = db.lock().map_err(|e| {
+            AgentError::Script(format!("builtin db.delete: lock poisoned: {e}"))
+        })?;
         let sql = format!("DELETE FROM {table} WHERE {where_clause}");
         let rows = conn
             .execute(&sql, [])
@@ -513,17 +626,21 @@ impl CapabilityExecutor {
             .get("table")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AgentError::Parse("db.query: missing 'table'".into()))?;
-        if !ALLOWED_TABLES.contains(&table) {
+        if !is_allowed_table(table) {
             return Err(AgentError::NotFound(format!(
                 "db.query: table '{table}' not allowed"
             )));
         }
         let where_clause = input.get("where").and_then(|v| v.as_str()).unwrap_or("1=1");
+        // A6：where 拼进 SQL 前做子查询守卫，防 `IN (SELECT ...)` 读白名单外表。
+        validate_where_clause("db.query", where_clause)?;
         let db = self
             .duckdb
             .as_ref()
             .ok_or_else(|| AgentError::NotFound("db.query: duckdb not configured".into()))?;
-        let conn = db.lock().unwrap();
+        let conn = db.lock().map_err(|e| {
+            AgentError::Script(format!("builtin db.query: lock poisoned: {e}"))
+        })?;
         let sql = format!("SELECT * FROM {table} WHERE {where_clause}");
         let mut stmt = conn
             .prepare(&sql)
@@ -538,8 +655,10 @@ impl CapabilityExecutor {
                         .column_name(i)
                         .map(|s| s.to_string())
                         .unwrap_or_else(|_| "unknown".to_string());
-                    let val: String = row.get::<_, String>(i).unwrap_or_default();
-                    obj.insert(name, serde_json::Value::String(val));
+                    // A6：按 ValueRef 类型映射，INTEGER/BOOLEAN/TIMESTAMP/NULL 不再
+                    // 被吞成空串（损坏数据当成功返回）。
+                    let val = duckdb_value_ref_to_json(row.get_ref(i)?);
+                    obj.insert(name, val);
                 }
                 Ok(serde_json::Value::Object(obj))
             })
@@ -570,6 +689,7 @@ impl Default for CapabilityExecutor {
 mod tests {
     use super::*;
     use crate::data::duckdb::loader::BaseCapabilityRow;
+    use crate::data::duckdb::schema::create_all_tables;
 
     struct EchoCap;
     impl BaseCapability for EchoCap {
@@ -851,5 +971,179 @@ mod tests {
             Some("from-b"),
             "新任务使用新默认工作区"
         );
+    }
+
+    /// db.* 基线共用：内存库 + 全表 schema + 接线到 executor。
+    fn db_executor() -> CapabilityExecutor {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        create_all_tables(&conn).unwrap();
+        let mut ex = CapabilityExecutor::new();
+        ex.set_duckdb(Arc::new(std::sync::Mutex::new(conn)));
+        ex
+    }
+
+    /// A6 类型回读基线：INTEGER→number、BOOLEAN→bool、TIMESTAMP→RFC3339 字符串、
+    /// VARCHAR→string、NULL→null（不再变空串）。
+    #[test]
+    fn db_query_maps_column_types_to_json_types() {
+        let ex = db_executor();
+        {
+            let db = ex.duckdb.as_ref().unwrap();
+            let conn = db.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE _db_query_type_probe \
+                 (n INTEGER, b BOOLEAN, t TIMESTAMP, s VARCHAR, maybe_null INTEGER); \
+                 INSERT INTO _db_query_type_probe \
+                 VALUES (42, true, CAST('2026-10-18 12:34:56.789' AS TIMESTAMP), 'hello', NULL);",
+            )
+            .unwrap();
+        }
+        let out = ex
+            .builtin_db_query(&serde_json::json!({"table": "_db_query_type_probe"}))
+            .unwrap();
+        let rows = out["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["n"].as_i64(), Some(42), "INTEGER 必须回读为 number");
+        assert_eq!(row["b"], serde_json::json!(true), "BOOLEAN 必须回读为 bool");
+        let ts = row["t"].as_str().unwrap_or_default();
+        assert!(
+            ts.starts_with("2026-10-18T12:34:56.789"),
+            "TIMESTAMP 必须回读为 RFC3339 字符串: {ts}"
+        );
+        assert_eq!(
+            row["s"].as_str(),
+            Some("hello"),
+            "VARCHAR 必须回读为 string"
+        );
+        assert!(row["maybe_null"].is_null(), "NULL 必须回读为 null 而非空串");
+    }
+
+    /// db.insert / db.query 正常路径基线：白名单表可写可读，且缺省 TIMESTAMP/NULL
+    /// 列的类型回读正确（usage_method 的 NOT NULL 列全为 TEXT，规避 VARCHAR→JSON
+    /// 参数绑定的隐式转换变量）。
+    #[test]
+    fn db_insert_then_query_roundtrip_on_allowed_table() {
+        let ex = db_executor();
+        let out = ex
+            .builtin_db_insert(&serde_json::json!({
+                "table": "usage_method",
+                "data": {
+                    "id": "happy.usage",
+                    "capability_id": "file.read",
+                    "name": "Happy",
+                    "prompt": "how to read"
+                }
+            }))
+            .unwrap();
+        assert_eq!(out["rows_affected"], 1);
+
+        let out = ex
+            .builtin_db_query(&serde_json::json!({
+                "table": "usage_method",
+                "where": "id = 'happy.usage'"
+            }))
+            .unwrap();
+        let rows = out["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], serde_json::json!("happy.usage"));
+        assert_eq!(
+            rows[0]["prompt"].as_str(),
+            Some("how to read"),
+            "TEXT 列必须回读为 string"
+        );
+        assert!(rows[0]["examples"].is_null(), "NULL 列必须回读为 null");
+        assert!(
+            rows[0]["created_at"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("20"),
+            "TIMESTAMP 缺省必须回读为 RFC3339 字符串"
+        );
+    }
+
+    /// A6 列名注入：db.insert 的 JSON key / db.update 的 SET 列非
+    /// `[A-Za-z_][A-Za-z0-9_]*` 时拒绝，表不被破坏。
+    #[test]
+    fn db_insert_and_update_reject_invalid_column_names() {
+        let ex = db_executor();
+        let err = ex
+            .builtin_db_insert(&serde_json::json!({
+                "table": "base_capability",
+                "data": {"evil-col; DROP TABLE base_capability": "x"}
+            }))
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid column name"), "{err}");
+
+        let err = ex
+            .builtin_db_update(&serde_json::json!({
+                "table": "base_capability",
+                "data": {"ok_col": "1", "bad col": "2"}
+            }))
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid column name"), "{err}");
+
+        // 注入被拒后表仍完好可查。
+        assert!(ex
+            .builtin_db_query(&serde_json::json!({"table": "base_capability"}))
+            .is_ok());
+    }
+
+    /// A6 where 子查询守卫：query/update/delete 的 where 含 "select"
+    /// （大小写不敏感）即拒绝。
+    #[test]
+    fn db_query_update_delete_reject_subquery_in_where() {
+        let ex = db_executor();
+        let err = ex
+            .builtin_db_query(&serde_json::json!({
+                "table": "base_capability",
+                "where": "id IN (SELECT id FROM model)"
+            }))
+            .unwrap_err();
+        assert!(err.to_string().contains("subqueries are not allowed"), "{err}");
+
+        let err = ex
+            .builtin_db_update(&serde_json::json!({
+                "table": "base_capability",
+                "data": {"version": "9"},
+                "where": "id IN (SeLeCt id FROM model)"
+            }))
+            .unwrap_err();
+        assert!(err.to_string().contains("subqueries are not allowed"), "{err}");
+
+        let err = ex
+            .builtin_db_delete(&serde_json::json!({
+                "table": "base_capability",
+                "where": "id IN (SELECT api_key FROM model)"
+            }))
+            .unwrap_err();
+        assert!(err.to_string().contains("subqueries are not allowed"), "{err}");
+    }
+
+    /// A6/D3：agent 表移出 db.* 白名单后不可经 db.* 可达。
+    #[test]
+    fn db_builtins_reject_agent_table() {
+        let ex = db_executor();
+        let err = ex
+            .builtin_db_query(&serde_json::json!({"table": "agent"}))
+            .unwrap_err();
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        let err = ex
+            .builtin_db_insert(&serde_json::json!({
+                "table": "agent",
+                "data": {"id": "x", "name": "X", "mode": "subagent"}
+            }))
+            .unwrap_err();
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        let err = ex
+            .builtin_db_update(&serde_json::json!({
+                "table": "agent",
+                "data": {"name": "Y"},
+                "where": "id = 'x'"
+            }))
+            .unwrap_err();
+        assert!(err.to_string().contains("not allowed"), "{err}");
     }
 }
