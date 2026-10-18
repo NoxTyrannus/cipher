@@ -45,6 +45,8 @@ pub const BUILTIN_EXECUTORS: &[&str] = &[
     "builtin:permission.revoke",
     "builtin:ledger.read",
     "builtin:ledger.write",
+    // B4（v0.5.11）：多模式证据检索分子。
+    "builtin:evidence.check",
 ];
 
 fn fail(msg: impl Into<String>) -> Result<Value, String> {

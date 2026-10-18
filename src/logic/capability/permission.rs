@@ -54,8 +54,11 @@ pub fn execute(
 /// `permission.grant`：把一项 registry 能力授予 subagent 实例（宽集外叠加）。
 ///
 /// 校验（全部实时 DB）：target 必须为 mode='subagent' 且未 tombstoned 的实例；
-/// capability_id 必须为 registry 可执行 base contract；mode/ttl_secs 合法；
-/// 去重（allowlist 已含 → 拒绝，含「活跃授权必然伴随 allowlist 含」的重复活跃授权）。
+/// capability_id 必须为 registry 可执行 base **或 composite** contract（v0.5.11 B1：
+/// composite 授权后 execute_for_agent 仅校验调用者 allowlist 含 composite id 本身，
+/// 节点不查 allowlist——因此 grant 侧放行 composite 与执行侧语义对齐）；
+/// mode/ttl_secs 合法；去重（allowlist 已含 → 拒绝，含「活跃授权必然伴随
+/// allowlist 含」的重复活跃授权）。
 /// 行为：allowlist 追加 + 审计行（status=active）+ 返回授权记录 id。
 pub fn grant(conn: &duckdb::Connection, granter_agent: &str, input: &Value) -> Result<Value> {
     let obj = input
@@ -98,11 +101,15 @@ pub fn grant(conn: &duckdb::Connection, granter_agent: &str, input: &Value) -> R
         )));
     }
 
+    // B1c（v0.5.11）：能力存在性二选一——base 或 composite（enabled 且未 tombstone，
+    // 与执行侧 validate_base_authority / validate_composite_authority 语义一致）。
     let executable: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM base_capability \
-             WHERE id = ? AND enabled = true AND tombstoned_at IS NULL",
-            duckdb::params![capability_id],
+            "SELECT (SELECT COUNT(*) FROM base_capability \
+                      WHERE id = ? AND enabled = true AND tombstoned_at IS NULL) \
+                  + (SELECT COUNT(*) FROM composite_capability \
+                      WHERE id = ? AND enabled = true AND tombstoned_at IS NULL)",
+            duckdb::params![capability_id, capability_id],
             |row| row.get(0),
         )
         .map_err(|error| {
@@ -110,7 +117,7 @@ pub fn grant(conn: &duckdb::Connection, granter_agent: &str, input: &Value) -> R
         })?;
     if executable == 0 {
         return Err(AgentError::NotFound(format!(
-            "permission.grant: capability '{capability_id}' is not an executable registry contract"
+            "permission.grant: capability '{capability_id}' is not an executable registry contract (base or composite)"
         )));
     }
 
@@ -386,8 +393,12 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::duckdb::loader::Registry;
     use crate::data::duckdb::schema::create_all_tables;
+    use crate::logic::capability::executor::CapabilityExecutor;
+    use crate::logic::capability::service::{CapabilityCall, CapabilityService};
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
 
     fn memory_db() -> duckdb::Connection {
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -910,5 +921,414 @@ mod tests {
         assert_eq!(granter2, "sg-1");
         assert_eq!(target2, "sg-2");
         assert_eq!(cap2, "probe.run");
+    }
+
+    // ---- B1c（v0.5.11）：permission.grant 支持 composite contract ----
+
+    /// composite 契约可授予；disabled / tombstoned / 未知 id 拒绝。
+    #[test]
+    fn grant_accepts_composite_contract_and_rejects_disabled_or_unknown() {
+        let conn = memory_db();
+        seed_fixture(&conn);
+        conn.execute(
+            "INSERT INTO composite_capability \
+             (id, name, description, schema_in, schema_out, executor, dag, version, enabled) \
+             VALUES ('memory.settle.v1', 'settle', '', CAST(? AS JSON), CAST(? AS JSON), 'dag', CAST(? AS JSON), '1.0.0', true), \
+                    ('memory.dead.v1', 'dead', '', CAST(? AS JSON), CAST(? AS JSON), 'dag', CAST(? AS JSON), '1.0.0', false)",
+            duckdb::params![
+                r#"{"type":"object"}"#,
+                r#"{"type":"object"}"#,
+                "[]",
+                r#"{"type":"object"}"#,
+                r#"{"type":"object"}"#,
+                "[]",
+            ],
+        )
+        .unwrap();
+
+        let out = grant(
+            &conn,
+            "execution-platform",
+            &json!({
+                "target_agent_id": "sg-1",
+                "capability_id": "memory.settle.v1",
+                "mode": "one_shot",
+            }),
+        )
+        .unwrap();
+        assert_eq!(out["capability_id"], "memory.settle.v1");
+        assert_eq!(
+            allowlist_of(&conn, "sg-1"),
+            vec!["file.read", "memory.settle.v1"]
+        );
+
+        // disabled composite 拒绝。
+        let err = grant(
+            &conn,
+            "execution-platform",
+            &json!({
+                "target_agent_id": "sg-1",
+                "capability_id": "memory.dead.v1",
+                "mode": "one_shot",
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not an executable registry contract (base or composite)"),
+            "{err}"
+        );
+
+        // tombstoned composite 拒绝。
+        conn.execute(
+            "UPDATE composite_capability SET tombstoned_at = now() WHERE id = 'memory.settle.v1'",
+            [],
+        )
+        .unwrap();
+        let err = grant(
+            &conn,
+            "execution-platform",
+            &json!({
+                "target_agent_id": "sg-1",
+                "capability_id": "memory.settle.v1",
+                "mode": "one_shot",
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not an executable registry contract (base or composite)"),
+            "{err}"
+        );
+
+        // 未知 id 拒绝（错误文案更新后仍含既有断言关键字）。
+        let err = grant(
+            &conn,
+            "execution-platform",
+            &json!({
+                "target_agent_id": "sg-1",
+                "capability_id": "nope.composite",
+                "mode": "one_shot",
+            }),
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("not an executable registry contract"));
+    }
+
+    // ---- B1a（v0.5.11）：capability.self-register 端到端（任务二核心验收）----
+
+    type SelfRegisterEnv = (Registry, CapabilityExecutor, Arc<Mutex<duckdb::Connection>>);
+
+    /// 工厂种子（capability.import / db.query / ledger.write base 行 +
+    /// capability.self-register composite 行）镜像到内存 DuckDB，经
+    /// load_all_into_memory 构造真实 registry 快照（装配方式参考 service.rs
+    /// composite 执行测试 / permission_env）。
+    fn self_register_env(agent_rows: &[(&str, &str, &str, &[&str])]) -> SelfRegisterEnv {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        create_all_tables(&conn).unwrap();
+
+        let base_seed: serde_json::Value =
+            serde_json::from_str(crate::data::cognitive_seed::CAPABILITY_SEED_BASE).unwrap();
+        for row in base_seed["capabilities"].as_array().unwrap() {
+            let id = row["id"].as_str().unwrap_or_default();
+            if !["capability.import", "db.query", "ledger.write"].contains(&id) {
+                continue;
+            }
+            conn.execute(
+                "INSERT INTO base_capability \
+                 (id, name, type, description, schema_in, schema_out, executor, version, enabled, metadata) \
+                 VALUES (?, ?, ?, ?, CAST(? AS JSON), CAST(? AS JSON), ?, ?, ?, CAST(? AS JSON))",
+                duckdb::params![
+                    id,
+                    row["name"].as_str().unwrap_or(id),
+                    row["type"].as_str().unwrap_or("function"),
+                    row["description"].as_str().unwrap_or(""),
+                    row["schema_in"].to_string(),
+                    row["schema_out"].to_string(),
+                    row["executor"].as_str().unwrap_or(""),
+                    row["version"].as_str().unwrap_or("1.0.0"),
+                    row["enabled"].as_bool().unwrap_or(true),
+                    r#"{"partition":"system"}"#,
+                ],
+            )
+            .unwrap();
+        }
+
+        let comp_seed: serde_json::Value =
+            serde_json::from_str(crate::data::cognitive_seed::CAPABILITY_SEED_COMPOSITE).unwrap();
+        let self_register = comp_seed["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "capability.self-register")
+            .expect("composite 种子应含 capability.self-register")
+            .clone();
+        conn.execute(
+            "INSERT INTO composite_capability \
+             (id, name, description, schema_in, schema_out, executor, dag, version, enabled, metadata) \
+             VALUES (?, ?, ?, CAST(? AS JSON), CAST(? AS JSON), ?, CAST(? AS JSON), ?, ?, CAST(? AS JSON))",
+            duckdb::params![
+                self_register["id"].as_str().unwrap(),
+                self_register["name"].as_str().unwrap(),
+                self_register["description"].as_str().unwrap_or(""),
+                self_register["schema_in"].to_string(),
+                self_register["schema_out"].to_string(),
+                self_register["executor"].as_str().unwrap_or("dag"),
+                self_register["dag"].to_string(),
+                self_register["version"].as_str().unwrap_or("1.0.0"),
+                self_register["enabled"].as_bool().unwrap_or(true),
+                r#"{"partition":"factory"}"#,
+            ],
+        )
+        .unwrap();
+
+        for (id, name, mode, allowlist) in agent_rows {
+            let allowlist_json = serde_json::to_string(allowlist).unwrap();
+            conn.execute(
+                "INSERT INTO agent (id, name, mode, capability_allowlist, is_default) \
+                 VALUES (?, ?, ?, CAST(? AS JSON), false)",
+                duckdb::params![id, name, mode, allowlist_json],
+            )
+            .unwrap();
+        }
+
+        let db = Arc::new(Mutex::new(conn));
+        let mut executor = CapabilityExecutor::new();
+        executor.set_duckdb(db.clone());
+        let registry = {
+            let guard = db.lock().unwrap();
+            crate::data::duckdb::loader::load_all_into_memory(&guard).unwrap()
+        };
+        (registry, executor, db)
+    }
+
+    fn self_register_call(arguments: serde_json::Value) -> CapabilityCall {
+        CapabilityCall {
+            capability_id: "capability.self-register".to_string(),
+            capability_name: String::new(),
+            arguments,
+        }
+    }
+
+    fn probe_definition(capability_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "base_capabilities": [{
+                "id": capability_id,
+                "name": "Self Register Probe",
+                "description": "self-register 端到端探针",
+                "schema_in": {"type": "object"},
+                "schema_out": {"type": "object"},
+                "executor": "builtin:shell.exec",
+                "version": "1.0.0"
+            }],
+            "capability_id": capability_id,
+            "item": format!("注册探针能力 {capability_id} 并回读验证"),
+            "owner_agent": "reg-actor"
+        })
+    }
+
+    /// ① 正常路径：探针 base 能力注册 → verify rows 非空 → gate 通过 →
+    /// 台账单行 imported→verified（previous_state 链正确），证据无未解析标记。
+    #[test]
+    fn self_register_composite_happy_path_lands_verified_ledger() {
+        let (registry, executor, db) =
+            self_register_env(&[("reg-actor", "Reg", "unni", &["capability.self-register"])]);
+        let service = CapabilityService::new(&registry, &executor).unwrap();
+
+        let result = service
+            .execute_for_agent(
+                "reg-actor",
+                &self_register_call(probe_definition("probe.happy.cap")),
+            )
+            .unwrap();
+
+        // final = 拓扑末节点（ledger_verified）输出：verified 且从 imported 迁移。
+        assert_eq!(result.output["final"]["state"], "verified");
+        assert_eq!(result.output["final"]["previous_state"], "imported");
+        // 五节点依序执行，verify 节点回读到探针行。
+        let steps = result.output["steps"].as_array().unwrap();
+        let node_ids: Vec<&str> = steps.iter().map(|s| s["node"].as_str().unwrap()).collect();
+        assert_eq!(
+            node_ids,
+            vec![
+                "register",
+                "verify",
+                "gate",
+                "ledger_imported",
+                "ledger_verified"
+            ]
+        );
+        assert_eq!(steps[1]["output"]["rows"][0]["id"], "probe.happy.cap");
+
+        let conn = db.lock().unwrap();
+        // 注册表：探针 base 行 + gate 探针 usage 行落库。
+        let (base_n, usage_n): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM base_capability WHERE id = 'probe.happy.cap'), \
+                        (SELECT COUNT(*) FROM usage_method WHERE id = 'selfregister.probe.probe.happy.cap')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((base_n, usage_n), (1, 1));
+        // 台账：单行 verified、owner 正确、证据非空且无未解析标记。
+        let (state, owner, evidence): (String, Option<String>, String) = conn
+            .query_row(
+                "SELECT state, owner_agent, CAST(evidence_refs AS VARCHAR) FROM deliverable_ledger \
+                 WHERE item = '注册探针能力 probe.happy.cap 并回读验证'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "verified");
+        assert_eq!(owner.as_deref(), Some("reg-actor"));
+        assert!(
+            !evidence.contains("${"),
+            "证据不得残留未解析标记: {evidence}"
+        );
+        assert!(
+            !evidence.contains("$input."),
+            "证据不得残留未解析标记: {evidence}"
+        );
+        assert!(
+            evidence.contains("probe.happy.cap"),
+            "证据应含回读行摘要: {evidence}"
+        );
+        let ledger_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM deliverable_ledger", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(ledger_count, 1, "imported→verified 应是同一行推进");
+    }
+
+    /// ② 连坐门：capability_id 与真正注册的 id 不一致（空回读）→ gate 探针导入失败
+    /// → 整条 composite Err，台账零行、verified 不落账（注册本身如实发生）。
+    #[test]
+    fn self_register_composite_empty_readback_fails_wholesale() {
+        let (registry, executor, db) =
+            self_register_env(&[("reg-actor", "Reg", "unni", &["capability.self-register"])]);
+        let service = CapabilityService::new(&registry, &executor).unwrap();
+
+        // 定义注册 probe.happy.cap，却用 ghost.cap 回读——空回读。
+        let mut arguments = probe_definition("probe.happy.cap");
+        arguments["capability_id"] = json!("ghost.cap");
+        let error = service
+            .execute_for_agent("reg-actor", &self_register_call(arguments))
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("references unknown capability_id"),
+            "连坐门应由 gate 探针的存在性校验触发整条失败: {message}"
+        );
+
+        let conn = db.lock().unwrap();
+        let ledger_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM deliverable_ledger", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            ledger_count, 0,
+            "空回读不得落任何台账行（verified 不可凭回执落账）"
+        );
+        // gate 探针行未写入（capability.import 校验先行，原子拒绝）。
+        let probe_usage: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_method WHERE id = 'selfregister.probe.ghost.cap'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(probe_usage, 0);
+        // register 节点先执行：注册本身如实发生（诚实：已导入未验证）。
+        let base_n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM base_capability WHERE id = 'probe.happy.cap'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(base_n, 1);
+    }
+
+    /// 任务四端到端：grant composite one-shot → 子代理 allowlist 含该 id →
+    /// execute_for_agent 可执行该 composite → 成功后回收（审计 used + allowlist 移除）。
+    #[test]
+    fn one_shot_composite_grant_executes_and_reclaims() {
+        let (_initial_registry, _initial_executor, db) = self_register_env(&[
+            ("execution-platform", "Exec", "platform", &[]),
+            ("sg-c", "Sub C", "subagent", &[]),
+        ]);
+        // 未知 composite id 拒绝。
+        {
+            let conn = db.lock().unwrap();
+            let err = grant(
+                &conn,
+                "execution-platform",
+                &json!({
+                    "target_agent_id": "sg-c",
+                    "capability_id": "nope.composite",
+                    "mode": "one_shot",
+                }),
+            )
+            .unwrap_err();
+            assert!(err
+                .to_string()
+                .contains("not an executable registry contract"));
+            // 授予 composite：allowlist + active 审计。
+            grant(
+                &conn,
+                "execution-platform",
+                &json!({
+                    "target_agent_id": "sg-c",
+                    "capability_id": "capability.self-register",
+                    "mode": "one_shot",
+                }),
+            )
+            .unwrap();
+        }
+        // 真实 reload 语义：grant 落库后刷新 registry 快照。
+        let (registry, executor) = {
+            let conn = db.lock().unwrap();
+            let registry = crate::data::duckdb::loader::load_all_into_memory(&conn).unwrap();
+            let mut executor = CapabilityExecutor::new();
+            executor.set_duckdb(db.clone());
+            (registry, executor)
+        };
+        assert!(
+            registry
+                .agents
+                .get("sg-c")
+                .unwrap()
+                .capability_allowlist
+                .iter()
+                .any(|id| id == "capability.self-register"),
+            "授权后子代理 allowlist 应含 composite id"
+        );
+
+        let service = CapabilityService::new(&registry, &executor).unwrap();
+        let call = {
+            let mut arguments = probe_definition("probe.granted.cap");
+            arguments["owner_agent"] = json!("sg-c");
+            self_register_call(arguments)
+        };
+        let result = service.execute_for_agent("sg-c", &call).unwrap();
+        assert_eq!(result.output["final"]["state"], "verified");
+
+        // one-shot 回收：审计 used + allowlist 移除（持久层）。
+        let conn = db.lock().unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM permission_grants \
+                 WHERE target_agent = 'sg-c' AND capability_id = 'capability.self-register'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "used");
+        assert_eq!(allowlist_of(&conn, "sg-c"), Vec::<String>::new());
     }
 }

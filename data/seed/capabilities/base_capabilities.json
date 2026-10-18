@@ -1,5 +1,5 @@
 {
-  "seed_version": 4,
+  "seed_version": 5,
   "capabilities": [
     {
       "id": "file.read",
@@ -2029,8 +2029,7 @@
         "required": [
           "item",
           "state"
-        ],
-        "additionalProperties": false
+        ]
       },
       "schema_out": {
         "type": "object",
@@ -2069,6 +2068,91 @@
         "additionalProperties": false
       },
       "executor": "builtin:ledger.write",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "evidence.check",
+      "name": "Evidence Check",
+      "type": "function",
+      "description": "多模式证据检索（v0.5.11 B4）：按问题关键词在 log（invocations 事实文件 + method_call_audit）/ file（工作区浅层）/ web（显式 url 抓取）/ memory（全类型检索）各证据源独立检索命中片段。只报告 hit/evidence_ref/raw_excerpt，不做跨模式综合判断——结论由调用方基于证据自行做出",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "question": {
+            "type": "string",
+            "description": "要检索证据的问题（关键词子串匹配）"
+          },
+          "modes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "log",
+                "file",
+                "web",
+                "memory"
+              ]
+            },
+            "minItems": 1,
+            "description": "证据模式（去重；空数组拒绝）"
+          },
+          "url": {
+            "type": "string",
+            "description": "web 模式显式抓取目标（仅 https，需在 [web] allowed_domains 白名单内）；缺省 web 模式明确 miss"
+          }
+        },
+        "required": [
+          "question",
+          "modes"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "results": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "mode": {
+                  "type": "string"
+                },
+                "hit": {
+                  "type": "boolean"
+                },
+                "evidence_ref": {},
+                "raw_excerpt": {},
+                "note": {
+                  "type": "string"
+                },
+                "matches": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": [
+                "mode",
+                "hit"
+              ]
+            }
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "success",
+          "results"
+        ]
+      },
+      "executor": "builtin:evidence.check",
       "version": "1.0.0",
       "enabled": true,
       "partition": "system"

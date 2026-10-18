@@ -1,575 +1,728 @@
-[
-  {
-    "id": "capability.register",
-    "name": "Register Capability",
-    "description": "注册新的原子/分子能力到注册表",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "table": {
-          "type": "string"
+{
+  "seed_version": 2,
+  "capabilities": [
+    {
+      "id": "capability.register",
+      "name": "Register Capability",
+      "description": "注册新的原子/分子能力到注册表",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "table": {
+            "type": "string"
+          },
+          "data": {
+            "type": "object"
+          }
         },
-        "data": {
-          "type": "object"
-        }
-      },
-      "required": [
-        "table",
-        "data"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "capability_id": {
-          "type": "string"
-        },
-        "steps": {
-          "type": "array"
-        },
-        "final": {}
-      },
-      "required": [
-        "capability_id",
-        "steps",
-        "final"
-      ]
-    },
-    "executor": "dag",
-    "dag": [
-      {
-        "id": "insert",
-        "base_capability": "db.insert",
-        "depends_on": []
-      }
-    ],
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "capability.update",
-    "name": "Update Capability",
-    "description": "更新注册表中的能力定义",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "table": {
-          "type": "string"
-        },
-        "data": {
-          "type": "object"
-        },
-        "where": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "table",
-        "data"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "capability_id": {
-          "type": "string"
-        },
-        "steps": {
-          "type": "array"
-        },
-        "final": {}
-      },
-      "required": [
-        "capability_id",
-        "steps",
-        "final"
-      ]
-    },
-    "executor": "dag",
-    "dag": [
-      {
-        "id": "update",
-        "base_capability": "db.update",
-        "depends_on": []
-      }
-    ],
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "capability.delete",
-    "name": "Delete Capability",
-    "description": "从注册表删除能力定义",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "table": {
-          "type": "string"
-        },
-        "where": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "table",
-        "where"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "capability_id": {
-          "type": "string"
-        },
-        "steps": {
-          "type": "array"
-        },
-        "final": {}
-      },
-      "required": [
-        "capability_id",
-        "steps",
-        "final"
-      ]
-    },
-    "executor": "dag",
-    "dag": [
-      {
-        "id": "delete",
-        "base_capability": "db.delete",
-        "depends_on": []
-      }
-    ],
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "agent.update",
-    "name": "Update Agent",
-    "description": "更新 agent 注册表（capability_allowlist 等），内部固定 table=agent",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "data": {
-          "type": "object"
-        },
-        "where": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "data"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "capability_id": {
-          "type": "string"
-        },
-        "steps": {
-          "type": "array"
-        },
-        "final": {}
-      },
-      "required": [
-        "capability_id",
-        "steps",
-        "final"
-      ]
-    },
-    "executor": "dag",
-    "dag": [
-      {
-        "id": "update",
-        "base_capability": "db.update",
-        "args": {
-          "table": "agent"
-        },
-        "depends_on": []
-      }
-    ],
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "file.copy",
-    "name": "Copy File",
-    "description": "在工作区内复制文件（原子能力组合示例）",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "from": {
-          "type": "string"
-        },
-        "to": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "from",
-        "to"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "capability_id": {
-          "type": "string"
-        },
-        "steps": {
-          "type": "array"
-        },
-        "final": {}
-      },
-      "required": [
-        "capability_id",
-        "steps",
-        "final"
-      ]
-    },
-    "executor": "dag",
-    "dag": [
-      {
-        "id": "read",
-        "base_capability": "file.read",
-        "args": {
-          "path": "$input.from"
-        },
-        "depends_on": []
-      },
-      {
-        "id": "write",
-        "base_capability": "file.write",
-        "args": {
-          "path": "$input.to",
-          "content": "${read}.content"
-        },
-        "depends_on": [
-          "read"
+        "required": [
+          "table",
+          "data"
         ]
-      }
-    ],
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "log.analyze",
-    "name": "Log Analyze",
-    "description": "日志分析分子：读取->搜索->写入报告",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "path": {
-          "type": "string"
-        },
-        "pattern": {
-          "type": "string"
-        },
-        "output": {
-          "type": "string"
-        }
       },
-      "required": [
-        "path",
-        "pattern",
-        "output"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "capability_id": {
-          "type": "string"
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "capability_id": {
+            "type": "string"
+          },
+          "steps": {
+            "type": "array"
+          },
+          "final": {}
         },
-        "steps": {
-          "type": "array"
-        },
-        "final": {}
-      },
-      "required": [
-        "capability_id",
-        "steps",
-        "final"
-      ]
-    },
-    "executor": "dag",
-    "dag": [
-      {
-        "id": "read",
-        "base_capability": "file.read",
-        "args": {
-          "path": "$input.path"
-        },
-        "depends_on": []
-      },
-      {
-        "id": "grep",
-        "base_capability": "text.grep",
-        "args": {
-          "path": "$input.path",
-          "pattern": "$input.pattern"
-        },
-        "depends_on": []
-      },
-      {
-        "id": "write",
-        "base_capability": "file.write",
-        "args": {
-          "path": "$input.output",
-          "content": "${grep}.matches"
-        },
-        "depends_on": [
-          "grep"
+        "required": [
+          "capability_id",
+          "steps",
+          "final"
         ]
-      }
-    ],
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "report.generate",
-    "name": "Generate Report",
-    "description": "报告生成分子：读取->整理->写入",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "source": {
-          "type": "string"
-        },
-        "output": {
-          "type": "string"
+      },
+      "executor": "dag",
+      "dag": [
+        {
+          "id": "insert",
+          "base_capability": "db.insert",
+          "depends_on": []
         }
-      },
-      "required": [
-        "source",
-        "output"
-      ]
+      ],
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
     },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "capability_id": {
-          "type": "string"
+    {
+      "id": "capability.update",
+      "name": "Update Capability",
+      "description": "更新注册表中的能力定义",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "table": {
+            "type": "string"
+          },
+          "data": {
+            "type": "object"
+          },
+          "where": {
+            "type": "string"
+          }
         },
-        "steps": {
-          "type": "array"
-        },
-        "final": {}
-      },
-      "required": [
-        "capability_id",
-        "steps",
-        "final"
-      ]
-    },
-    "executor": "dag",
-    "dag": [
-      {
-        "id": "read",
-        "base_capability": "file.read",
-        "args": {
-          "path": "$input.source"
-        },
-        "depends_on": []
-      },
-      {
-        "id": "write",
-        "base_capability": "file.write",
-        "args": {
-          "path": "$input.output",
-          "content": "${read}.content"
-        },
-        "depends_on": [
-          "read"
+        "required": [
+          "table",
+          "data"
         ]
-      }
-    ],
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "large_file.exhaustive",
-    "name": "Exhaustive Large File Read",
-    "description": "逐块读取完整大文件的分子示例",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "path": {
-          "type": "string"
-        }
       },
-      "required": [
-        "path"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "capability_id": {
-          "type": "string"
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "capability_id": {
+            "type": "string"
+          },
+          "steps": {
+            "type": "array"
+          },
+          "final": {}
         },
-        "steps": {
-          "type": "array"
-        },
-        "final": {}
-      },
-      "required": [
-        "capability_id",
-        "steps",
-        "final"
-      ]
-    },
-    "executor": "dag",
-    "dag": [
-      {
-        "id": "read_chunk",
-        "base_capability": "file.chunk_read",
-        "args": {
-          "path": "$input.path"
-        },
-        "depends_on": []
-      }
-    ],
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "large_file.targeted",
-    "name": "Targeted Large File Read",
-    "description": "定位读取大文件指定偏移的分子示例",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "path": {
-          "type": "string"
-        },
-        "offset": {
-          "type": "integer"
-        },
-        "size": {
-          "type": "integer"
-        }
-      },
-      "required": [
-        "path"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "capability_id": {
-          "type": "string"
-        },
-        "steps": {
-          "type": "array"
-        },
-        "final": {}
-      },
-      "required": [
-        "capability_id",
-        "steps",
-        "final"
-      ]
-    },
-    "executor": "dag",
-    "dag": [
-      {
-        "id": "read_chunk",
-        "base_capability": "file.chunk_read",
-        "args": {
-          "path": "$input.path",
-          "offset": "$input.offset",
-          "size": "$input.size"
-        },
-        "depends_on": []
-      }
-    ],
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  },
-  {
-    "id": "code.audit",
-    "name": "Code Audit",
-    "description": "代码审计分子示例：列出目录->读取->搜索->写报告",
-    "schema_in": {
-      "type": "object",
-      "properties": {
-        "path": {
-          "type": "string"
-        },
-        "pattern": {
-          "type": "string"
-        },
-        "output": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "path",
-        "pattern",
-        "output"
-      ]
-    },
-    "schema_out": {
-      "type": "object",
-      "properties": {
-        "capability_id": {
-          "type": "string"
-        },
-        "steps": {
-          "type": "array"
-        },
-        "final": {}
-      },
-      "required": [
-        "capability_id",
-        "steps",
-        "final"
-      ]
-    },
-    "executor": "dag",
-    "dag": [
-      {
-        "id": "list",
-        "base_capability": "file.list",
-        "args": {
-          "path": "$input.path"
-        },
-        "depends_on": []
-      },
-      {
-        "id": "grep",
-        "base_capability": "text.grep",
-        "args": {
-          "path": "$input.path",
-          "pattern": "$input.pattern"
-        },
-        "depends_on": []
-      },
-      {
-        "id": "write",
-        "base_capability": "file.write",
-        "args": {
-          "path": "$input.output",
-          "content": "${grep}.matches"
-        },
-        "depends_on": [
-          "grep"
+        "required": [
+          "capability_id",
+          "steps",
+          "final"
         ]
+      },
+      "executor": "dag",
+      "dag": [
+        {
+          "id": "update",
+          "base_capability": "db.update",
+          "depends_on": []
+        }
+      ],
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "capability.delete",
+      "name": "Delete Capability",
+      "description": "从注册表删除能力定义",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "table": {
+            "type": "string"
+          },
+          "where": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "table",
+          "where"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "capability_id": {
+            "type": "string"
+          },
+          "steps": {
+            "type": "array"
+          },
+          "final": {}
+        },
+        "required": [
+          "capability_id",
+          "steps",
+          "final"
+        ]
+      },
+      "executor": "dag",
+      "dag": [
+        {
+          "id": "delete",
+          "base_capability": "db.delete",
+          "depends_on": []
+        }
+      ],
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "agent.update",
+      "name": "Update Agent",
+      "description": "更新 agent 注册表（capability_allowlist 等），内部固定 table=agent",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "type": "object"
+          },
+          "where": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "data"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "capability_id": {
+            "type": "string"
+          },
+          "steps": {
+            "type": "array"
+          },
+          "final": {}
+        },
+        "required": [
+          "capability_id",
+          "steps",
+          "final"
+        ]
+      },
+      "executor": "dag",
+      "dag": [
+        {
+          "id": "update",
+          "base_capability": "db.update",
+          "args": {
+            "table": "agent"
+          },
+          "depends_on": []
+        }
+      ],
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "file.copy",
+      "name": "Copy File",
+      "description": "在工作区内复制文件（原子能力组合示例）",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "from": {
+            "type": "string"
+          },
+          "to": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "from",
+          "to"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "capability_id": {
+            "type": "string"
+          },
+          "steps": {
+            "type": "array"
+          },
+          "final": {}
+        },
+        "required": [
+          "capability_id",
+          "steps",
+          "final"
+        ]
+      },
+      "executor": "dag",
+      "dag": [
+        {
+          "id": "read",
+          "base_capability": "file.read",
+          "args": {
+            "path": "$input.from"
+          },
+          "depends_on": []
+        },
+        {
+          "id": "write",
+          "base_capability": "file.write",
+          "args": {
+            "path": "$input.to",
+            "content": "${read}.content"
+          },
+          "depends_on": [
+            "read"
+          ]
+        }
+      ],
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "log.analyze",
+      "name": "Log Analyze",
+      "description": "日志分析分子：读取->搜索->写入报告",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "pattern": {
+            "type": "string"
+          },
+          "output": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "pattern",
+          "output"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "capability_id": {
+            "type": "string"
+          },
+          "steps": {
+            "type": "array"
+          },
+          "final": {}
+        },
+        "required": [
+          "capability_id",
+          "steps",
+          "final"
+        ]
+      },
+      "executor": "dag",
+      "dag": [
+        {
+          "id": "read",
+          "base_capability": "file.read",
+          "args": {
+            "path": "$input.path"
+          },
+          "depends_on": []
+        },
+        {
+          "id": "grep",
+          "base_capability": "text.grep",
+          "args": {
+            "path": "$input.path",
+            "pattern": "$input.pattern"
+          },
+          "depends_on": []
+        },
+        {
+          "id": "write",
+          "base_capability": "file.write",
+          "args": {
+            "path": "$input.output",
+            "content": "${grep}.matches"
+          },
+          "depends_on": [
+            "grep"
+          ]
+        }
+      ],
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "report.generate",
+      "name": "Generate Report",
+      "description": "报告生成分子：读取->整理->写入",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": "string"
+          },
+          "output": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "output"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "capability_id": {
+            "type": "string"
+          },
+          "steps": {
+            "type": "array"
+          },
+          "final": {}
+        },
+        "required": [
+          "capability_id",
+          "steps",
+          "final"
+        ]
+      },
+      "executor": "dag",
+      "dag": [
+        {
+          "id": "read",
+          "base_capability": "file.read",
+          "args": {
+            "path": "$input.source"
+          },
+          "depends_on": []
+        },
+        {
+          "id": "write",
+          "base_capability": "file.write",
+          "args": {
+            "path": "$input.output",
+            "content": "${read}.content"
+          },
+          "depends_on": [
+            "read"
+          ]
+        }
+      ],
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "large_file.exhaustive",
+      "name": "Exhaustive Large File Read",
+      "description": "逐块读取完整大文件的分子示例",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "capability_id": {
+            "type": "string"
+          },
+          "steps": {
+            "type": "array"
+          },
+          "final": {}
+        },
+        "required": [
+          "capability_id",
+          "steps",
+          "final"
+        ]
+      },
+      "executor": "dag",
+      "dag": [
+        {
+          "id": "read_chunk",
+          "base_capability": "file.chunk_read",
+          "args": {
+            "path": "$input.path"
+          },
+          "depends_on": []
+        }
+      ],
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "large_file.targeted",
+      "name": "Targeted Large File Read",
+      "description": "定位读取大文件指定偏移的分子示例",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "offset": {
+            "type": "integer"
+          },
+          "size": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "capability_id": {
+            "type": "string"
+          },
+          "steps": {
+            "type": "array"
+          },
+          "final": {}
+        },
+        "required": [
+          "capability_id",
+          "steps",
+          "final"
+        ]
+      },
+      "executor": "dag",
+      "dag": [
+        {
+          "id": "read_chunk",
+          "base_capability": "file.chunk_read",
+          "args": {
+            "path": "$input.path",
+            "offset": "$input.offset",
+            "size": "$input.size"
+          },
+          "depends_on": []
+        }
+      ],
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "code.audit",
+      "name": "Code Audit",
+      "description": "代码审计分子示例：列出目录->读取->搜索->写报告",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "pattern": {
+            "type": "string"
+          },
+          "output": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "pattern",
+          "output"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "capability_id": {
+            "type": "string"
+          },
+          "steps": {
+            "type": "array"
+          },
+          "final": {}
+        },
+        "required": [
+          "capability_id",
+          "steps",
+          "final"
+        ]
+      },
+      "executor": "dag",
+      "dag": [
+        {
+          "id": "list",
+          "base_capability": "file.list",
+          "args": {
+            "path": "$input.path"
+          },
+          "depends_on": []
+        },
+        {
+          "id": "grep",
+          "base_capability": "text.grep",
+          "args": {
+            "path": "$input.path",
+            "pattern": "$input.pattern"
+          },
+          "depends_on": []
+        },
+        {
+          "id": "write",
+          "base_capability": "file.write",
+          "args": {
+            "path": "$input.output",
+            "content": "${grep}.matches"
+          },
+          "depends_on": [
+            "grep"
+          ]
+        }
+      ],
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "capability.self-register",
+      "name": "Self Register Capability",
+      "description": "从能力定义到落库验证的注册闭环：import → 独立回读 → 台账 imported → 台账 verified。连坐门：gate 探针（usage 行）仅在 capability_id 于注册表（base/composite，enabled 且未 tombstone）真实存在时可导入；空回读使整条失败——verified 不可凭回执落账。",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "base_capabilities": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "capability.import 的 base 定义数组（原样透传给 import 节点）"
+          },
+          "composite_capabilities": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "capability.import 的 composite 定义数组"
+          },
+          "usage_methods": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "capability.import 的 usage_method 定义数组"
+          },
+          "grant_to_agent": {
+            "type": "string",
+            "description": "可选：导入后授权目标 agent（capability.import 原语义）"
+          },
+          "capability_id": {
+            "type": "string",
+            "description": "注册后要回读验证的能力 id；必须与定义中真正注册的 id 一致，否则 gate 探针连坐整条失败"
+          },
+          "item": {
+            "type": "string",
+            "description": "台账条目描述（deliverable_ledger.item）"
+          },
+          "owner_agent": {
+            "type": "string",
+            "description": "可选：台账归属 agent；未提供时台账不落 owner"
+          }
+        },
+        "required": [
+          "capability_id",
+          "item"
+        ]
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "capability_id": {
+            "type": "string"
+          },
+          "steps": {
+            "type": "array"
+          },
+          "final": {}
+        },
+        "required": [
+          "capability_id",
+          "steps",
+          "final"
+        ]
+      },
+      "executor": "dag",
+      "dag": [
+        {
+          "id": "register",
+          "base_capability": "capability.import",
+          "depends_on": []
+        },
+        {
+          "id": "verify",
+          "base_capability": "db.query",
+          "depends_on": [
+            "register"
+          ],
+          "args": {
+            "table": "base_capability",
+            "where": "id = '$input.capability_id'"
+          }
+        },
+        {
+          "id": "gate",
+          "base_capability": "capability.import",
+          "depends_on": [
+            "register"
+          ],
+          "args": {
+            "base_capabilities": [],
+            "composite_capabilities": [],
+            "grant_to_agent": "",
+            "usage_methods": [
+              {
+                "id": "selfregister.probe.$input.capability_id",
+                "capability_id": "$input.capability_id",
+                "name": "Self Register Verify Probe",
+                "prompt": "capability.self-register 的连坐门探针行：仅当 capability_id 在注册表（base 或 composite，enabled 且未 tombstone）真实存在时，本 usage 行才能通过 capability.import 的 capability_id 存在性校验；不存在则 gate 节点失败，整条 self-register 失败，verified 不落账。",
+                "examples": null,
+                "metadata": {
+                  "partition": "factory",
+                  "probe": true
+                }
+              }
+            ]
+          }
+        },
+        {
+          "id": "ledger_imported",
+          "base_capability": "ledger.write",
+          "depends_on": [
+            "verify",
+            "gate"
+          ],
+          "args": {
+            "item": "$input.item",
+            "state": "imported",
+            "evidence_refs": [
+              "import:${register.success}",
+              "rows:${verify.rows}"
+            ]
+          }
+        },
+        {
+          "id": "ledger_verified",
+          "base_capability": "ledger.write",
+          "depends_on": [
+            "ledger_imported"
+          ],
+          "args": {
+            "id": "${ledger_imported}.id",
+            "item": "$input.item",
+            "state": "verified",
+            "evidence_refs": [
+              "rows:${verify.rows}",
+              "gate:${gate.success}"
+            ]
+          }
+        }
+      ],
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "factory",
+      "metadata": {
+        "partition": "factory"
       }
-    ],
-    "version": "1.0.0",
-    "enabled": true,
-    "partition": "system"
-  }
-]
+    }
+  ]
+}

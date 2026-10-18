@@ -1,5 +1,6 @@
 pub mod base;
 pub mod composite;
+pub mod evidence;
 pub mod executor;
 pub mod import;
 pub mod ledger;

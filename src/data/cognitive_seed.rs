@@ -19,7 +19,20 @@ const CAPABILITY_SEED_DIR: &str = "seed/capabilities";
 /// - 旧格式（v0.4.6 及以前）：纯数组，视为 version 1 → 触发重写。
 ///
 /// v4（v0.5.11 B2/B3）：新增 ledger.read / ledger.write 能力行（完成状态台账）。
-pub const CAPABILITY_SEED_VERSION: u32 = 4;
+/// v5（v0.5.11 B4/B1）：新增 evidence.check 能力行；ledger.write 的 schema_in
+/// 去掉 `additionalProperties:false`（composite DAG 数据流会把 composite 输入键
+/// 合并进每个节点 args，闭 schema 使 ledger.write 无法进入任何 composite——
+/// 诚实合同的实际强制在 ledger.rs 状态机与证据校验，不依赖该 schema 收口）。
+pub const CAPABILITY_SEED_VERSION: u32 = 5;
+
+/// composite seed 版本（v0.5.11 B1a）：种子文件从纯数组升级为版本化对象
+/// `{"seed_version": N, "capabilities": [...]}`，与 base 同构。
+/// v2：新增 capability.self-register（自注册闭环 composite）。
+pub const COMPOSITE_SEED_VERSION: u32 = 2;
+
+/// usage_method seed 版本（v0.5.11 B1b）：同 composite 的版本化升级。
+/// v2：新增 um_capability_self_register（自注册方法文档）。
+pub const USAGE_SEED_VERSION: u32 = 2;
 
 pub const COGNITIVE_SEED_MANIFEST: &str = include_str!("../../data/seed/cognitive/manifest.json");
 pub const COGNITIVE_SEED_NODES: &str = include_str!("../../data/seed/cognitive/nodes.json");
@@ -226,11 +239,11 @@ pub fn seed_cognitive_memory(data_dir: &Path, db: &mut TriviumDb) -> Result<()> 
     Ok(())
 }
 
-/// 读取已落盘 `base_capabilities.json` 的 seed_version：
+/// 读取已落盘种子文件的 seed_version（base/composite/usage 通用）：
 /// - 新格式对象 `{"seed_version": N, ...}` → N；
 /// - 旧格式纯数组 → 1（v0.4.6 及以前写入的版本）；
 /// - 缺失 / 不可解析 / 无 seed_version 字段 → 0（触发重写）。
-fn base_capabilities_seed_version(path: &Path) -> u32 {
+fn seed_file_version(path: &Path) -> u32 {
     let Ok(text) = fs::read_to_string(path) else {
         return 0;
     };
@@ -252,22 +265,31 @@ pub fn ensure_default_capabilities(data_dir: &Path) -> Result<()> {
     let seed_root = data_dir.join(CAPABILITY_SEED_DIR);
     ensure_private_directory(&seed_root)?;
 
-    let files: &[(&str, &str)] = &[
-        ("base_capabilities.json", CAPABILITY_SEED_BASE),
-        ("composite_capabilities.json", CAPABILITY_SEED_COMPOSITE),
-        ("usage_methods.json", CAPABILITY_SEED_USAGE),
+    let files: &[(&str, &str, u32)] = &[
+        (
+            "base_capabilities.json",
+            CAPABILITY_SEED_BASE,
+            CAPABILITY_SEED_VERSION,
+        ),
+        (
+            "composite_capabilities.json",
+            CAPABILITY_SEED_COMPOSITE,
+            COMPOSITE_SEED_VERSION,
+        ),
+        (
+            "usage_methods.json",
+            CAPABILITY_SEED_USAGE,
+            USAGE_SEED_VERSION,
+        ),
     ];
 
-    for (name, content) in files {
+    for (name, content, version) in files {
         let path = seed_root.join(name);
         // v0.4.7 覆盖判定：base_capabilities.json 版本化（缺失 / seed_version 落后 / 旧纯数组
-        // 格式 → 以内置最新重写）；composite/usage 未版本化（缺失才写入）。`wasm:` 特判已删除。
-        let should_write = if *name == "base_capabilities.json" {
-            base_capabilities_seed_version(&path) < CAPABILITY_SEED_VERSION
-        } else {
-            !path.exists()
-        };
-        if should_write {
+        // 格式 → 以内置最新重写）。v0.5.11 B1 起 composite/usage 同样版本化：存量目录
+        // 种子文件版本落后时重写，保证升级后拿到新增行（此前「缺失才写」使存量安装
+        // 永远拿不到新 composite/usage 行）。`wasm:` 特判已删除。
+        if seed_file_version(&path) < *version {
             fs::write(&path, content)
                 .map_err(|e| AgentError::Io(format!("write capability seed {name}: {e}")))?;
             secure_existing_file(&path)?;
@@ -351,8 +373,7 @@ pub fn import_factory_defaults(conn: &duckdb::Connection, data_dir: &Path) -> Re
 
     let comp_text = fs::read_to_string(seed_root.join("composite_capabilities.json"))
         .map_err(|e| AgentError::Io(format!("read composite_capabilities.json: {e}")))?;
-    let comp_rows: Vec<serde_json::Value> = serde_json::from_str(&comp_text)
-        .map_err(|e| AgentError::Parse(format!("parse composite_capabilities.json: {e}")))?;
+    let comp_rows = read_seed_rows(&comp_text, "composite_capabilities.json")?;
     for row in &comp_rows {
         let id = row["id"].as_str().unwrap_or_default();
         if id.is_empty() {
@@ -362,10 +383,13 @@ pub fn import_factory_defaults(conn: &duckdb::Connection, data_dir: &Path) -> Re
         let metadata = serde_json::json!({
             "partition": row["partition"].as_str().unwrap_or("system"),
         });
+        // v0.5.11 B1：composite 走 delta 语义（DB 无该 id 才插）——INSERT OR REPLACE
+        // 会覆盖用户对同 id 工厂行的修改；升级目标是「拿到新增行」，不夺回用户改动。
         conn.execute(
-            "INSERT OR REPLACE INTO composite_capability \
+            "INSERT INTO composite_capability \
              (id, name, description, schema_in, schema_out, executor, dag, version, enabled, metadata) \
-             VALUES (?, ?, ?, CAST(? AS JSON), CAST(? AS JSON), ?, CAST(? AS JSON), ?, ?, CAST(? AS JSON))",
+             SELECT ?, ?, ?, CAST(? AS JSON), CAST(? AS JSON), ?, CAST(? AS JSON), ?, ?, CAST(? AS JSON) \
+             WHERE NOT EXISTS (SELECT 1 FROM composite_capability WHERE id = ?)",
             duckdb::params![
                 id,
                 row["name"].as_str().unwrap_or(id),
@@ -377,6 +401,7 @@ pub fn import_factory_defaults(conn: &duckdb::Connection, data_dir: &Path) -> Re
                 row["version"].as_str().unwrap_or(""),
                 enabled,
                 metadata.to_string(),
+                id,
             ],
         )
         .map_err(|e| AgentError::Bootstrap(format!("import composite_capability {id}: {e}")))?;
@@ -384,17 +409,18 @@ pub fn import_factory_defaults(conn: &duckdb::Connection, data_dir: &Path) -> Re
 
     let usage_text = fs::read_to_string(seed_root.join("usage_methods.json"))
         .map_err(|e| AgentError::Io(format!("read usage_methods.json: {e}")))?;
-    let usage_rows: Vec<serde_json::Value> = serde_json::from_str(&usage_text)
-        .map_err(|e| AgentError::Parse(format!("parse usage_methods.json: {e}")))?;
+    let usage_rows = read_seed_rows(&usage_text, "usage_methods.json")?;
     for row in &usage_rows {
         let id = row["id"].as_str().unwrap_or_default();
         if id.is_empty() {
             continue;
         }
+        // v0.5.11 B1：usage 同 composite 走 delta 语义（DB 无该 id 才插）。
         conn.execute(
-            "INSERT OR REPLACE INTO usage_method \
+            "INSERT INTO usage_method \
              (id, capability_id, name, prompt, examples, metadata) \
-             VALUES (?, ?, ?, ?, CAST(? AS JSON), CAST(? AS JSON))",
+             SELECT ?, ?, ?, ?, CAST(? AS JSON), CAST(? AS JSON) \
+             WHERE NOT EXISTS (SELECT 1 FROM usage_method WHERE id = ?)",
             duckdb::params![
                 id,
                 row["capability_id"].as_str().unwrap_or(""),
@@ -402,6 +428,7 @@ pub fn import_factory_defaults(conn: &duckdb::Connection, data_dir: &Path) -> Re
                 row["prompt"].as_str().unwrap_or(""),
                 row["examples"].to_string(),
                 row["metadata"].to_string(),
+                id,
             ],
         )
         .map_err(|e| AgentError::Bootstrap(format!("import usage_method {id}: {e}")))?;
@@ -449,6 +476,25 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
         serde_json::Value::String(_) => "string",
         serde_json::Value::Array(_) => "array",
         serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// 读侧兼容（v0.5.11 B1）：composite/usage 种子文件两种格式——
+/// 新格式对象 `{"seed_version": N, "capabilities": [...]}`（取 capabilities）与
+/// 旧格式纯数组（视为完整行集）。与 base 的读侧兼容策略同构。
+fn read_seed_rows(text: &str, name: &str) -> Result<Vec<serde_json::Value>> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| AgentError::Parse(format!("parse {name}: {e}")))?;
+    match value {
+        serde_json::Value::Array(rows) => Ok(rows),
+        serde_json::Value::Object(mut obj) => Ok(obj
+            .remove("capabilities")
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default()),
+        other => Err(AgentError::Parse(format!(
+            "parse {name}: unexpected top-level type {}",
+            json_type_name(&other)
+        ))),
     }
 }
 
@@ -584,6 +630,7 @@ const SUBAGENT_TEMPLATE_DEFS: &[(&str, &str, &str, &str, &[&str])] = &[
             "memory.retrieve",
             "ledger.read",
             "ledger.write",
+            "evidence.check",
             "file.read",
             "file.list",
             "path.exists",
@@ -1277,6 +1324,7 @@ mod tests {
                     "memory.retrieve",
                     "ledger.read",
                     "ledger.write",
+                    "evidence.check",
                     "file.read",
                     "file.list",
                     "path.exists",
@@ -1626,7 +1674,7 @@ mod tests {
         );
         let caps = value["capabilities"].as_array().expect("capabilities 数组");
         assert!(caps.iter().any(|c| c["id"] == "web.fetch.public"));
-        assert!(base_capabilities_seed_version(&base_path) >= CAPABILITY_SEED_VERSION);
+        assert!(seed_file_version(&base_path) >= CAPABILITY_SEED_VERSION);
 
         import_factory_defaults(&conn, dir.path()).unwrap();
         let count: i64 = conn
@@ -1664,7 +1712,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            base_capabilities_seed_version(&seed_root.join("base_capabilities.json")),
+            seed_file_version(&seed_root.join("base_capabilities.json")),
             1,
             "纯数组应判定为 version 1"
         );
@@ -1758,7 +1806,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            base_capabilities_seed_version(&seed_root.join("base_capabilities.json")),
+            seed_file_version(&seed_root.join("base_capabilities.json")),
             2,
             "v2 文件应判定为 version 2"
         );
@@ -1793,7 +1841,8 @@ mod tests {
         );
     }
 
-    /// import_factory_defaults 读侧兼容：旧纯数组格式（version 1 文件）也能完整导入。
+    /// import_factory_defaults 读侧兼容：旧纯数组格式（version 1 文件）也能完整导入
+    /// （base/composite/usage 三份种子文件的旧数组格式读侧兼容）。
     #[test]
     fn import_factory_defaults_reads_legacy_array_format() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -1801,20 +1850,24 @@ mod tests {
         let dir = tempdir().unwrap();
         let seed_root = dir.path().join("seed/capabilities");
         std::fs::create_dir_all(&seed_root).unwrap();
-        // 旧格式纯数组（直接写内置数组内容）。
-        let builtin: serde_json::Value = serde_json::from_str(CAPABILITY_SEED_BASE).unwrap();
-        std::fs::write(
-            seed_root.join("base_capabilities.json"),
-            serde_json::to_string(builtin["capabilities"].as_array().unwrap()).unwrap(),
-        )
-        .unwrap();
-        // composite/usage 用内置内容（不重跑 ensure，保持旧文件形态）。
-        std::fs::write(
-            seed_root.join("composite_capabilities.json"),
-            CAPABILITY_SEED_COMPOSITE,
-        )
-        .unwrap();
-        std::fs::write(seed_root.join("usage_methods.json"), CAPABILITY_SEED_USAGE).unwrap();
+        // 三份种子都写旧格式纯数组（直接写内置 capabilities 数组内容）。
+        for (file, builtin) in [
+            ("base_capabilities.json", CAPABILITY_SEED_BASE),
+            ("composite_capabilities.json", CAPABILITY_SEED_COMPOSITE),
+            ("usage_methods.json", CAPABILITY_SEED_USAGE),
+        ] {
+            let builtin: serde_json::Value = serde_json::from_str(builtin).unwrap();
+            std::fs::write(
+                seed_root.join(file),
+                serde_json::to_string(builtin["capabilities"].as_array().unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                seed_file_version(&seed_root.join(file)),
+                1,
+                "{file} 纯数组应判定为 version 1"
+            );
+        }
 
         import_factory_defaults(&conn, dir.path()).unwrap();
 
@@ -1826,10 +1879,184 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1, "旧数组格式读侧应兼容导入（含 web.fetch.public）");
+        let comp_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM composite_capability WHERE id = 'capability.self-register'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(comp_count, 1, "旧数组格式 composite 也应完整导入");
         let agent_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM agent", [], |row| row.get(0))
             .unwrap();
         assert!(agent_count >= 4, "记忆 agent 正常导入: {agent_count}");
+    }
+
+    /// v0.5.11 B1 升级通路：旧版本 composite/usage 种子文件（纯数组、无新行）在
+    /// ensure_default_capabilities 时被重写为最新版本化内容；import 落库采用
+    /// delta 语义——新工厂行（capability.self-register / um_capability_self_register）
+    /// 落库，用户自定义行与对已有工厂行的修改均不被破坏。
+    #[test]
+    fn legacy_composite_usage_seed_upgraded_with_delta_import() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        crate::data::duckdb::schema::create_all_tables(&conn).unwrap();
+        let dir = tempdir().unwrap();
+        let seed_root = dir.path().join("seed/capabilities");
+        std::fs::create_dir_all(&seed_root).unwrap();
+
+        // 模拟旧版目录：composite/usage 为纯数组且不含新行；base 落后一版。
+        let comp_builtin: serde_json::Value =
+            serde_json::from_str(CAPABILITY_SEED_COMPOSITE).unwrap();
+        let legacy_comp: Vec<serde_json::Value> = comp_builtin["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["id"] != "capability.self-register")
+            .cloned()
+            .collect();
+        std::fs::write(
+            seed_root.join("composite_capabilities.json"),
+            serde_json::to_string(&legacy_comp).unwrap(),
+        )
+        .unwrap();
+        let usage_builtin: serde_json::Value = serde_json::from_str(CAPABILITY_SEED_USAGE).unwrap();
+        let legacy_usage: Vec<serde_json::Value> = usage_builtin["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["id"] != "um_capability_self_register")
+            .cloned()
+            .collect();
+        std::fs::write(
+            seed_root.join("usage_methods.json"),
+            serde_json::to_string(&legacy_usage).unwrap(),
+        )
+        .unwrap();
+        let base_builtin: serde_json::Value = serde_json::from_str(CAPABILITY_SEED_BASE).unwrap();
+        let mut legacy_base = base_builtin.clone();
+        legacy_base["seed_version"] = serde_json::json!(CAPABILITY_SEED_VERSION - 1);
+        std::fs::write(
+            seed_root.join("base_capabilities.json"),
+            serde_json::to_string(&legacy_base).unwrap(),
+        )
+        .unwrap();
+
+        // 启动链：版本落后 → 三份种子文件重写为内置最新。
+        ensure_default_capabilities(dir.path()).unwrap();
+        for (file, version) in [
+            ("composite_capabilities.json", COMPOSITE_SEED_VERSION),
+            ("usage_methods.json", USAGE_SEED_VERSION),
+            ("base_capabilities.json", CAPABILITY_SEED_VERSION),
+        ] {
+            assert_eq!(
+                seed_file_version(&seed_root.join(file)),
+                version,
+                "{file} 应被重写为最新版本"
+            );
+        }
+        let rewritten =
+            std::fs::read_to_string(seed_root.join("composite_capabilities.json")).unwrap();
+        assert!(rewritten.contains("capability.self-register"));
+
+        // DB 预置：用户自定义行 + 对已有工厂行的修改（改 prompt）。
+        conn.execute(
+            "INSERT INTO composite_capability \
+             (id, name, description, schema_in, schema_out, executor, dag, version, enabled) \
+             VALUES ('user.custom.comp', 'Custom', 'user row', CAST(? AS JSON), CAST(? AS JSON), 'dag', CAST(? AS JSON), '1.0.0', true)",
+            duckdb::params![r#"{"type":"object"}"#, r#"{"type":"object"}"#, "[]"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_method (id, capability_id, name, prompt) \
+             VALUES ('user.custom.um', 'capability.register', 'Custom UM', 'user prompt')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_method (id, capability_id, name, prompt) \
+             VALUES ('capability.list', 'capability.register', 'List', '工厂行原文')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE usage_method SET prompt = '用户改过的工厂行' WHERE id = 'capability.list'",
+            [],
+        )
+        .unwrap();
+
+        // 启动导入：delta 语义。
+        import_factory_defaults(&conn, dir.path()).unwrap();
+
+        // 新工厂行落库（升级拿到 self-register 与方法行）。
+        let (comp_n, um_n): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM composite_capability WHERE id = 'capability.self-register'), \
+                        (SELECT COUNT(*) FROM usage_method WHERE id = 'um_capability_self_register')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (comp_n, um_n),
+            (1, 1),
+            "存量安装升级后应拿到新 composite/usage 行"
+        );
+
+        // 用户自定义行与对工厂行的修改未被破坏。
+        let user_um: Option<String> = conn
+            .query_row(
+                "SELECT prompt FROM usage_method WHERE id = 'user.custom.um'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(user_um.as_deref(), Some("user prompt"));
+        let modified_factory: Option<String> = conn
+            .query_row(
+                "SELECT prompt FROM usage_method WHERE id = 'capability.list'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            modified_factory.as_deref(),
+            Some("用户改过的工厂行"),
+            "delta 语义：用户对同 id 工厂行的修改不被覆盖"
+        );
+
+        // 幂等：重复启动不重复插入、不破坏。
+        import_factory_defaults(&conn, dir.path()).unwrap();
+        let comp_total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM composite_capability WHERE id = 'capability.self-register'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(comp_total, 1);
+    }
+
+    /// 最新版本目录：composite/usage 种子文件不被重写（用户/历史内容保持）。
+    #[test]
+    fn current_version_composite_usage_seed_not_rewritten() {
+        let dir = tempdir().unwrap();
+        ensure_default_capabilities(dir.path()).unwrap();
+        let seed_root = dir.path().join("seed/capabilities");
+        for file in ["composite_capabilities.json", "usage_methods.json"] {
+            let path = seed_root.join(file);
+            std::fs::write(&path, "{\"seed_version\":2,\"capabilities\":[]}").unwrap();
+        }
+
+        ensure_default_capabilities(dir.path()).unwrap();
+
+        for file in ["composite_capabilities.json", "usage_methods.json"] {
+            let text = std::fs::read_to_string(seed_root.join(file)).unwrap();
+            assert_eq!(
+                text, "{\"seed_version\":2,\"capabilities\":[]}",
+                "{file} 版本匹配时不得被重写"
+            );
+        }
     }
 
     /// upgrade_seed_deltas：缺 id 插入（平台/记忆/模板三类）、已有不覆盖（含用户改的
