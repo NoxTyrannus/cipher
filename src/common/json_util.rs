@@ -166,6 +166,7 @@ mod tests {
     use super::extract_first_json_object;
     use super::repair_json;
     use super::strip_reasoning_preamble;
+    use super::strip_think_blocks;
     use super::truncate_head_tail;
     use super::truncate_utf8_boundary;
 
@@ -203,6 +204,16 @@ mod tests {
     fn strip_reasoning_preamble_no_brace_returns_unchanged() {
         let input = "纯散文没有 JSON 对象";
         assert_eq!(strip_reasoning_preamble(input), input);
+    }
+
+    #[test]
+    fn strip_think_blocks_keeps_prose_before_brace() {
+        // say 通道契约：含 JSON 示例的散文回答中，`{` 前的解释文字必须存活。
+        let input = "符号链接逃逸是沙箱经典攻击。\n\n示例：{\"attack\": \"example\"}\n\n以上就是全部内容。";
+        let stripped = strip_think_blocks(input);
+        assert!(stripped.starts_with("符号链接逃逸"), "got: {stripped}");
+        assert!(stripped.contains("{\"attack\": \"example\"}"));
+        assert!(stripped.ends_with("以上就是全部内容。"));
     }
 
     #[test]
