@@ -270,7 +270,9 @@ impl RuntimeSpawnHook {
             }
         }
         if let Err(e) = crate::agent::subagent_capability::close_subagent_invocation(
+            self.duckdb.as_ref(),
             &self.storage_root,
+            subagent_id,
             invocation_id,
             "failed",
             Some(&error.to_string()),
@@ -602,9 +604,31 @@ async fn execute_one(
         arguments: invocation.arguments.clone(),
     };
 
-    let outcome = CapabilityService::new_with_host(&params.registry, &params.executor, frozen_host)
-        .and_then(|service| service.execute_for_agent(actor_id, &call))
-        .map(|result| result.output);
+    // A13（v0.5.11）：execute_for_agent 是同步阻塞调用（内置能力含 std::process/文件 IO），
+    // 在 async 上下文直接调用会占住 runtime worker，total_timeout 只能等下一个 await 点才
+    // 生效。放入 spawn_blocking，future 在阻塞执行期间可被超时打断调度。所需数据按值
+    // move 进闭包（Registry/HostContext/CapabilityCall 均为 Clone，executor 克隆 Arc）；
+    // JoinError（阻塞任务 panic/被取消）转 AgentError 走既有失败回填路径。
+    // 已知边界（登记在案，不要求本迭代解决）：超时后阻塞任务仍在后台线程跑完，无进程级取消。
+    let outcome = {
+        let registry = params.registry.clone();
+        let executor = Arc::clone(&params.executor);
+        let host = frozen_host.clone();
+        let actor_id = actor_id.clone();
+        let call_for_blocking = call.clone();
+        match tokio::task::spawn_blocking(move || {
+            CapabilityService::new_with_host(&registry, &executor, &host)
+                .and_then(|service| service.execute_for_agent(&actor_id, &call_for_blocking))
+                .map(|result| result.output)
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(join_error) => Err(AgentError::Script(format!(
+                "capability blocking task failed: {join_error}"
+            ))),
+        }
+    };
 
     match outcome {
         Ok(output) => {

@@ -363,8 +363,13 @@ pub async fn run_normal(
                         tracing::warn!("subagent finish: set_subagent_lifecycle failed: {e}");
                     }
                 }
+                // close_subagent_invocation（B6 v0.5.11 扩展）：除闭合 invocation 终态外，
+                // 同时按 subagent_id 回填 method_call_audit 的 running 行为终态
+                // （succeeded/failed；error 取失败原因）。
                 if let Err(e) = crate::agent::subagent_capability::close_subagent_invocation(
+                    Some(&finish_duckdb),
                     &finish_storage_root,
+                    &finish.subagent_id,
                     &finish.invocation_id,
                     final_state,
                     error,
