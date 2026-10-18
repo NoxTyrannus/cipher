@@ -77,19 +77,9 @@ pub fn parse_capability_output(content: &str) -> CapabilityAction {
 }
 
 fn capability_parse_candidates(content: &str) -> Vec<String> {
-    let mut candidates = Vec::new();
-    if let Some(block) = crate::common::json_util::extract_json_block(content) {
-        candidates.push(block);
-    }
-    let stripped = crate::common::json_util::strip_reasoning_preamble(content);
-    if let Some(obj) = crate::common::json_util::extract_first_json_object(&stripped) {
-        candidates.push(obj);
-    }
-    let trimmed = content.trim().to_string();
-    if !candidates.contains(&trimmed) {
-        candidates.push(trimmed);
-    }
-    candidates
+    // 统一候选链（含裸围栏与全对象扫描）：散文先出 `{`、多对象并列、
+    // 忘写 json 标签的围栏等模型常见形态都不再把协议整体判死。
+    crate::common::json_util::json_parse_candidates(content)
 }
 
 enum CapabilityParseError {

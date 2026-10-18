@@ -934,18 +934,9 @@ fn failure_output(message: String) -> ExecutionOutput {
 /// - 完全提取不到 → 诚实零动作：`task_design=None`，`task_status=Some("raw:" + 原文截断
 ///   200)`，`capability_calls=[]`——下游可见模型原话，不伪装「解析失败」占位。
 fn parse_execution_output(content: &str) -> ExecutionPlatformRawOutput {
-    let mut candidates = Vec::new();
-    if let Some(block) = crate::common::json_util::extract_json_block(content) {
-        candidates.push(block);
-    }
-    let stripped = crate::common::json_util::strip_reasoning_preamble(content);
-    if let Some(obj) = crate::common::json_util::extract_first_json_object(&stripped) {
-        candidates.push(obj);
-    }
-    let trimmed = content.trim().to_string();
-    if !candidates.contains(&trimmed) {
-        candidates.push(trimmed);
-    }
+    // 统一候选链（与 capability_protocol 共用，含裸围栏与全对象扫描）：
+    // E1 实测 task_status 曾因 raw: 片段断链，此处不再因散文/围栏形态整体判死。
+    let candidates = crate::common::json_util::json_parse_candidates(content);
 
     for candidate in candidates {
         if let Some(raw) = parse_execution_raw(&candidate) {

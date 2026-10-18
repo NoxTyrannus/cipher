@@ -41,35 +41,94 @@ pub fn strip_think_blocks(text: &str) -> String {
 /// 从首个 `{` 起做字符串感知的平衡扫描（跟踪引号内/转义状态），
 /// 返回第一个完整 `{...}` 子串；找不到返回 None。
 pub fn extract_first_json_object(text: &str) -> Option<String> {
-    let start = text.find('{')?;
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (i, c) in text[start..].char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match c {
-            '"' => in_string = true,
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    let end = start + i + 1;
-                    return Some(text[start..end].to_string());
+    extract_all_json_objects(text).into_iter().next()
+}
+
+/// 扫描文本中所有顶层完整 `{...}` 对象（字符串感知，忽略引号内括号）。
+/// 模型输出常在散文中先出现示例括号或多对象并列，逐个给出候选比只取首个更稳。
+pub fn extract_all_json_objects(text: &str) -> Vec<String> {
+    let mut objects = Vec::new();
+    let mut search_from = 0;
+    while let Some(rel) = text[search_from..].find('{') {
+        let start = search_from + rel;
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut closed = None;
+        for (i, c) in text[start..].char_indices() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_string = false;
                 }
+                continue;
             }
-            _ => {}
+            match c {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        closed = Some(start + i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match closed {
+            Some(end) => {
+                objects.push(text[start..end].to_string());
+                search_from = end;
+            }
+            None => break, // 未闭合：其后不会再有完整对象
         }
     }
-    None
+    objects
+}
+
+/// 协议解析的统一候选链：```json 块 / 裸 ``` 块 / strip 前言后首对象 /
+/// 全文所有平衡对象（按出现序）/ 原文 trim。去重保序。
+/// capability_protocol 与 execution_platform 共用，保证两处宽容度一致。
+pub fn json_parse_candidates(content: &str) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    let push = |s: String, candidates: &mut Vec<String>| {
+        if !s.is_empty() && !candidates.contains(&s) {
+            candidates.push(s);
+        }
+    };
+    if let Some(block) = extract_json_block(content) {
+        push(block, &mut candidates);
+    }
+    if let Some(block) = extract_code_fence(content) {
+        push(block, &mut candidates);
+    }
+    let stripped = strip_reasoning_preamble(content);
+    if let Some(obj) = extract_first_json_object(&stripped) {
+        push(obj, &mut candidates);
+    }
+    for obj in extract_all_json_objects(content) {
+        push(obj, &mut candidates);
+    }
+    push(content.trim().to_string(), &mut candidates);
+    candidates
+}
+
+/// 裸 ``` 围栏（无 json 标签）内容提取——模型常忘写 json 标记。
+fn extract_code_fence(text: &str) -> Option<String> {
+    let start = text.find("```")?;
+    let after = &text[start + 3..];
+    // 跳过语言标签行
+    let after = match after.find('\n') {
+        Some(nl) => &after[nl + 1..],
+        None => return None,
+    };
+    let end = after.find("```")?;
+    let body = after[..end].trim();
+    (!body.is_empty()).then(|| body.to_string())
 }
 
 pub fn truncate_utf8_boundary(text: &str, max_bytes: usize) -> &str {
@@ -163,7 +222,10 @@ pub fn truncate_head_tail(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::extract_all_json_objects;
+    use super::extract_code_fence;
     use super::extract_first_json_object;
+    use super::json_parse_candidates;
     use super::repair_json;
     use super::strip_reasoning_preamble;
     use super::strip_think_blocks;
@@ -209,11 +271,46 @@ mod tests {
     #[test]
     fn strip_think_blocks_keeps_prose_before_brace() {
         // say 通道契约：含 JSON 示例的散文回答中，`{` 前的解释文字必须存活。
-        let input = "符号链接逃逸是沙箱经典攻击。\n\n示例：{\"attack\": \"example\"}\n\n以上就是全部内容。";
+        let input =
+            "符号链接逃逸是沙箱经典攻击。\n\n示例：{\"attack\": \"example\"}\n\n以上就是全部内容。";
         let stripped = strip_think_blocks(input);
         assert!(stripped.starts_with("符号链接逃逸"), "got: {stripped}");
         assert!(stripped.contains("{\"attack\": \"example\"}"));
         assert!(stripped.ends_with("以上就是全部内容。"));
+    }
+
+    #[test]
+    fn extract_all_json_objects_finds_nested_and_multiple() {
+        let text = "先一段散文 {\"demo\": 1} 再一段 {\"real\": {\"a\": [1,2]}} 尾巴";
+        let objs = extract_all_json_objects(text);
+        assert_eq!(objs.len(), 2);
+        assert_eq!(objs[0], "{\"demo\": 1}");
+        assert_eq!(objs[1], "{\"real\": {\"a\": [1,2]}}");
+        // 引号内的括号不参与平衡
+        let tricky = "x {\"s\": \"a{b}c\"} y";
+        assert_eq!(extract_all_json_objects(tricky), vec!["{\"s\": \"a{b}c\"}"]);
+    }
+
+    #[test]
+    fn extract_code_fence_handles_bare_and_tagged() {
+        let bare = "前言\n```\n{\"a\": 1}\n```\n后记";
+        assert_eq!(extract_code_fence(bare).as_deref(), Some("{\"a\": 1}"));
+        let tagged = "```json\n{\"a\": 1}\n```";
+        // json 标签围栏优先由 extract_json_block 命中；裸围栏兜底也能取到
+        assert_eq!(extract_code_fence(tagged).as_deref(), Some("{\"a\": 1}"));
+        assert!(extract_code_fence("没有围栏的文本").is_none());
+    }
+
+    #[test]
+    fn json_parse_candidates_cover_prose_brace_first() {
+        // E1/IT-1 实测形态：散文先出现 `{` 示例，真协议对象在后。
+        let content = "好的，示例是 {\"demo\": \"x\"}，正式调用如下：\n{\"capability_call\": {\"capability_id\": \"file.read\", \"arguments\": {\"path\": \"a\"}}}";
+        let candidates = json_parse_candidates(content);
+        let parsed = candidates
+            .iter()
+            .filter_map(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+            .find(|v| v.get("capability_call").is_some());
+        assert!(parsed.is_some(), "candidates: {candidates:?}");
     }
 
     #[test]
