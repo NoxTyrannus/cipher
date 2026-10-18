@@ -67,6 +67,33 @@ download_and_install() {
     echo "== 下载 $url =="
     curl -fSL "$url" -o "$tmpdir/$asset"
 
+    # 校验和验证：Release 附带 SHA256SUMS 则强制校验，缺失则警告跳过
+    local sums_url
+    if [ "$tag" = "latest" ]; then
+        sums_url="https://github.com/$GH_REPO/releases/latest/download/SHA256SUMS"
+    else
+        sums_url="https://github.com/$GH_REPO/releases/download/$tag/SHA256SUMS"
+    fi
+    if curl -fsSL "$sums_url" -o "$tmpdir/SHA256SUMS"; then
+        local expected_hash actual_hash
+        expected_hash="$(awk -v a="$asset" '{f=$2; sub(/^\*/, "", f); if (f==a) print $1}' "$tmpdir/SHA256SUMS")"
+        if [ -n "$expected_hash" ]; then
+            actual_hash="$(sha256sum "$tmpdir/$asset" | awk '{print $1}')"
+            if [ "$actual_hash" != "$expected_hash" ]; then
+                echo "错误: SHA256 校验失败"
+                echo "  期望: $expected_hash"
+                echo "  实际: $actual_hash"
+                rm -rf "$tmpdir"
+                exit 1
+            fi
+            echo "== SHA256 校验通过 =="
+        else
+            echo "警告: SHA256SUMS 中未找到 $asset 条目，跳过校验"
+        fi
+    else
+        echo "警告: Release 未提供 SHA256SUMS，跳过校验和验证"
+    fi
+
     echo "== 解压 =="
     case "$asset" in
         *.tar.gz) tar xzf "$tmpdir/$asset" -C "$tmpdir" ;;
@@ -179,11 +206,12 @@ run_test() {
 
     # 验证二进制可用
     echo "== 验证: 二进制版本 =="
-    local version
+    local version expected
     version="$("$test_dir/bin/$BIN_NAME" --version 2>&1 || true)"
-    echo "  版本: $version"
-    if [[ "$version" != *"0.2.3"* ]]; then
-        echo "  警告: 版本号可能不正确"
+    expected="$(grep -m1 '^version' "$REPO_DIR/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
+    echo "  版本: $version (Cargo.toml: $expected)"
+    if [ -n "$expected" ] && [[ "$version" != *"$expected"* ]]; then
+        echo "  警告: 版本号与 Cargo.toml 不一致"
     fi
 
     # 验证 wasm 植入
