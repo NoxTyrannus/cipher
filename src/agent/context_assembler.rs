@@ -29,6 +29,10 @@ pub struct ContextAssembler {
     memory_db: Option<std::sync::Arc<std::sync::Mutex<duckdb::Connection>>>,
 
     shared_trivium: Option<Arc<std::sync::Mutex<crate::data::triviumdb::TriviumDb>>>,
+
+    /// 主库（cipher.duckdb）共享句柄（B3 v0.5.11）：注入未结交付台账用。
+    /// 必须复用共享句柄、不得另开连接——DuckDB 单写者，另开会锁冲突（E1 实测）。
+    ledger_db: Option<std::sync::Arc<std::sync::Mutex<duckdb::Connection>>>,
 }
 
 impl ContextAssembler {
@@ -51,6 +55,7 @@ impl ContextAssembler {
             thought_store: None,
             memory_db: None,
             shared_trivium: None,
+            ledger_db: None,
         }
     }
     pub fn set_agent_pool(&mut self, pool: Arc<AgentPool>) {
@@ -66,6 +71,12 @@ impl ContextAssembler {
         db: Arc<std::sync::Mutex<crate::data::triviumdb::TriviumDb>>,
     ) {
         self.shared_trivium = Some(db);
+    }
+
+    /// 注入主库共享句柄（cipher.duckdb，与能力执行中台同一连接）：
+    /// 未结交付台账读取用（B3 v0.5.11）。
+    pub fn set_ledger_db(&mut self, db: Arc<std::sync::Mutex<duckdb::Connection>>) {
+        self.ledger_db = Some(db);
     }
 
     fn memory_kind_active(
@@ -260,6 +271,17 @@ impl ContextAssembler {
         }
         messages.extend(experience_msgs);
         messages.extend(preference_msgs);
+
+        // B3（v0.5.11）：未结交付台账每轮必注（不受 history_truncated 门控——完成
+        // 状态是诚实合同的一部分，不随历史预算浮动）。读失败降级为跳过 + warn，
+        // 不得让注入拖垮轮次。复用主库共享句柄（见 set_ledger_db 文档）。
+        if let Some(text) = self.ledger_block() {
+            messages.push(ChatMessage::System {
+                text,
+                kind: SystemKind::Meta,
+            });
+        }
+
         match input_override {
             // 内部轮：当前输入段 = System{Meta} + reader 同款前缀（parsed_thinking_input
             // 与历史段格式一致），保序插入原 User 段位置，不产生任何 User 段。
@@ -274,6 +296,44 @@ impl ContextAssembler {
         }
 
         (system_prompt, messages)
+    }
+
+    /// B3（v0.5.11）：组装未结交付台账注入段（System Meta）。
+    ///
+    /// 读 state NOT IN ('verified','blocked') 条目（上限 20，updated_at 倒序），
+    /// 每行 `[state] item — evidence: ref1,ref2 — updated_at`。
+    /// 选 SystemKind::Meta 而非 Memory 段：Memory kind 绑定记忆子系统
+    /// （MemoryKind 枚举），台账是运行时状态注入，Meta 无需扩枚举（改动最小路径）。
+    fn ledger_block(&self) -> Option<String> {
+        let db = self.ledger_db.as_ref()?;
+        let conn = match db.lock() {
+            Ok(conn) => conn,
+            Err(error) => {
+                tracing::warn!(
+                    "ContextAssembler: ledger db lock poisoned, skip injection: {error}"
+                );
+                return None;
+            }
+        };
+        match crate::logic::capability::ledger::pending_ledger_lines(
+            &conn,
+            crate::logic::capability::ledger::MAX_INJECTION_LINES,
+        ) {
+            Ok(lines) if lines.is_empty() => None,
+            Ok(lines) => Some(format!(
+                "[未结交付台账 | 完成状态]\n\
+                 以下条目尚未完成（designed=已设计 / imported=已导入 / blocked=受阻），\
+                 不得宣称它们已完成；推进或受阻请经 ledger.write 更新状态并附证据：\n\
+                 {}",
+                lines.join("\n")
+            )),
+            Err(error) => {
+                tracing::warn!(
+                    "ContextAssembler: read deliverable ledger failed, skip injection: {error}"
+                );
+                None
+            }
+        }
     }
 
     async fn read_trivium_memories(&self, memory_type: &str, quota: usize) -> Vec<ChatMessage> {
@@ -1228,5 +1288,112 @@ mod tests {
             parse_yaml_string("role: \"assistant\"", "role:"),
             Some("assistant".to_string())
         );
+    }
+
+    /// B3（v0.5.11）：未结台账每轮注入——designed/imported 条目进 System{Meta} 段，
+    /// verified/blocked 不进；不受 history_truncated 门控（历史未裁剪也注入）。
+    #[tokio::test]
+    async fn ledger_pending_items_injected_as_system_meta_every_turn() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let ledger_conn = duckdb::Connection::open_in_memory().unwrap();
+        crate::data::duckdb::create_all_tables(&ledger_conn).unwrap();
+        ledger_conn
+            .execute_batch(
+                "INSERT INTO deliverable_ledger (id, item, state, evidence_refs) VALUES \
+                 ('p1', '实现解析器', 'designed', '[]'); \
+                 INSERT INTO deliverable_ledger (id, item, state, evidence_refs) VALUES \
+                 ('p2', '导入数据集', 'imported', '[\"inv_7\"]'); \
+                 INSERT INTO deliverable_ledger (id, item, state, evidence_refs) VALUES \
+                 ('p3', '已完成条目', 'verified', '[\"inv_8\"]');",
+            )
+            .unwrap();
+        let ledger_db = std::sync::Arc::new(std::sync::Mutex::new(ledger_conn));
+
+        let mut assembler = ContextAssembler::new(ContextConfig::default(), &data_dir, None);
+        assembler.set_ledger_db(std::sync::Arc::clone(&ledger_db));
+
+        // 用户轮（历史为空=未被裁剪）也注入。
+        let (_s, msgs) = assembler
+            .build_dual_messages("think", "问题", "unni", None)
+            .await;
+        let ledger_msgs: Vec<&ChatMessage> = msgs
+            .iter()
+            .filter(|m| {
+                matches!(m, ChatMessage::System { text, kind: SystemKind::Meta } if text.contains("[未结交付台账"))
+            })
+            .collect();
+        assert_eq!(ledger_msgs.len(), 1, "应恰好一段台账注入: {msgs:?}");
+        let text = message_text(ledger_msgs[0]);
+        assert!(
+            text.contains("[designed] 实现解析器 — evidence: -"),
+            "缺 designed 行: {text}"
+        );
+        assert!(
+            text.contains("[imported] 导入数据集 — evidence: inv_7"),
+            "缺 imported 行: {text}"
+        );
+        assert!(!text.contains("已完成条目"), "verified 不得注入: {text}");
+        assert!(
+            text.contains("ledger.write"),
+            "应引导经 ledger.write 更新: {text}"
+        );
+        // 用户轮契约不破坏：仍恰好一个 User 段且为当前输入。
+        assert!(matches!(
+            msgs.last(),
+            Some(ChatMessage::User { text }) if text == "问题"
+        ));
+
+        // 内部轮（洞察回环）同样注入，且不产生 User 段。
+        let override_input = ThinkingInput::PlatformInsight {
+            summary: "摘要".to_string(),
+            has_subagent_result: false,
+        };
+        let (_s, msgs) = assembler
+            .build_dual_messages("think", "摘要", "unni", Some(&override_input))
+            .await;
+        assert!(
+            msgs.iter().any(|m| {
+                matches!(m, ChatMessage::System { text, kind: SystemKind::Meta }
+                    if text.contains("[未结交付台账") && text.contains("[designed] 实现解析器"))
+            }),
+            "内部轮也应有台账注入: {msgs:?}"
+        );
+        assert!(!msgs.iter().any(|m| matches!(m, ChatMessage::User { .. })));
+    }
+
+    /// B3（v0.5.11）：读失败/表缺失/未接线 → 降级跳过（无注入、不 panic、轮次照常）。
+    #[tokio::test]
+    async fn ledger_injection_degrades_silently_on_failure() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // 未接线（None）：无注入。
+        let assembler = ContextAssembler::new(ContextConfig::default(), &data_dir, None);
+        let (_s, msgs) = assembler
+            .build_dual_messages("think", "q", "unni", None)
+            .await;
+        assert!(!msgs
+            .iter()
+            .any(|m| message_text(m).contains("[未结交付台账")));
+
+        // 接线但表缺失（读报错）：降级跳过，不 panic。
+        let broken = duckdb::Connection::open_in_memory().unwrap();
+        let broken_db = std::sync::Arc::new(std::sync::Mutex::new(broken));
+        let mut assembler = ContextAssembler::new(ContextConfig::default(), &data_dir, None);
+        assembler.set_ledger_db(broken_db);
+        let (_s, msgs) = assembler
+            .build_dual_messages("think", "q", "unni", None)
+            .await;
+        assert!(!msgs
+            .iter()
+            .any(|m| message_text(m).contains("[未结交付台账")));
+        assert!(matches!(
+            msgs.last(),
+            Some(ChatMessage::User { text }) if text == "q"
+        ));
     }
 }

@@ -625,6 +625,10 @@ pub async fn run_normal(
     assembler.set_memory_db(std::sync::Arc::clone(&memory_db));
     assembler.set_shared_trivium(std::sync::Arc::clone(&trivium_db));
     assembler.set_agent_pool(std::sync::Arc::clone(&pool));
+    // B3（v0.5.11）：把主库共享句柄（cipher.duckdb，与执行中台 set_duckdb 同一
+    // 连接）传给 assembler 注入未结交付台账——必须复用共享句柄，DuckDB 单写者，
+    // 另开连接会锁冲突（E1 实测）。
+    assembler.set_ledger_db(std::sync::Arc::clone(&exec_duckdb_conn));
 
     let duckdb_for_mgr = {
         let duckdb_path = app_state.paths.duckdb();
