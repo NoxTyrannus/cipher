@@ -40,13 +40,26 @@ pub struct ReqwestGetter {
     client: reqwest::Client,
 }
 
+/// Bug 20（v0.5.11）：进程级共享 client——`execute()` 原先每次调用重建
+/// `reqwest::Client`，丢连接池；现经 OnceLock 复用（Client 为 Arc 内核，clone
+/// 廉价且共享池）。配置不变：10s 总超时 + `RedirectPolicy::none`。
+/// 缓存 `Result` 而非 panic：构建失败保持原有结构化错误语义（"build client: ..."），
+/// 首次失败被缓存（client 构建失败非瞬态错误，不重试构建）。
+/// 仅生产路径 `execute()` 使用；单测经 `execute_with_getter` 注入 mock，不受影响。
+static SHARED_CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+    std::sync::OnceLock::new();
+
 impl ReqwestGetter {
     pub fn new() -> Result<Self, String> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| format!("build client: {e}"))?;
+        let client = SHARED_CLIENT
+            .get_or_init(|| {
+                reqwest::Client::builder()
+                    .timeout(Duration::from_secs(TIMEOUT_SECS))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .map_err(|e| format!("build client: {e}"))
+            })
+            .clone()?;
         Ok(Self { client })
     }
 }
@@ -446,6 +459,14 @@ mod tests {
         .unwrap()
         .map(|row| row.unwrap())
         .collect()
+    }
+
+    #[test]
+    fn reqwest_getter_new_reuses_shared_client() {
+        // Bug 20：client 进程级 OnceLock 复用，多次构建均成功（rustls 后端构建
+        // 不发网络请求，离线确定性）。连接池共享性无法离线断言，由实现保证。
+        assert!(ReqwestGetter::new().is_ok());
+        assert!(ReqwestGetter::new().is_ok());
     }
 
     #[test]

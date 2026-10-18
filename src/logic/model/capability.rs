@@ -36,7 +36,9 @@ fn builtin_model_capability(model_id: &str) -> Option<ModelCapability> {
             Some((16385, 4096, TokenCountingStrategy::Tiktoken))
         }
 
-        id if id.contains("doubao-pro") || id.contains("doubao-pro") => {
+        // Bug 16（v0.5.11）：原为两个相同的 contains("doubao-pro") 条件（初版提交即
+        // 笔误重复，git 历史无第二种条件变体），行为等价去重只留一个。
+        id if id.contains("doubao-pro") => {
             Some((200000, 8192, TokenCountingStrategy::Conservative))
         }
         id if id.contains("doubao-lite") => {
@@ -222,6 +224,18 @@ mod tests {
         let cap = resolve_model_capability(&make_row("doubao-mini-1.5", "openai", None));
         assert_eq!(cap.context_window, 32000);
         assert_eq!(cap.max_output_tokens, 4096);
+    }
+
+    #[test]
+    fn test_doubao_pro_resolves_large_context() {
+        // Bug 16：去重后的 doubao-pro 臂照常命中（200k 上下文 / 8k 输出）。
+        let cap = resolve_model_capability(&make_row("doubao-pro-32k", "openai", None));
+        assert_eq!(cap.context_window, 200000);
+        assert_eq!(cap.max_output_tokens, 8192);
+        assert_eq!(
+            cap.token_counting_strategy,
+            TokenCountingStrategy::Conservative
+        );
     }
 
     #[test]
