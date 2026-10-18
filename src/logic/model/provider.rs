@@ -43,7 +43,10 @@ pub fn resolve_max_tokens_from_config(config: Option<&serde_json::Value>) -> u32
     config
         .and_then(|c| c.get("max_output"))
         .and_then(|v| v.as_u64())
-        .map(|n| n as u32)
+        // Bug 14（v0.5.11）：`n as u32` 对超 u32::MAX 的 u64 静默回绕（4294967296→0，
+        // 恰为"不发上限"的坏值），改饱和 clamp 到 u32::MAX；真实超限由 D2 去
+        // max_tokens 重试兜底。
+        .map(|n| n.min(u32::MAX as u64) as u32)
         .unwrap_or(FALLBACK_MAX_OUTPUT_TOKENS as u32)
 }
 
@@ -56,7 +59,10 @@ impl LlmRequest {
         let config = model_row.config.clone();
 
         let capability = super::capability::resolve_model_capability(model_row);
-        let temperature = capability.temperature.or(Some(1.0));
+        // Bug 15（v0.5.11）：不再强制注入 temperature=1.0——拒收该参数的模型（o 系）
+        // 会 400。None 时序列化层省略该字段（openai.rs / responses.rs 的请求结构均
+        // `skip_serializing_if = "Option::is_none"`），保留 Option 原语义。
+        let temperature = capability.temperature;
         let top_p = capability.top_p;
         // D1：无 config / 无键 / 非 u64 一律兜底 8192（恒发送 max_tokens 参数）。
         let max_tokens = Some(resolve_max_tokens_from_config(config.as_ref()));
@@ -237,6 +243,96 @@ mod tests {
             1024,
             "显式 max_output（如 /config 新增行写入的 1024）原样生效"
         );
+    }
+
+    #[test]
+    fn resolve_max_tokens_saturates_above_u32_range() {
+        // Bug 14：4294967296（2^32）经 `as u32` 回绕成 0，须饱和到 u32::MAX。
+        let config = serde_json::json!({"max_output": 4_294_967_296_u64});
+        assert_eq!(
+            resolve_max_tokens_from_config(Some(&config)),
+            u32::MAX,
+            "超 u32::MAX 的 max_output 饱和而非回绕为 0"
+        );
+        let config = serde_json::json!({"max_output": u64::MAX});
+        assert_eq!(
+            resolve_max_tokens_from_config(Some(&config)),
+            u32::MAX,
+            "u64::MAX 同样饱和到 u32::MAX"
+        );
+        let config = serde_json::json!({"max_output": u32::MAX as u64});
+        assert_eq!(
+            resolve_max_tokens_from_config(Some(&config)),
+            u32::MAX,
+            "恰好 u32::MAX 的边界值原样生效"
+        );
+    }
+
+    // ---- Bug 15：不强制注入 temperature（None → 请求体省略该字段）----
+
+    fn make_model_row(model_id: &str, config: Option<serde_json::Value>) -> ModelRow {
+        ModelRow {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            provider: "test".to_string(),
+            api_url: "https://example.com".to_string(),
+            api_protocol: crate::data::duckdb::loader::default_api_protocol("openai"),
+            api_type: "openai".to_string(),
+            model_id: model_id.to_string(),
+            api_key: None,
+            config,
+        }
+    }
+
+    /// 按 openai.rs `build_openai_request` 的透传方式（temperature: req.temperature）
+    /// 组请求体并序列化——None 经 `skip_serializing_if` 省略。
+    fn serialize_openai_body(req: &LlmRequest) -> String {
+        let body = crate::logic::model::openai::OpenAiRequest {
+            model: &req.model,
+            messages: Vec::new(),
+            temperature: req.temperature,
+            top_p: req.top_p,
+            max_tokens: req.max_tokens,
+            response_format: req.response_format.clone(),
+            stream: false,
+        };
+        serde_json::to_string(&body).expect("序列化请求体")
+    }
+
+    #[test]
+    fn from_model_row_without_temperature_omits_field_in_body() {
+        // gpt-4o 的内置 capability 无 temperature（capability.rs 已有对应测试）。
+        let row = make_model_row("gpt-4o", None);
+        let req = LlmRequest::from_model_row(&row, Vec::new(), SecretString::from("x".to_string()))
+            .expect("构建请求");
+        assert!(
+            req.temperature.is_none(),
+            "capability 无 temperature 时不得强制注入 1.0"
+        );
+        let body = serialize_openai_body(&req);
+        assert!(
+            !body.contains("temperature"),
+            "请求体应省略 temperature 键：{body}"
+        );
+        assert!(
+            body.contains("max_tokens"),
+            "max_tokens 仍恒发送（D1 语义不变）：{body}"
+        );
+    }
+
+    #[test]
+    fn from_model_row_keeps_declared_temperature() {
+        // 内置声明（kimi）与 config 显式值两条路径均照常透传。
+        let row = make_model_row("kimi-k3", None);
+        let req = LlmRequest::from_model_row(&row, Vec::new(), SecretString::from("x".to_string()))
+            .expect("构建请求");
+        assert_eq!(req.temperature, Some(1.0));
+        assert!(serialize_openai_body(&req).contains("temperature"));
+
+        let row = make_model_row("gpt-4o", Some(serde_json::json!({"temperature": 0.42})));
+        let req = LlmRequest::from_model_row(&row, Vec::new(), SecretString::from("x".to_string()))
+            .expect("构建请求");
+        assert_eq!(req.temperature, Some(0.42));
     }
 
     // ---- D2：超限错误分类 + 仅一次去 max_tokens 重试 ----
