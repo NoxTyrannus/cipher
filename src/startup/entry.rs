@@ -605,10 +605,15 @@ pub async fn run_normal(
 
     let assembler_triviumdb_path = Some(triviumdb_path.clone());
     let thought_store = std::sync::Arc::clone(&shared_thought_store);
+    // 提示词根必须是 unified_root（~/.cipher）：与升级流程（ensure_default_prompts_interactive）
+    // 和平台中台（entry 前段 prompts_dir）同源。paths.root() 是 config.data_dir（~/.cipher/data），
+    // 其下没有 prompts/，会导致 read_prompt 永远落空、SOUL/system 全部回落编译内嵌默认，
+    // 用户自定义人设不生效（v0.5.10 修复）。
+    let prompt_root = crate::startup::manifest::unified_root();
     let mut assembler = ContextAssembler::new_with_roots(
         ContextConfig::from(&config.context),
         app_state.paths.storage_root(),
-        app_state.paths.root(),
+        &prompt_root,
         assembler_triviumdb_path,
     );
     assembler.set_thought_store(std::sync::Arc::clone(&thought_store));
