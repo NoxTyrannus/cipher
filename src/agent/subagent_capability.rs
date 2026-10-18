@@ -1523,15 +1523,42 @@ fn prewrite_invocation(
 
 /// TB runtime 收口时闭合 subagent.run 的 invocation 终态。
 ///
-/// 该路径由 TC 的 finish 回调调用；成功后写 `<invocation_id>.result.json`，
+/// 该路径由 TC 的 finish 回调与 spawn 失败回滚调用；成功后写 `<invocation_id>.result.json`，
 /// 保持首文件不可变。失败只告警，不改变 runtime 已经写好的 last_output/memory。
+///
+/// B6（v0.5.11）：收口同时回填 method_call_audit 中该 subagent 关联 running 行的终态
+/// （按 result JSON 的 subagent_id 匹配；回填失败只告警，不影响 invocation 闭合的
+/// 返回语义——两条事实相互独立，均尽力写入）。
 pub fn close_subagent_invocation(
+    duckdb: Option<&Arc<Mutex<duckdb::Connection>>>,
     storage_root: &Path,
+    subagent_id: &str,
     invocation_id: &str,
     final_state: &str,
     error: Option<&str>,
 ) -> Result<()> {
-    append_invocation_result(storage_root, invocation_id, final_state, error)
+    let invocation = append_invocation_result(storage_root, invocation_id, final_state, error);
+    if let Some(duckdb) = duckdb {
+        match duckdb.lock() {
+            Ok(conn) => match finalize_method_call_audit(&conn, subagent_id, final_state, error) {
+                Ok(updated) if updated > 0 => {
+                    tracing::debug!(
+                        "method_call_audit backfill: {updated} row(s) -> terminal for {subagent_id}"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "close_subagent_invocation: method_call_audit backfill failed: {e}"
+                    );
+                }
+            },
+            Err(_) => tracing::warn!(
+                "close_subagent_invocation: duckdb lock poisoned, skip method_call_audit backfill"
+            ),
+        }
+    }
+    invocation
 }
 
 /// 执行后追加 invocation 终态（<id>.result.json），保持首文件不可变。
@@ -1765,6 +1792,84 @@ fn write_method_call_audit_row(
     )
     .map_err(|e| AgentError::Bootstrap(format!("method_call_audit insert: {e}")))?;
     Ok(id)
+}
+
+/// B6（v0.5.11）：子代理终态确定后，回填 method_call_audit 中该 subagent 关联的 running 行。
+///
+/// 全仓库唯一写入者 `write_method_call_audit_row` 只 INSERT `status='running'`，此前无任何
+/// UPDATE，行恒 running。本函数在终态确定处（`close_subagent_invocation` 钩子，成功/失败
+/// 两条路径共用）把匹配行 UPDATE 为终态：
+/// - 匹配：扫描 `status='running'` 的行（并发在跑的方法调用数量少，扫描代价可接受），
+///   在 Rust 侧解析 result JSON 的 `subagent_id` 与当前完结的 subagent 比对，命中才更新；
+/// - status → `'succeeded'`/`'failed'`（收口语汇 completed/failed 映射，其他值按成功语义）；
+/// - error → 失败原因（成功时置 NULL）；
+/// - result → 原 JSON 追加 `final_state` 与 `finished_at`，并把内嵌 `status` 同步为终态
+///   （原 JSON 解析失败时回退为仅含终态字段的新对象，不丢失回填）；
+/// - updated_at 刷新。
+///
+/// 幂等：UPDATE 带 `AND status = 'running'` 守卫，重复回调时该行已非 running、0 行命中，
+/// 既不会把 succeeded 改回，也不会重复追加字段。不做 schema 变更（不加列、不动
+/// migration）；进程崩溃遗留的 running 行不在本回填范围（属下迭代）。
+fn finalize_method_call_audit(
+    conn: &duckdb::Connection,
+    subagent_id: &str,
+    final_state: &str,
+    error: Option<&str>,
+) -> Result<u64> {
+    let status = match final_state {
+        "failed" => "failed",
+        _ => "succeeded",
+    };
+    let mut statement = conn
+        .prepare(
+            "SELECT id, CAST(result AS VARCHAR) FROM method_call_audit WHERE status = 'running'",
+        )
+        .map_err(|e| AgentError::Bootstrap(format!("method_call_audit backfill prepare: {e}")))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        })
+        .map_err(|e| AgentError::Bootstrap(format!("method_call_audit backfill query: {e}")))?;
+    let candidates = rows
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| AgentError::Bootstrap(format!("method_call_audit backfill read: {e}")))?;
+
+    let finished_at = now_iso();
+    let mut updated: u64 = 0;
+    for (row_id, result_text) in candidates {
+        let parsed = result_text
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok());
+        let row_subagent_id = parsed
+            .as_ref()
+            .and_then(|value| value.get("subagent_id"))
+            .and_then(|value| value.as_str());
+        if row_subagent_id != Some(subagent_id) {
+            continue;
+        }
+        let mut result_json = parsed
+            .unwrap_or_else(|| serde_json::json!({ "subagent_id": subagent_id }));
+        if let Some(object) = result_json.as_object_mut() {
+            object.insert("status".into(), serde_json::json!(status));
+            object.insert("final_state".into(), serde_json::json!(status));
+            object.insert("finished_at".into(), serde_json::json!(finished_at));
+        }
+        let changed = conn
+            .execute(
+                "UPDATE method_call_audit \
+                 SET status = ?, error = ?, result = CAST(? AS JSON), updated_at = now() \
+                 WHERE id = ? AND status = 'running'",
+                duckdb::params![status, error, result_json.to_string(), row_id],
+            )
+            .map_err(|e| {
+                AgentError::Bootstrap(format!("method_call_audit backfill update '{row_id}': {e}"))
+            })?;
+        updated += changed as u64;
+    }
+    Ok(updated)
 }
 
 fn write_usage_observation_row(
@@ -2089,6 +2194,16 @@ mod tests {
     fn lifecycle_of(conn: &duckdb::Connection, id: &str) -> String {
         let row = resolve_agent_row(conn, id).unwrap().unwrap();
         row.subagent_config().unwrap().lifecycle.to_string()
+    }
+
+    /// 读取 method_call_audit 行（status, error, result JSON 文本）。
+    fn audit_row(conn: &duckdb::Connection, id: &str) -> (String, Option<String>, String) {
+        conn.query_row(
+            "SELECT status, error, CAST(result AS VARCHAR) FROM method_call_audit WHERE id = ?",
+            duckdb::params![id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -3002,6 +3117,144 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1);
         });
+
+        // B6（v0.5.11）：受理后行应为 running 占位；模拟 runtime 收口（entry.rs finish
+        // 回调同款钩子 close_subagent_invocation）后回填终态——status 不再是 running，
+        // result 含 final_state/finished_at。
+        let method_call_id = output["method_call_id"].as_str().unwrap().to_string();
+        let (status, error, _) = with_conn(&db, |conn| audit_row(conn, &method_call_id));
+        assert_eq!(status, "running");
+        assert!(error.is_none());
+
+        close_subagent_invocation(
+            Some(&db),
+            storage_root.path(),
+            subagent_id,
+            "inv_close_success_sim",
+            "completed",
+            None,
+        )
+        .unwrap();
+
+        let (status, error, result_text) =
+            with_conn(&db, |conn| audit_row(conn, &method_call_id));
+        assert_ne!(status, "running");
+        assert_eq!(status, "succeeded");
+        assert!(error.is_none());
+        let result: serde_json::Value = serde_json::from_str(&result_text).unwrap();
+        assert_eq!(result["subagent_id"], subagent_id);
+        assert_eq!(result["final_state"], "succeeded");
+        assert_eq!(result["status"], "succeeded", "内嵌 status 应同步为终态");
+        assert!(result["finished_at"].as_str().is_some());
+
+        // 幂等：重复回调（失败形态）不得把 succeeded 改回或重复追加字段。
+        close_subagent_invocation(
+            Some(&db),
+            storage_root.path(),
+            subagent_id,
+            "inv_close_success_sim",
+            "failed",
+            Some("late duplicate callback"),
+        )
+        .unwrap();
+        let (status_again, error_again, result_text_again) =
+            with_conn(&db, |conn| audit_row(conn, &method_call_id));
+        assert_eq!(status_again, "succeeded");
+        assert!(error_again.is_none());
+        assert_eq!(
+            result_text_again, result_text,
+            "幂等回调不得改动已终态行"
+        );
+    }
+
+    #[test]
+    fn method_invoke_audit_failed_backfill_and_mismatch_noop() {
+        let db = test_conn_arc();
+        let storage_root = tempfile::tempdir().unwrap();
+
+        with_conn(&db, |conn| {
+            conn.execute(
+                "INSERT INTO base_capability (id, name, type, description, schema_in, schema_out, executor, version, enabled) \
+                 VALUES ('web.fetch.public', 'Fetch', 'function', 'fetch', '{}', '{}', 'builtin:web.fetch.public', '1.0.0', true)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO usage_method \
+                 (id, capability_id, name, prompt, examples, metadata) \
+                 VALUES (?, ?, ?, ?, NULL, CAST(? AS JSON))",
+                duckdb::params![
+                    "um_test_fetch",
+                    "web.fetch.public",
+                    "Test Fetch Method",
+                    "brief",
+                    r#"{"full_document":"full method doc","required_capabilities":["web.fetch.public"]}"#,
+                ],
+            )
+            .unwrap();
+        });
+
+        let output = call(
+            &db,
+            storage_root.path(),
+            "method.invoke",
+            serde_json::json!({
+                "method_id": "um_test_fetch",
+                "task_input": "fetch a test page again",
+                "model_id": MODEL_MINI,
+            }),
+        )
+        .expect("method.invoke should succeed");
+        let subagent_id = output["subagent_id"].as_str().unwrap();
+        let method_call_id = output["method_call_id"].as_str().unwrap();
+
+        // 错配 subagent：不命中任何 running 行，行保持 running。
+        close_subagent_invocation(
+            Some(&db),
+            storage_root.path(),
+            "sg_someone_else",
+            "inv_mismatch_sim",
+            "failed",
+            Some("not this one"),
+        )
+        .unwrap();
+        let (status, _, _) = with_conn(&db, |conn| audit_row(conn, method_call_id));
+        assert_eq!(status, "running", "subagent_id 不匹配的行不得被回填");
+
+        // 失败终态：status/error/result 回填（error 取失败原因）。
+        close_subagent_invocation(
+            Some(&db),
+            storage_root.path(),
+            subagent_id,
+            "inv_failed_sim",
+            "failed",
+            Some("provider exploded"),
+        )
+        .unwrap();
+        let (status, error, result_text) =
+            with_conn(&db, |conn| audit_row(conn, method_call_id));
+        assert_eq!(status, "failed");
+        assert_eq!(error.as_deref(), Some("provider exploded"));
+        let result: serde_json::Value = serde_json::from_str(&result_text).unwrap();
+        assert_eq!(result["final_state"], "failed");
+        assert_eq!(result["status"], "failed");
+        assert!(result["finished_at"].as_str().is_some());
+
+        // 幂等：失败终态上的重复回调同样不改。
+        close_subagent_invocation(
+            Some(&db),
+            storage_root.path(),
+            subagent_id,
+            "inv_failed_sim",
+            "completed",
+            None,
+        )
+        .unwrap();
+        let (status, error, result_text_again) =
+            with_conn(&db, |conn| audit_row(conn, method_call_id));
+        assert_eq!(status, "failed");
+        assert_eq!(error.as_deref(), Some("provider exploded"));
+        assert_eq!(result_text_again, result_text);
     }
 
     #[cfg(unix)]
