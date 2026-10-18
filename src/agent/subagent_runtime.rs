@@ -8,7 +8,9 @@
 //! 4. attempt_timeout_seconds 限制单次 provider 调用；total_timeout_seconds 限制整个 run；
 //!    失败最多 max_retries 次有限重试（默认 0），超时/重试耗尽写失败事实，不无限重试；
 //! 5. 运行中每 1 秒向 AgentPool touch_subagent_heartbeat；
-//! 6. 结束：追加 memory 条目 + 写 last_output.json + AgentPool 状态回 idle + 生命周期 idle/failed。
+//! 6. 结束：追加 memory 条目 + 写 last_output.json + AgentPool 状态回 idle + 生命周期 idle；
+//!    终态失败自动 tombstone（B5-1，方案 §3.1：tombstoned + tombstoned_at、移出池，
+//!    记忆/last_output 文件保留供复盘）。
 
 use crate::agent::agent_pool::registry::AgentStatus;
 use crate::agent::agent_pool::AgentPool;
@@ -291,8 +293,11 @@ impl RuntimeSpawnHook {
         let subagent_id = subagent_id.to_string();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                pool.update_subagent_lifecycle(&subagent_id, SubagentLifecycle::Failed)
+                // B5-1：spawn 失败同属终态失败，池内按 tombstone 语义移出
+                // （持久行由上方 close_subagent_invocation(failed) 自动置 tombstoned）。
+                pool.update_subagent_lifecycle(&subagent_id, SubagentLifecycle::Tombstoned)
                     .await;
+                pool.remove_subagent(&subagent_id).await;
             });
         }
     }
@@ -853,7 +858,12 @@ async fn finalize_completed(params: &SubagentRunParams, outcome: &CompletedOutco
     );
 }
 
-/// 失败收口：失败事实进 memory（含逐轮 calls/logs 证据）+ last_output，生命周期 failed（AgentPool 以 idle 身份保留）。
+/// 失败收口：失败事实进 memory（含逐轮 calls/logs 证据）+ last_output。
+///
+/// B5-1（v0.5.11，方案 §3.1）：超预算终败自动 tombstone——池内生命周期置 tombstoned
+/// 并移出池（不再以 idle 身份保留），持久行的 tombstoned + tombstoned_at 由 finish
+/// 回调链上的 `close_subagent_invocation(failed)` 写入（软删语义）；记忆/last_output
+/// 文件仍保留供复盘。
 async fn finalize_failed(params: &SubagentRunParams, failure: &RunFailure) {
     let subagent_id = &params.definition.subagent_id;
     let message = failure.error.to_string();
@@ -894,13 +904,10 @@ async fn finalize_failed(params: &SubagentRunParams, failure: &RunFailure) {
 
     params
         .pool
-        .update_subagent_lifecycle(subagent_id, SubagentLifecycle::Failed)
+        .update_subagent_lifecycle(subagent_id, SubagentLifecycle::Tombstoned)
         .await;
-    // failed 实例以 idle 身份保留在池（供快照展示与后续 run/update/delete）。
-    params
-        .pool
-        .update_subagent_status(subagent_id, AgentStatus::Idle)
-        .await;
+    // B5-1：终态失败自动清算，不再以 idle 身份保留在池（快照/思考引擎经
+    // execution_platform 从持久行重建时同样会剔除 tombstoned 实例）。
     let truncated =
         read_last_output_truncated(&params.storage_root, subagent_id, window).unwrap_or(None);
     params
@@ -917,7 +924,8 @@ async fn finalize_failed(params: &SubagentRunParams, failure: &RunFailure) {
         tracing::warn!(subagent_id = %subagent_id, "subagent complete trigger failed: {e}");
     }
 
-    // 完成回调：TC 接到 TA 的 set_subagent_lifecycle(failed) + invocation result 失败闭合。
+    // 完成回调：TC 接到 TA 的 set_subagent_lifecycle(failed) + invocation result 失败闭合
+    // （close_subagent_invocation 的 B5-1 钩子随后把持久行自动置 tombstoned + tombstoned_at）。
     (params.finish)(&SubagentFinish {
         subagent_id: subagent_id.clone(),
         outcome: SubagentOutcome::Failed {
@@ -927,6 +935,9 @@ async fn finalize_failed(params: &SubagentRunParams, failure: &RunFailure) {
         turns: 0,
         logs: Vec::new(),
     });
+
+    // B5-1（v0.5.11）：tombstoned 实例移出池（软删语义；记忆/last_output 文件保留供复盘）。
+    params.pool.remove_subagent(subagent_id).await;
 
     tracing::warn!(
         subagent_id = %subagent_id,
@@ -1318,18 +1329,16 @@ mod tests {
         );
         spawn_subagent(params).await.unwrap();
 
+        // B5-1（v0.5.11）：超预算终败自动 tombstone——实例移出池，不再以 failed/idle
+        // 身份保留；失败事实仍写 last_output/memory 供复盘。
         let states = pool.subagent_states().await;
-        assert_eq!(states[0].lifecycle, SubagentLifecycle::Failed);
-        // failed 实例以 idle 身份保留在池。
-        assert_eq!(
-            pool.snapshot()
-                .await
-                .into_iter()
-                .find(|e| e.id == "sg_test")
-                .unwrap()
-                .status,
-            AgentStatus::Idle
-        );
+        assert!(states.is_empty(), "tombstoned subagent must leave the pool");
+        assert!(pool
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|e| e.id == "sg_test")
+            .is_none());
         let last = read_last_output(&storage, "sg_test").unwrap().unwrap();
         assert_eq!(last.status, "failed");
         assert!(
@@ -1377,8 +1386,9 @@ mod tests {
         );
         spawn_subagent(params).await.unwrap();
 
+        // B5-1：终败自动 tombstone，实例移出池；last_output 保留失败事实。
         let states = pool.subagent_states().await;
-        assert_eq!(states[0].lifecycle, SubagentLifecycle::Failed);
+        assert!(states.is_empty(), "tombstoned subagent must leave the pool");
         let last = read_last_output(&storage, "sg_test").unwrap().unwrap();
         assert_eq!(last.status, "failed");
         assert!(
@@ -1422,17 +1432,15 @@ mod tests {
         // 初始 1 次 + 2 次重试 = 3 次 provider 调用。
         assert_eq!(provider_calls.load(Ordering::SeqCst), 3);
 
+        // B5-1：重试耗尽终败自动 tombstone，实例移出池。
         let states = pool.subagent_states().await;
-        assert_eq!(states[0].lifecycle, SubagentLifecycle::Failed);
-        assert_eq!(
-            pool.snapshot()
-                .await
-                .into_iter()
-                .find(|e| e.id == "sg_test")
-                .unwrap()
-                .status,
-            AgentStatus::Idle
-        );
+        assert!(states.is_empty(), "tombstoned subagent must leave the pool");
+        assert!(pool
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|e| e.id == "sg_test")
+            .is_none());
         let last = read_last_output(&storage, "sg_test").unwrap().unwrap();
         assert_eq!(last.status, "failed");
     }
@@ -1537,8 +1545,9 @@ mod tests {
         spawn_subagent(params).await.unwrap();
 
         assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+        // B5-1：轮数超限终败自动 tombstone，实例移出池。
         let states = pool.subagent_states().await;
-        assert_eq!(states[0].lifecycle, SubagentLifecycle::Failed);
+        assert!(states.is_empty(), "tombstoned subagent must leave the pool");
         let last = read_last_output(&storage, "sg_test").unwrap().unwrap();
         assert_eq!(last.status, "failed");
         assert!(last.summary.contains("max_turns"), "got: {}", last.summary);
@@ -1766,8 +1775,9 @@ mod tests {
 
         // 2 次 provider 调用（失败调用 + 被拒绝的 done），无第三次。
         assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+        // B5-1：终败自动 tombstone，实例移出池。
         let states = pool.subagent_states().await;
-        assert_eq!(states[0].lifecycle, SubagentLifecycle::Failed);
+        assert!(states.is_empty(), "tombstoned subagent must leave the pool");
         let last = read_last_output(&storage, "sg_test").unwrap().unwrap();
         assert_eq!(last.status, "failed");
         assert!(last.summary.contains("max_turns"), "got: {}", last.summary);
