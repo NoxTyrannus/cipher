@@ -844,7 +844,13 @@ fn execute_interpreted_code(language: &str, code: &str, ws_root: &Path) -> Resul
     let mut cmd = std::process::Command::new(runtime);
     cmd.arg(code_flag).arg(code);
     cmd.current_dir(ws_root);
+    // env_clear 后必须继承父进程 PATH：execvp 对清空环境只回落到系统默认路径
+    // （/bin:/usr/bin），装在 /usr/local/bin、~/.cargo/bin 的解释器与 rustc 会解析失败
+    // （CI runner 实测）。PATH 不承载机密，继承无碍密闭性，与 shell.exec 姿态一致。
     cmd.env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        cmd.env("PATH", path);
+    }
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     watchdog::apply_lifecycle_hooks(&mut cmd);
@@ -892,7 +898,11 @@ fn compile_and_run_rust(
     cmd.arg(src_path);
     cmd.arg("-o").arg(bin_path);
     cmd.current_dir(ws_root);
+    // 同解释器路径：rustc 多经 rustup 装在 ~/.cargo/bin，无 PATH 必然解析失败。
     cmd.env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        cmd.env("PATH", path);
+    }
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     watchdog::apply_lifecycle_hooks(&mut cmd);
@@ -916,6 +926,9 @@ fn compile_and_run_rust(
     let mut run_cmd = std::process::Command::new(bin_path);
     run_cmd.current_dir(ws_root);
     run_cmd.env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        run_cmd.env("PATH", path);
+    }
     run_cmd.stdout(std::process::Stdio::piped());
     run_cmd.stderr(std::process::Stdio::piped());
     watchdog::apply_lifecycle_hooks(&mut run_cmd);
