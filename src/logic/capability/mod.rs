@@ -2,6 +2,7 @@ pub mod base;
 pub mod composite;
 pub mod executor;
 pub mod import;
+pub mod ledger;
 pub mod memory;
 pub mod permission;
 pub mod service;

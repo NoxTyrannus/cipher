@@ -80,9 +80,8 @@ fn is_allowed_table(table: &str) -> bool {
 /// 直接拼进 SQL，只放行 `[A-Za-z_][A-Za-z0-9_]*`，阻断经列名的 SQL 注入。
 fn validate_column_ident(cap: &str, column: &str) -> Result<()> {
     let mut chars = column.chars();
-    let valid =
-        matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
-            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let valid = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
     if valid {
         Ok(())
     } else {
@@ -147,9 +146,9 @@ fn duckdb_value_ref_to_json(value: duckdb::types::ValueRef<'_>) -> serde_json::V
         ValueRef::Date32(days) => DateTime::<Utc>::from_timestamp(i64::from(days) * 86_400, 0)
             .map(|dt| serde_json::Value::String(dt.format("%Y-%m-%d").to_string()))
             .unwrap_or_else(|| serde_json::Value::String(format!("(date out of range: {days})"))),
-        ValueRef::Blob(bytes) | ValueRef::Geometry(bytes) => serde_json::Value::String(
-            bytes.iter().map(|b| format!("{b:02x}")).collect(),
-        ),
+        ValueRef::Blob(bytes) | ValueRef::Geometry(bytes) => {
+            serde_json::Value::String(bytes.iter().map(|b| format!("{b:02x}")).collect())
+        }
         ValueRef::Decimal(v) => serde_json::Value::String(v.to_string()),
         ValueRef::Enum(..) => serde_json::Value::String(
             value
@@ -233,6 +232,21 @@ impl CapabilityExecutor {
                 })?;
                 return super::import::capability_import(&guard, &self.reload_tx, input)
                     .map_err(|e| AgentError::Script(format!("builtin capability.import: {e}")));
+            }
+            // B3（v0.5.11）：完成状态台账读写分子（deliverable_ledger 第 9 表）。
+            "ledger.read" | "ledger.write" => {
+                let conn = self.duckdb.as_ref().ok_or_else(|| {
+                    AgentError::NotFound(format!("{builtin_name}: duckdb not configured"))
+                })?;
+                let guard = conn.lock().map_err(|e| {
+                    AgentError::Script(format!("builtin {builtin_name}: lock poisoned: {e}"))
+                })?;
+                let raw = if builtin_name == "ledger.read" {
+                    super::ledger::ledger_read(&guard, input)
+                } else {
+                    super::ledger::ledger_write(&guard, input)
+                };
+                return raw.map_err(|e| AgentError::Script(format!("builtin {builtin_name}: {e}")));
             }
             "db.insert" => return self.builtin_db_insert(input),
             "db.update" => return self.builtin_db_update(input),
@@ -510,9 +524,9 @@ impl CapabilityExecutor {
             .duckdb
             .as_ref()
             .ok_or_else(|| AgentError::NotFound("db.insert: duckdb not configured".into()))?;
-        let conn = db.lock().map_err(|e| {
-            AgentError::Script(format!("builtin db.insert: lock poisoned: {e}"))
-        })?;
+        let conn = db
+            .lock()
+            .map_err(|e| AgentError::Script(format!("builtin db.insert: lock poisoned: {e}")))?;
         let columns: Vec<&str> = obj.keys().map(|s| s.as_str()).collect();
         let placeholders: Vec<String> = (0..columns.len()).map(|i| format!("${}", i + 1)).collect();
         let sql = format!(
@@ -562,9 +576,9 @@ impl CapabilityExecutor {
             .duckdb
             .as_ref()
             .ok_or_else(|| AgentError::NotFound("db.update: duckdb not configured".into()))?;
-        let conn = db.lock().map_err(|e| {
-            AgentError::Script(format!("builtin db.update: lock poisoned: {e}"))
-        })?;
+        let conn = db
+            .lock()
+            .map_err(|e| AgentError::Script(format!("builtin db.update: lock poisoned: {e}")))?;
         let set_clause: Vec<String> = obj
             .keys()
             .enumerate()
@@ -610,9 +624,9 @@ impl CapabilityExecutor {
             .duckdb
             .as_ref()
             .ok_or_else(|| AgentError::NotFound("db.delete: duckdb not configured".into()))?;
-        let conn = db.lock().map_err(|e| {
-            AgentError::Script(format!("builtin db.delete: lock poisoned: {e}"))
-        })?;
+        let conn = db
+            .lock()
+            .map_err(|e| AgentError::Script(format!("builtin db.delete: lock poisoned: {e}")))?;
         let sql = format!("DELETE FROM {table} WHERE {where_clause}");
         let rows = conn
             .execute(&sql, [])
@@ -638,9 +652,9 @@ impl CapabilityExecutor {
             .duckdb
             .as_ref()
             .ok_or_else(|| AgentError::NotFound("db.query: duckdb not configured".into()))?;
-        let conn = db.lock().map_err(|e| {
-            AgentError::Script(format!("builtin db.query: lock poisoned: {e}"))
-        })?;
+        let conn = db
+            .lock()
+            .map_err(|e| AgentError::Script(format!("builtin db.query: lock poisoned: {e}")))?;
         let sql = format!("SELECT * FROM {table} WHERE {where_clause}");
         let mut stmt = conn
             .prepare(&sql)
@@ -1100,7 +1114,10 @@ mod tests {
                 "where": "id IN (SELECT id FROM model)"
             }))
             .unwrap_err();
-        assert!(err.to_string().contains("subqueries are not allowed"), "{err}");
+        assert!(
+            err.to_string().contains("subqueries are not allowed"),
+            "{err}"
+        );
 
         let err = ex
             .builtin_db_update(&serde_json::json!({
@@ -1109,7 +1126,10 @@ mod tests {
                 "where": "id IN (SeLeCt id FROM model)"
             }))
             .unwrap_err();
-        assert!(err.to_string().contains("subqueries are not allowed"), "{err}");
+        assert!(
+            err.to_string().contains("subqueries are not allowed"),
+            "{err}"
+        );
 
         let err = ex
             .builtin_db_delete(&serde_json::json!({
@@ -1117,7 +1137,10 @@ mod tests {
                 "where": "id IN (SELECT api_key FROM model)"
             }))
             .unwrap_err();
-        assert!(err.to_string().contains("subqueries are not allowed"), "{err}");
+        assert!(
+            err.to_string().contains("subqueries are not allowed"),
+            "{err}"
+        );
     }
 
     /// A6/D3：agent 表移出 db.* 白名单后不可经 db.* 可达。

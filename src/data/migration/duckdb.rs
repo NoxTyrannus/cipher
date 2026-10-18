@@ -19,6 +19,7 @@ const TARGET_TABLES: &[&str] = &[
     "agent",
     "base_capability",
     "composite_capability",
+    "deliverable_ledger",
     "method_call_audit",
     "model",
     "permission_grants",
@@ -117,6 +118,26 @@ CREATE TABLE IF NOT EXISTS method_call_audit (
     };
 }
 
+/// v0.5.11 B3 完成状态台账表（与写者 X 契约定死的 DDL，不得改名）：
+/// 交付条目状态机 designed→imported→verified / →blocked，evidence_refs 承载
+/// 诚实合同证据（invocation_id / 回读行摘要 / 时间戳）。
+macro_rules! deliverable_ledger_ddl {
+    () => {
+        r#"
+CREATE TABLE IF NOT EXISTS deliverable_ledger (
+    id TEXT PRIMARY KEY,
+    item TEXT NOT NULL,
+    state TEXT NOT NULL,
+    owner_agent TEXT,
+    evidence_refs JSON NOT NULL DEFAULT '[]',
+    note TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT now(),
+    updated_at TIMESTAMP NOT NULL DEFAULT now()
+);
+"#
+    };
+}
+
 const TARGET_SCHEMA: &str = concat!(
     r#"
 CREATE TABLE model (
@@ -187,6 +208,7 @@ CREATE TABLE usage_method (
     permission_grants_ddl!(),
     web_fetch_audit_ddl!(),
     method_call_audit_ddl!(),
+    deliverable_ledger_ddl!(),
 );
 
 const MODEL_COLUMNS: &[&str] = &[
@@ -292,6 +314,16 @@ const METHOD_CALL_AUDIT_COLUMNS: &[&str] = &[
     "result",
     "state_machine_state",
     "status",
+    "updated_at",
+];
+const DELIVERABLE_LEDGER_COLUMNS: &[&str] = &[
+    "created_at",
+    "evidence_refs",
+    "id",
+    "item",
+    "note",
+    "owner_agent",
+    "state",
     "updated_at",
 ];
 
@@ -489,6 +521,7 @@ pub fn validate_current_duckdb_connection(
     require_exact_columns(connection, "permission_grants", PERMISSION_GRANT_COLUMNS)?;
     require_exact_columns(connection, "web_fetch_audit", WEB_FETCH_AUDIT_COLUMNS)?;
     require_exact_columns(connection, "method_call_audit", METHOD_CALL_AUDIT_COLUMNS)?;
+    require_exact_columns(connection, "deliverable_ledger", DELIVERABLE_LEDGER_COLUMNS)?;
 
     let table_counts = table_counts(connection, TARGET_TABLES)?;
     Ok(DuckdbValidationReport { table_counts })
@@ -534,6 +567,15 @@ pub fn ensure_method_call_audit_table(connection: &duckdb::Connection) -> Result
     connection
         .execute_batch(method_call_audit_ddl!())
         .map_err(|error| migration_error(format!("ensure method_call_audit table: {error}")))?;
+    Ok(())
+}
+
+/// v0.5.11 B3 旧数据目录补建完成状态台账表（第 9 表；模式同 method_call_audit：
+/// CREATE TABLE IF NOT EXISTS 幂等，与 TARGET_SCHEMA 的 DDL 完全一致）。
+pub fn ensure_deliverable_ledger_table(connection: &duckdb::Connection) -> Result<()> {
+    connection
+        .execute_batch(deliverable_ledger_ddl!())
+        .map_err(|error| migration_error(format!("ensure deliverable_ledger table: {error}")))?;
     Ok(())
 }
 
@@ -1749,11 +1791,12 @@ mod tests {
     }
 
     #[test]
-    fn fresh_candidate_has_exact_eight_empty_tables() {
+    fn fresh_candidate_has_exact_nine_empty_tables() {
         let (_temporary, _source, staging) = roots();
         let report = build_duckdb_candidate(None, &staging).unwrap();
         assert!(report.fresh);
-        assert_eq!(report.target_counts.len(), 8);
+        assert_eq!(report.target_counts.len(), 9);
+        assert!(report.target_counts.contains_key("deliverable_ledger"));
         assert!(report.target_counts.values().all(|count| *count == 0));
         let validation = validate_current_duckdb(&staging.join(CANDIDATE_DUCKDB_FILE)).unwrap();
         assert_eq!(validation.table_counts, report.target_counts);
@@ -1770,6 +1813,34 @@ mod tests {
             .map(|column| (*column).to_string())
             .collect();
         assert_eq!(grant_columns, expected);
+
+        // v0.5.11 B3：deliverable_ledger 随全新库创建，列集精确匹配。
+        let ledger_columns = column_set(&connection, "deliverable_ledger").unwrap();
+        let expected: BTreeSet<String> = DELIVERABLE_LEDGER_COLUMNS
+            .iter()
+            .map(|column| (*column).to_string())
+            .collect();
+        assert_eq!(ledger_columns, expected);
+    }
+
+    /// v0.5.11 B3：八表旧数据目录（无 deliverable_ledger）经
+    /// ensure_deliverable_ledger_table 幂等补建后通过九表精确校验。
+    #[test]
+    fn ensure_deliverable_ledger_table_upgrades_eight_table_library() {
+        let (_temporary, _source, staging) = roots();
+        build_duckdb_candidate(None, &staging).unwrap();
+        let path = staging.join(CANDIDATE_DUCKDB_FILE);
+        let connection = duckdb::Connection::open(&path).unwrap();
+        connection
+            .execute_batch("DROP TABLE deliverable_ledger")
+            .unwrap();
+        assert!(validate_current_duckdb_connection(&connection).is_err());
+
+        ensure_deliverable_ledger_table(&connection).unwrap();
+        let validation = validate_current_duckdb_connection(&connection).unwrap();
+        assert_eq!(validation.table_counts.len(), 9);
+        // 幂等：重复补建无副作用。
+        ensure_deliverable_ledger_table(&connection).unwrap();
     }
 
     #[test]

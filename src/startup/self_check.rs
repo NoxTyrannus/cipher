@@ -107,6 +107,8 @@ fn verify_tables(conn: &duckdb::Connection) -> CheckResult {
         "permission_grants",
         "web_fetch_audit",
         "method_call_audit",
+        // v0.5.11 B3：完成状态台账（第 9 表）。
+        "deliverable_ledger",
     ];
     let mut stmt = match conn.prepare(
         "SELECT table_name FROM information_schema.tables \

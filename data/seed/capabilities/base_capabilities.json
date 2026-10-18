@@ -1,5 +1,5 @@
 {
-  "seed_version": 3,
+  "seed_version": 4,
   "capabilities": [
     {
       "id": "file.read",
@@ -1895,6 +1895,180 @@
         "additionalProperties": false
       },
       "executor": "builtin:method.invoke",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "ledger.read",
+      "name": "Read Deliverable Ledger",
+      "type": "function",
+      "description": "读取完成状态台账（v0.5.11 B3）：按 state/item/owner_agent 过滤交付条目（item 为子串匹配），updated_at 倒序，limit 默认 50 上限 200。台账承载诚实合同——每项交付必须沿 designed→imported→verified 推进且带证据，防止宣称完成但无执行证据",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "designed",
+              "imported",
+              "verified",
+              "blocked"
+            ]
+          },
+          "item": {
+            "type": "string",
+            "description": "条目子串过滤（大小写不敏感）"
+          },
+          "owner_agent": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200
+          }
+        },
+        "additionalProperties": false
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "rows": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "item": {
+                  "type": "string"
+                },
+                "state": {
+                  "type": "string"
+                },
+                "owner_agent": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "evidence_refs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "note": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "updated_at": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "count": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rows",
+          "count"
+        ],
+        "additionalProperties": false
+      },
+      "executor": "builtin:ledger.read",
+      "version": "1.0.0",
+      "enabled": true,
+      "partition": "system"
+    },
+    {
+      "id": "ledger.write",
+      "name": "Write Deliverable Ledger",
+      "type": "function",
+      "description": "写入完成状态台账（v0.5.11 B3）：新建（id 缺省生成 dlg_ 前缀）或推进条目状态。状态机仅允许 designed→imported→verified 前向、designed/imported→blocked，verified/blocked 为终态（同态重复写=幂等刷新 evidence/note）；imported/verified 必须携带非空 evidence_refs（字符串：invocation_id / 回读行摘要 / 时间戳）——先执行并留下证据，再推进状态（诚实合同）",
+      "schema_in": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "条目 id；缺省自动生成 dlg_<uuid>"
+          },
+          "item": {
+            "type": "string",
+            "description": "交付条目描述"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "designed",
+              "imported",
+              "verified",
+              "blocked"
+            ]
+          },
+          "owner_agent": {
+            "type": "string"
+          },
+          "evidence_refs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "证据引用（invocation_id / 回读行摘要 / 时间戳）；imported/verified 必填非空"
+          },
+          "note": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "item",
+          "state"
+        ],
+        "additionalProperties": false
+      },
+      "schema_out": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "previous_state": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "inserted",
+              "updated"
+            ]
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "success",
+          "id",
+          "state"
+        ],
+        "additionalProperties": false
+      },
+      "executor": "builtin:ledger.write",
       "version": "1.0.0",
       "enabled": true,
       "partition": "system"

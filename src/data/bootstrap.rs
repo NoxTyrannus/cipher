@@ -84,6 +84,15 @@ pub fn bootstrap(data_dir: &Path) -> Result<AppState, AgentError> {
         ));
     }
 
+    // v0.5.11 B3 旧数据目录补建完成状态台账表（第 9 表，否则表集精确校验失败）。
+    if let Err(error) = super::migration::ensure_deliverable_ledger_table(&conn) {
+        drop(conn);
+        return Err(merge_permission_error(
+            error,
+            secure_duckdb_files(&duckdb_path),
+        ));
+    }
+
     if let Err(error) = validate_current_duckdb_connection(&conn) {
         drop(conn);
         return Err(merge_permission_error(
@@ -271,6 +280,8 @@ mod tests {
             "usage_method",
             "permission_grants",
             "web_fetch_audit",
+            "method_call_audit",
+            "deliverable_ledger",
         ] {
             let mut stmt = app
                 .duckdb
