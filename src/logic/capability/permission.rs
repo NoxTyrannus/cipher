@@ -7,6 +7,8 @@
 //!
 //! 安全底线（用户已确认）：`permission.grant` 本身可被授予（递归授权），全量审计落库
 //! `permission_grants`（granter/target/capability/mode/ttl/状态全链），默认 one-shot。
+//! v0.5.11 起 grant/revoke/reclaim 中「allowlist 变更 + 审计行」两条写库语句在
+//! 同一事务内原子生效，中途失败整体回滚。
 //!
 //! 本模块只做 DuckDB 持久化（实时校验 target/capability，不依赖内存 registry 快照），
 //! 由 `CapabilityExecutor` 分发调用；one-shot 用后回收与 ttl 懒回收的**判定**在
@@ -120,14 +122,22 @@ pub fn grant(conn: &duckdb::Connection, granter_agent: &str, input: &Value) -> R
     }
     let mut new_allowlist = allowlist;
     new_allowlist.push(capability_id.to_string());
-    update_allowlist(conn, target_agent_id, &new_allowlist)?;
 
     let now = now_iso();
     let expires_at = ttl_secs.map(|secs| {
         (Utc::now() + Duration::seconds(secs)).to_rfc3339_opts(SecondsFormat::Nanos, true)
     });
     let id = Uuid::new_v4().simple().to_string();
-    conn.execute(
+
+    // v0.5.11 事务化：allowlist 追加与审计行 INSERT 两条写库语句原子生效，中途
+    // 失败（Tx 被 Drop）整体回滚，不再留下「allowlist 已改、审计缺失」的不一致。
+    // 用 `unchecked_transaction` 是因为本模块只持有 `&Connection`；executor 侧
+    // 调用全程持有 db 互斥锁，不存在同连接并发/嵌套开事务。
+    let tx = conn.unchecked_transaction().map_err(|error| {
+        AgentError::Bootstrap(format!("permission.grant: begin transaction: {error}"))
+    })?;
+    update_allowlist(&tx, target_agent_id, &new_allowlist)?;
+    tx.execute(
         "INSERT INTO permission_grants \
          (id, granted_at, granter_agent, target_agent, capability_id, mode, ttl_secs, expires_at, status) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')",
@@ -143,6 +153,9 @@ pub fn grant(conn: &duckdb::Connection, granter_agent: &str, input: &Value) -> R
         ],
     )
     .map_err(|error| AgentError::Bootstrap(format!("permission.grant: insert audit row: {error}")))?;
+    tx.commit().map_err(|error| {
+        AgentError::Bootstrap(format!("permission.grant: commit transaction: {error}"))
+    })?;
 
     Ok(serde_json::json!({
         "id": id,
@@ -191,15 +204,20 @@ pub fn revoke(conn: &duckdb::Connection, revoker_agent: &str, input: &Value) -> 
 
     let allowlist = read_allowlist(conn, target_agent_id)?;
     let removed = allowlist.iter().any(|value| value == capability_id);
+
+    // v0.5.11 事务化：allowlist 移除与审计行置 revoked 原子生效（同 grant）。
+    let tx = conn.unchecked_transaction().map_err(|error| {
+        AgentError::Bootstrap(format!("permission.revoke: begin transaction: {error}"))
+    })?;
     if removed {
         let new_allowlist: Vec<String> = allowlist
             .into_iter()
             .filter(|value| value != capability_id)
             .collect();
-        update_allowlist(conn, target_agent_id, &new_allowlist)?;
+        update_allowlist(&tx, target_agent_id, &new_allowlist)?;
     }
 
-    let revoked_records = conn
+    let revoked_records = tx
         .execute(
             "UPDATE permission_grants SET status = 'revoked', revoked_at = ?, updated_at = now() \
              WHERE target_agent = ? AND capability_id = ? AND status = 'active'",
@@ -208,6 +226,9 @@ pub fn revoke(conn: &duckdb::Connection, revoker_agent: &str, input: &Value) -> 
         .map_err(|error| {
             AgentError::Bootstrap(format!("permission.revoke: audit update: {error}"))
         })?;
+    tx.commit().map_err(|error| {
+        AgentError::Bootstrap(format!("permission.revoke: commit transaction: {error}"))
+    })?;
 
     Ok(serde_json::json!({
         "target_agent_id": target_agent_id,
@@ -226,21 +247,28 @@ pub fn reclaim(
     status: &str,
 ) -> Result<()> {
     let allowlist = read_allowlist(conn, target_agent)?;
-    if allowlist.iter().any(|value| value == capability_id) {
+    let in_allowlist = allowlist.iter().any(|value| value == capability_id);
+
+    // v0.5.11 事务化：allowlist 移除与审计行置终态原子生效（同 grant）；不支持
+    // 的 status 在事务内返回 Err 时同样触发回滚，allowlist 不会被单独改写。
+    let tx = conn.unchecked_transaction().map_err(|error| {
+        AgentError::Bootstrap(format!("permission reclaim: begin transaction: {error}"))
+    })?;
+    if in_allowlist {
         let new_allowlist: Vec<String> = allowlist
             .into_iter()
             .filter(|value| value != capability_id)
             .collect();
-        update_allowlist(conn, target_agent, &new_allowlist)?;
+        update_allowlist(&tx, target_agent, &new_allowlist)?;
     }
 
     match status {
-        STATUS_USED => conn.execute(
+        STATUS_USED => tx.execute(
             "UPDATE permission_grants SET status = 'used', used_at = ?, updated_at = now() \
                  WHERE target_agent = ? AND capability_id = ? AND status = 'active'",
             duckdb::params![now_iso(), target_agent, capability_id],
         ),
-        STATUS_EXPIRED => conn.execute(
+        STATUS_EXPIRED => tx.execute(
             "UPDATE permission_grants SET status = 'expired', updated_at = now() \
                  WHERE target_agent = ? AND capability_id = ? AND status = 'active'",
             duckdb::params![target_agent, capability_id],
@@ -252,6 +280,9 @@ pub fn reclaim(
         }
     }
     .map_err(|error| AgentError::Bootstrap(format!("permission reclaim: audit update: {error}")))?;
+    tx.commit().map_err(|error| {
+        AgentError::Bootstrap(format!("permission reclaim: commit transaction: {error}"))
+    })?;
     Ok(())
 }
 
@@ -764,6 +795,70 @@ mod tests {
         seed_fixture(&conn);
         let err = reclaim(&conn, "sg-1", "probe.run", "unknown").unwrap_err();
         assert!(err.to_string().contains("unsupported terminal status"));
+    }
+
+    /// v0.5.11 事务性：grant 的第二条语句（审计 INSERT）失败时，第一条
+    /// （allowlist 追加）必须一并回滚。审计行 id 为内部 UUID v4，无法从外部
+    /// 预插同 id 制造主键冲突；改为 DROP 审计表使 INSERT 必失败（等价可靠）。
+    #[test]
+    fn grant_rolls_back_allowlist_when_audit_insert_fails() {
+        let conn = memory_db();
+        seed_fixture(&conn);
+        conn.execute_batch("DROP TABLE permission_grants;").unwrap();
+        let err = grant(
+            &conn,
+            "execution-platform",
+            &json!({
+                "target_agent_id": "sg-1",
+                "capability_id": "probe.run",
+                "mode": "one_shot",
+            }),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("insert audit row"), "{err}");
+        // 原子性：allowlist 不得留下半提交的追加。
+        assert_eq!(allowlist_of(&conn, "sg-1"), vec!["file.read"]);
+    }
+
+    /// v0.5.11 事务性：revoke 的第二条语句（审计 UPDATE）失败时，allowlist
+    /// 移除必须一并回滚。
+    #[test]
+    fn revoke_rolls_back_allowlist_when_audit_update_fails() {
+        let conn = memory_db();
+        seed_fixture(&conn);
+        conn.execute_batch("DROP TABLE permission_grants;").unwrap();
+        let err = revoke(
+            &conn,
+            "execution-platform",
+            &json!({
+                "target_agent_id": "sg-1",
+                "capability_id": "file.read",
+            }),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("audit update"), "{err}");
+        assert_eq!(allowlist_of(&conn, "sg-1"), vec!["file.read"]);
+    }
+
+    /// v0.5.11 事务性（成功路径）：grant 成功后 allowlist 追加与审计行同时存在
+    /// （与 `grant_appends_allowlist_and_writes_active_audit` 互补，显式断言原子
+    /// 提交的两面）。
+    #[test]
+    fn grant_success_commits_allowlist_and_audit_together() {
+        let conn = memory_db();
+        seed_fixture(&conn);
+        grant(
+            &conn,
+            "execution-platform",
+            &json!({
+                "target_agent_id": "sg-1",
+                "capability_id": "probe.run",
+                "mode": "one_shot",
+            }),
+        )
+        .unwrap();
+        assert!(allowlist_of(&conn, "sg-1").contains(&"probe.run".to_string()));
+        assert_eq!(grant_records(&conn).len(), 1);
     }
 
     #[test]
