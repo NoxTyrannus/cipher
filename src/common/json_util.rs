@@ -15,7 +15,9 @@ pub fn strip_reasoning_preamble(text: &str) -> String {
     }
 }
 
-fn strip_think_blocks(text: &str) -> String {
+/// 仅剥离 `<think>...</think>` 块（含未闭合的 `<think>` 到末尾），不动正文散文。
+/// say 等纯文本通道用这个；需要提取 JSON 的协议通道才用 strip_reasoning_preamble。
+pub fn strip_think_blocks(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     loop {

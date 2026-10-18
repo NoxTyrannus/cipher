@@ -526,7 +526,8 @@ impl ThinkingSchemeHandler for DualThinkingHandler {
                     return Err(AgentError::Parse("cancelled".into()));
                 }
             };
-            let say_text = crate::common::json_util::strip_reasoning_preamble(&say_resp.content)
+            // say 是纯文本通道：只剥 <think> 块，不能走 JSON 前言剥离（会吞掉 `{` 前的散文）。
+            let say_text = crate::common::json_util::strip_think_blocks(&say_resp.content)
                 .trim()
                 .to_string();
             // D3：finish_reason=length（max_output 截断）→ say 尾部追加可见标记。
@@ -627,7 +628,6 @@ impl ThinkingFactory {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub async fn run_with_dm(
         &self,
